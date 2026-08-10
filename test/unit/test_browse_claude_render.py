@@ -9471,6 +9471,201 @@ class TestTeamWorkers(unittest.TestCase):
         self.assertEqual(self.r._resolve_agent_jsonl(lead, 'w-worker'), p)
 
 
+class TestInProcessTeammates(unittest.TestCase):
+    """New-backend team workers run in-process: their transcripts land in
+    the lead session's own ``subagents/agent-a<name>-<hash>.jsonl`` (plus
+    ``.meta.json`` with the spawn ``name``/``teamName``) instead of
+    sibling sessions, and the spawn tool_result carries ``name`` and
+    ``team_name``. ``_maybe_link_subagent`` joins these via
+    ``_find_inprocess_teammate`` and stores the FILENAME-derived agent id
+    (the key the row listing / orphan diff / ``_resolve_agent_jsonl``
+    already use), falling back to the legacy sibling-session scan."""
+
+    LEAD_SID = 'aaaa1111-2222-3333-4444-555566667777'
+    TEAM = 'session-aaaa1111'
+
+    @classmethod
+    def setUpClass(cls):
+        cls.r = _load_recipe()
+
+    def setUp(self):
+        import tempfile
+        self._tmp = tempfile.TemporaryDirectory()
+        self._saved_home = os.environ.get('HOME')
+        self._saved_root = self.r.CLAUDE_ROOT
+        os.environ['HOME'] = self._tmp.name
+        self.r.CLAUDE_ROOT = os.path.join(
+            self._tmp.name, '.claude', 'projects')
+        self.proj = os.path.join(self.r.CLAUDE_ROOT, '-home-test-team')
+        os.makedirs(self.proj)
+        self.r._TEAMS_INDEX.clear()
+        self.r._WORKER_META_CACHE.clear()
+        self.r._DIR_WORKERS_CACHE.clear()
+        self.r._TREE_CACHE.clear()
+
+    def tearDown(self):
+        if self._saved_home is None:
+            os.environ.pop('HOME', None)
+        else:
+            os.environ['HOME'] = self._saved_home
+        self.r.CLAUDE_ROOT = self._saved_root
+        self.r._WORKER_META_CACHE.clear()
+        self.r._DIR_WORKERS_CACHE.clear()
+        self._tmp.cleanup()
+
+    def _write_lead(self, name='w-worker', team=TEAM, old_shape=False):
+        import json as _json
+        path = os.path.join(self.proj, f'{self.LEAD_SID}.jsonl')
+        tur = {'status': 'teammate_spawned', 'prompt': 'do the thing'}
+        if not old_shape:   # legacy results carry neither name nor team
+            tur.update(name=name, agent_id=f'{name}@{team}',
+                       team_name=team)
+        recs = [
+            {'type': 'user', 'uuid': 'u1', 'sessionId': self.LEAD_SID,
+             'message': {'role': 'user', 'content': 'dispatch the worker'}},
+            {'type': 'assistant', 'uuid': 'a1',
+             'message': {'role': 'assistant', 'content': [
+                 {'type': 'tool_use', 'id': 't1', 'name': 'Agent',
+                  'input': {'name': name,
+                            'subagent_type': 'general-purpose',
+                            'prompt': 'do the thing'}},
+             ]}},
+            {'type': 'user', 'uuid': 'u2',
+             'message': {'role': 'user', 'content': [
+                 {'type': 'tool_result', 'tool_use_id': 't1',
+                  'content': 'Spawned successfully.'},
+             ]},
+             'toolUseResult': tur},
+        ]
+        with open(path, 'w') as f:
+            for rec in recs:
+                f.write(_json.dumps(rec) + '\n')
+        return path
+
+    def _write_agent(self, agent_id, meta=None, mtime=None):
+        """One ``subagents/agent-<agent_id>.jsonl`` (+ optional meta)."""
+        import json as _json
+        sub = os.path.join(self.proj, self.LEAD_SID, 'subagents')
+        os.makedirs(sub, exist_ok=True)
+        p = os.path.join(sub, f'agent-{agent_id}.jsonl')
+        with open(p, 'w') as f:
+            f.write(_json.dumps({
+                'type': 'user', 'agentId': agent_id, 'isSidechain': True,
+                'message': {'role': 'user', 'content': 'work work'},
+            }) + '\n')
+        if meta is not None:
+            with open(os.path.join(
+                    sub, f'agent-{agent_id}.meta.json'), 'w') as f:
+                _json.dump(meta, f)
+        if mtime is not None:
+            os.utime(p, (mtime, mtime))
+        return p
+
+    def _meta(self, name='w-worker', team=TEAM):
+        return {'name': name, 'teamName': team,
+                'agentType': 'general-purpose',
+                'taskKind': 'in_process_teammate',
+                'description': 'do the thing'}
+
+    def test_inprocess_spawn_links_filename_id(self):
+        lead = self._write_lead()
+        p = self._write_agent('aw-worker-0123abcd', meta=self._meta())
+        td = self.r._scan_tree(lead)
+        self.assertIn('t1', td.agent_link)
+        self.assertEqual(td.agent_link['t1']['agent_id'],
+                         'aw-worker-0123abcd')
+        self.assertEqual(td.agent_link['t1']['agent_path'], p)
+        # The filename-derived key makes the orphan diff match the row
+        # listing and places the agent inline in tree mode.
+        self.assertEqual(
+            self.r._orphan_subagents_for_session(lead, td), [])
+        self.assertIn('aw-worker-0123abcd', td.agent_to_assistant_line)
+
+    def test_inprocess_team_mismatch_stays_orphan(self):
+        # A same-named transcript from a DIFFERENT team (name reuse
+        # across re-created teams) must not be claimed by this spawn.
+        lead = self._write_lead()
+        self._write_agent('aw-worker-0123abcd',
+                          meta=self._meta(team='session-99999999'))
+        td = self.r._scan_tree(lead)
+        self.assertNotIn('t1', td.agent_link)
+        orphans = self.r._orphan_subagents_for_session(lead, td)
+        self.assertEqual([it.agent_id for it in orphans],
+                         ['aw-worker-0123abcd'])
+
+    def test_inprocess_name_reuse_team_disambiguates(self):
+        # Two teams reused the name; the NEWER file belongs to the other
+        # team — the team check must beat recency.
+        lead = self._write_lead()
+        now = os.stat(lead).st_mtime
+        want = self._write_agent('aw-worker-0123abcd', meta=self._meta(),
+                                 mtime=now - 100)
+        self._write_agent('aw-worker-4567beef',
+                          meta=self._meta(team='session-99999999'),
+                          mtime=now)
+        td = self.r._scan_tree(lead)
+        self.assertEqual(td.agent_link['t1']['agent_path'], want)
+
+    def test_inprocess_respawn_newest_wins(self):
+        lead = self._write_lead()
+        now = os.stat(lead).st_mtime
+        self._write_agent('aw-worker-0123abcd', meta=self._meta(),
+                          mtime=now - 100)
+        new = self._write_agent('aw-worker-4567beef', meta=self._meta(),
+                                mtime=now)
+        td = self.r._scan_tree(lead)
+        self.assertEqual(td.agent_link['t1']['agent_id'],
+                         'aw-worker-4567beef')
+        self.assertEqual(td.agent_link['t1']['agent_path'], new)
+
+    def test_inprocess_metaless_fallback_hex_guard(self):
+        # No meta.json: the filename convention still links, but only a
+        # pure-hex tail — a longer name sharing the prefix must not be
+        # claimed (``w-worker`` vs a meta-less ``w-worker-foo`` file).
+        lead = self._write_lead()
+        p = self._write_agent('aw-worker-0123abcd')
+        self._write_agent('aw-worker-foo-4567beef')
+        td = self.r._scan_tree(lead)
+        self.assertEqual(td.agent_link['t1']['agent_id'],
+                         'aw-worker-0123abcd')
+        self.assertEqual(td.agent_link['t1']['agent_path'], p)
+
+    def _write_sibling_worker(self, name='w-worker'):
+        import json as _json
+        sid = 'bbbb2222-0000-0000-0000-000000000000'
+        p = os.path.join(self.proj, f'{sid}.jsonl')
+        with open(p, 'w') as f:
+            f.write(_json.dumps(
+                {'type': 'user', 'sessionId': sid, 'teamName': self.TEAM,
+                 'agentName': name, 'userType': 'external',
+                 'message': {'role': 'user', 'content': 'work work'}},
+            ) + '\n')
+        return p
+
+    def test_no_inprocess_match_falls_back_to_sibling_scan(self):
+        # New-shape spawn but no subagents dir at all — the spawn links
+        # via the sibling-session head-stamp scan exactly as before.
+        lead = self._write_lead()
+        p = self._write_sibling_worker()
+        td = self.r._scan_tree(lead)
+        self.assertEqual(td.agent_link['t1']['agent_id'], 'w-worker')
+        self.assertEqual(td.agent_link['t1']['agent_path'], p)
+
+    def test_oldshape_spawn_never_claims_inprocess_file(self):
+        # Legacy-shaped result (no ``name``/``team_name``): the name
+        # comes from the tool_use input and the in-process lookup is
+        # skipped entirely — a same-named in-process transcript from
+        # another (unrecorded) team must not be claimed; the sibling
+        # scan wins exactly as before the change.
+        lead = self._write_lead(old_shape=True)
+        self._write_agent('aw-worker-0123abcd',
+                          meta=self._meta(team='session-99999999'))
+        p = self._write_sibling_worker()
+        td = self.r._scan_tree(lead)
+        self.assertEqual(td.agent_link['t1']['agent_id'], 'w-worker')
+        self.assertEqual(td.agent_link['t1']['agent_path'], p)
+
+
 def _load_recipe_with_md_doc():
     """Reload the recipe with ``recipes/`` on ``sys.path`` so ``md_doc`` resolves.
 

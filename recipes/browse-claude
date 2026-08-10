@@ -440,11 +440,14 @@ def _find_session_by_pid(pid):
 # A session that spawns *named* agents via the Agent tool (team workers)
 # gets a team: ``~/.claude/teams/<teamName>/config.json`` holds the roster
 # — ``leadSessionId`` plus one member entry per agent ({name, agentType,
-# isActive, …}). Each worker runs as its own plain session .jsonl in the
-# same project dir; the only linkage on its records is the
-# ``teamName`` / ``agentName`` stamped a few lines into the file. Workers
-# never write ``~/.claude/sessions/<pid>.json``, so team membership is
-# also the only liveness signal for them.
+# isActive, …}). On the legacy backend each worker runs as its own plain
+# session .jsonl in the same project dir; the only linkage on its records
+# is the ``teamName`` / ``agentName`` stamped a few lines into the file.
+# Workers never write ``~/.claude/sessions/<pid>.json``, so team
+# membership is also the only liveness signal for them. The in-process
+# backend instead stores worker transcripts under the lead session's own
+# ``<sid>/subagents/agent-a<name>-<hex>.jsonl`` with an adjacent meta —
+# see ``_find_inprocess_teammate``.
 
 _TEAMS_INDEX = {}   # teamName → {'lead': leadSessionId, 'members': {name: m}}
 
@@ -1337,7 +1340,8 @@ def _count_subagents(session_jsonl_path):
 
 
 def _read_subagent_meta(meta_path):
-    """Return ``{agentType, description}`` from a subagent meta.json or ``{}``."""
+    """Parsed dict from a subagent meta.json (``agentType``,
+    ``description``, ``name``, ``teamName``, …) or ``{}``."""
     try:
         with open(meta_path, 'r', encoding='utf-8', errors='replace') as f:
             data = json.load(f)
@@ -1346,6 +1350,56 @@ def _read_subagent_meta(meta_path):
     if not isinstance(data, dict):
         return {}
     return data
+
+
+def _find_inprocess_teammate(session_jsonl_path, name, team):
+    """Newest in-process teammate ``(agent_id, path)`` for a spawn, or None.
+
+    New-backend team workers run in-process and their transcripts land
+    in the session's own subagents dirs as ``agent-a<name>-<hash>.jsonl``
+    with an adjacent ``.meta.json`` carrying the spawn ``name`` /
+    ``teamName``. Match on the meta name, plus the team when BOTH sides
+    carry one — a later spawn under a re-created team reuses the name
+    but not the team, and after a resume the team name stops matching
+    the transcript filename, so equality of the two recorded values is
+    the only reliable check. A candidate without a meta file falls back
+    to the filename convention (``a<name>-`` + hex hash — the hex guard
+    keeps ``worker-1`` from claiming a meta-less ``worker-1-foo``).
+    Name reuse across respawns: newest mtime wins — spawn order is NOT
+    disambiguated, so every same-name/same-team spawn resolves to the
+    newest transcript (parity with the legacy sibling scan).
+    """
+    prefix = f'agent-a{name}-'
+    best = None   # (mtime, agent_id, path)
+    for d in _candidate_subagents_dirs(session_jsonl_path):
+        try:
+            names = os.listdir(d)
+        except OSError:
+            continue
+        for n in names:
+            if not (n.startswith(prefix) and n.endswith('.jsonl')):
+                continue
+            meta = _read_subagent_meta(
+                os.path.join(d, n[:-len('.jsonl')] + '.meta.json'))
+            if meta:
+                if meta.get('name') != name:
+                    continue
+                if (team and meta.get('teamName')
+                        and meta.get('teamName') != team):
+                    continue
+            elif not re.fullmatch(
+                    r'[0-9a-f]+', n[len(prefix):-len('.jsonl')]):
+                continue
+            p = os.path.join(d, n)
+            try:
+                m = os.stat(p).st_mtime
+            except OSError:
+                continue
+            if best is None or m > best[0]:
+                best = (m, n[len('agent-'):-len('.jsonl')], p)
+    if best is None:
+        return None
+    return best[1], best[2]
 
 
 def _list_subagents_for_session(session_jsonl_path):
@@ -1421,8 +1475,9 @@ def _list_subagents_for_session(session_jsonl_path):
             if bg is not None:
                 item.row_bg = bg
             out.append(item)
-    # Team workers: named agents spawned via the Agent tool run as
-    # sibling *sessions*, not agent-*.jsonl files. Same row shape, so
+    # Legacy team workers: on the old backend, named agents spawned via
+    # the Agent tool run as sibling *sessions*, not agent-*.jsonl files
+    # (in-process ones land in the dirs scanned above). Same row shape, so
     # every downstream consumer (orphan filter, previews, drill-in)
     # treats them like any other subagent group.
     for agent_name, agent_path in _team_workers_for_session(
@@ -5753,16 +5808,34 @@ def _maybe_link_subagent(td, rec, owner_uuid, path):
                     continue
             elif (isinstance(tur, dict)
                     and tur.get('status') == 'teammate_spawned'):
-                # Team worker: the spawn result carries no agentId —
-                # the worker runs as its own sibling session, joined
-                # via the Agent call's ``name`` and the team roster /
-                # head stamps.
-                agent_id = (ap.get('input') or {}).get('name')
-                if not agent_id:
+                # Team worker: the spawn result carries no agentId.
+                # New backend first: the worker runs in-process and
+                # its transcript lands in this session's own subagents
+                # dir — join via the spawn name + team. The stored
+                # agent_id is the filename-derived one, the same key
+                # the subagent row listing and ``_resolve_agent_jsonl``
+                # use, so the orphan diff and drill-in line up. Legacy
+                # backend fallback: the worker runs as its own sibling
+                # session, joined via the Agent call's ``name`` and
+                # the team roster / head stamps.
+                name = (tur.get('name')
+                        or (ap.get('input') or {}).get('name'))
+                if not name:
                     continue
-                agent_path = _find_worker_jsonl(path, agent_id)
-                if not agent_path:
-                    continue
+                # Only new-backend spawn results carry ``name`` — gate
+                # the in-process lookup on it so an old-shape spawn can
+                # never claim a same-named in-process transcript from a
+                # different (unrecorded) team.
+                hit = (_find_inprocess_teammate(
+                           path, name, tur.get('team_name'))
+                       if tur.get('name') else None)
+                if hit:
+                    agent_id, agent_path = hit
+                else:
+                    agent_id = name
+                    agent_path = _find_worker_jsonl(path, agent_id)
+                    if not agent_path:
+                        continue
             else:
                 continue
             td.agent_link[tu_id] = {
