@@ -1,0 +1,17 @@
+#!/bin/bash
+# Part of the browse-tui toolset (install/uninstall ownership marker).
+# Pure pass-through: exactly one write verb (--before/--after/--first/--last/
+# --replace Q) is required, so a flag-less call cannot fall through to the
+# plain ANSI-render default. -h/--help skips the guard.
+verbs=0
+for arg in "$@"; do
+  case "$arg" in
+    -h | --help) exec md2ansi_lib.py --help ;;
+    --before | --after | --first | --last | --replace) verbs=$((verbs + 1)) ;;
+  esac
+done
+if [ "$verbs" -ne 1 ]; then
+  echo "md-edit: exactly one of --before/--after/--first/--last/--replace Q is required" >&2
+  exit 2
+fi
+md2ansi_lib.py "$@"

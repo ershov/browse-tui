@@ -1,0 +1,3 @@
+#!/bin/bash
+# Part of the browse-tui toolset (install/uninstall ownership marker).
+md2ansi_lib.py --extract "$@"
