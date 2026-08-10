@@ -3838,7 +3838,8 @@ class TestInfoBarNotice(unittest.TestCase):
     """``render_info_bar`` shows ``browser._notice`` in the middle region.
 
     Priority in that region: search/filter prompt > notice > hint. Error
-    notices render red; pane headers (``info=False``) never show it. Drives
+    notices render red, flashes as a reverse-video yellow band; pane
+    headers (``info=False``) never show it. Drives
     a real headless Browser (which carries ``_notice`` / ``_mode`` / the
     hint) through the non-cached path with the real terminal funcs grafted
     so we can capture the emitted bytes.
@@ -3888,6 +3889,19 @@ class TestInfoBarNotice(unittest.TestCase):
         finally:
             b.stop_workers()
 
+    def test_flash_notice_renders_reverse_yellow(self):
+        # The flash SGR: reverse video + bright yellow (256-colour 11) +
+        # bold — the yellow band — immediately preceding the text.
+        b = self._browser()
+        try:
+            b._notice = _state.Notice(
+                text='did a thing', kind='flash', shown_at=0.0, seq=1)
+            _render.render_info_bar(24, 80, 'Preview', info=True, browser=b)
+            out = self._drain()
+            self.assertIn('\x1b[0;1;7;38;5;11mdid a thing', out)
+        finally:
+            b.stop_workers()
+
     def test_error_notice_renders_red(self):
         b = self._browser()
         try:
@@ -3896,8 +3910,9 @@ class TestInfoBarNotice(unittest.TestCase):
             _render.render_info_bar(24, 80, 'Preview', info=True, browser=b)
             out = self._drain()
             self.assertIn('kaboom', out)
-            # Red foreground (256-colour code 9) in the SGR stream.
-            self.assertIn('38;5;9', out)
+            # Red foreground (256-colour code 9) in the SGR stream —
+            # bold, NOT reverse: the flash restyle left errors alone.
+            self.assertIn('\x1b[0;1;38;5;9mkaboom', out)
         finally:
             b.stop_workers()
 

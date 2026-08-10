@@ -63,7 +63,8 @@ There is one slot; the most recent of `flash`/`error` wins (last-write
 replaces, bumping `_notice_seq`). An error followed by a flash is therefore
 replaced by the flash — acceptable, since the error is still in the log.
 
-Constants: `_FLASH_DURATION = 1.0`, `_ERROR_MIN_DISPLAY = 1.0`,
+Constants: `_FLASH_DURATION = 5.0` (1.0 at first landing; raised once
+flashes became the mutation feedback), `_ERROR_MIN_DISPLAY = 1.0`,
 `_LOG_MAXLEN = 1000`.
 
 Log entries are stored pre-formatted with a wall-clock prefix:

@@ -3251,7 +3251,7 @@ DEFAULT_HINT = ' /:search  ?:help  q:quit '
 # the framework log pager. A flash auto-clears after ``_FLASH_DURATION``;
 # an error clears on the first keypress landing ``_ERROR_MIN_DISPLAY``
 # after it appeared.
-_FLASH_DURATION = 1.0      # seconds a flash notice stays before auto-clear
+_FLASH_DURATION = 5.0      # seconds a flash notice stays before auto-clear
 _ERROR_MIN_DISPLAY = 1.0   # seconds before a keypress may clear an error
 _LOG_MAXLEN = 1000         # ring-buffer cap for the message log
 

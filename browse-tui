@@ -4950,7 +4950,7 @@ DEFAULT_HINT = ' /:search  ?:help  q:quit '
 # the framework log pager. A flash auto-clears after ``_FLASH_DURATION``;
 # an error clears on the first keypress landing ``_ERROR_MIN_DISPLAY``
 # after it appeared.
-_FLASH_DURATION = 1.0      # seconds a flash notice stays before auto-clear
+_FLASH_DURATION = 5.0      # seconds a flash notice stays before auto-clear
 _ERROR_MIN_DISPLAY = 1.0   # seconds before a keypress may clear an error
 _LOG_MAXLEN = 1000         # ring-buffer cap for the message log
 
@@ -14114,7 +14114,7 @@ def render_info_bar(row, cols, label, *, info=False, browser=None,
         ``▸ <id>`` segment per stack entry in bright cyan;
       * the search prompt + query (when ``browser._mode is Mode.SEARCH_EDIT``);
       * an info-bar notice (``browser._notice``) in place of the hint —
-        red+bold for an error, dim for a flash;
+        red+bold for an error, a reverse-video yellow band for a flash;
       * a dim hint string about navigation keys (when none of the above).
 
     Middle-region priority: search / filter prompt > notice > hint.
@@ -14248,15 +14248,16 @@ def render_info_bar(row, cols, label, *, info=False, browser=None,
         set_style(fg=8)
     elif notice is not None and pos < cols:
         # Info-bar notice — in place of the hint, truncated to the same
-        # budget. Red + bold for errors (loud); a quiet dim style for
-        # flashes (distinct from the dimmer hint, but not shouty).
+        # budget. Red + bold for errors (loud); a reverse-video yellow
+        # band for flashes — an eye-catching acknowledgement the user
+        # can't miss (mutations rely on it as their only feedback).
         avail = cols - pos - len(label_str) - 3
         if avail > 10:
             text = notice.text[:avail]
             if notice.kind == 'error':
                 set_style(fg=9, bold=True)
             else:
-                set_style(fg=250, bold=True)
+                set_style(fg=11, reverse=True, bold=True)
             write(text)
             pos += len(text)
         reset_style()
