@@ -720,7 +720,9 @@ class TestBrowseMdMoveSectionCrossDocument(unittest.TestCase):
     (collapsed) row resolves to 'after' the referenced doc's ROOT — the
     file's bottom. The destination insert and the source cut are
     asserted on BOTH files' final bytes (ground truth), plus the
-    tag-anchored tree no longer listing the moved ``[h2]`` row.
+    tag-anchored tree listing the moved ``[h2]`` row exactly once —
+    inside the destination's ``[md]`` subtree, which the post-move
+    landing expands into view (#1236).
     """
 
     _MAIN = ('# Main\n'
@@ -772,8 +774,10 @@ class TestBrowseMdMoveSectionCrossDocument(unittest.TestCase):
                 t.send('Down')
                 t.send('Enter')
                 # Ground truth first: the destination gained the section
-                # and the source lost it; then the refreshed tree no
-                # longer lists the [h2] Movable row (the tag chip is
+                # and the source lost it; then the refreshed tree lists
+                # the [h2] Movable row exactly ONCE — gone from the
+                # source, revealed inside the [md] destination subtree
+                # by the landing's ancestor expansion (the tag chip is
                 # tree-only, so the check can't trip on preview text).
                 deadline = time.time() + 6.0
                 final_main = final_other = pane = None
@@ -785,12 +789,16 @@ class TestBrowseMdMoveSectionCrossDocument(unittest.TestCase):
                     pane = t.capture()
                     if (final_other == self._OTHER + self._MOVED
                             and final_main == self._MAIN_AFTER
-                            and '[h2] Movable' not in pane):
+                            and pane.count('[h2] Movable') == 1
+                            and pane.index('[md] other.md')
+                                < pane.index('[h2] Movable')):
                         break
                     time.sleep(0.05)
                 self.assertEqual(final_other, self._OTHER + self._MOVED)
                 self.assertEqual(final_main, self._MAIN_AFTER)
-                self.assertNotIn('[h2] Movable', pane)
+                self.assertEqual(pane.count('[h2] Movable'), 1)
+                self.assertLess(pane.index('[md] other.md'),
+                                pane.index('[h2] Movable'))
                 t.send('q')
 
 

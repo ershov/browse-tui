@@ -1772,6 +1772,64 @@ def _row_document(node_id):
     return None
 
 
+def _landing_chain(tree, line):
+    """Visible-node chain from the document root DOWN to the node owning
+    ``line`` — ancestors first, the landing row last.
+
+    Within one (position-ordered) children list a node's scope runs from
+    its own first line to the next visible sibling's, so the LAST node
+    with ``line_offset <= line`` owns the line; recursing into it walks
+    the ownership chain (a line inside an invisible leaf body stops at
+    its heading). Empty when ``line`` precedes every visible row.
+    """
+    chain, nodes = [], tree
+    while True:
+        best = None
+        for node in md_doc.visible_children(nodes):
+            if node.line_offset <= line:
+                best = node
+        if best is None:
+            return chain
+        chain.append(best)
+        nodes = best.children
+
+
+def _land_on_line(ctx, path, line, anchor_id=None):
+    """Land the cursor on the row owning ``line``, expanded into view.
+
+    The shared post-refresh landing of edit, insert AND move — call it
+    from the ``ctx.refresh`` ``on_complete`` (the reload has re-read the
+    document by then; this re-reads + re-parses the same bytes rather
+    than reaching into per-family state). ``ctx.cursor_to`` is
+    best-effort and leaves the cursor alone when the target row hides
+    under a collapsed ancestor, so the document root and each ancestor
+    heading are ``ctx.expand``-ed first (idempotent on already-expanded
+    ids; both calls just park framework goals, so firing them back to
+    back is safe). Row ids follow ``anchor_id``'s family — ``('md',
+    anchor, chain, …)`` when the mutation acted through a reference
+    subtree, else ``('content', path, …)`` under the ``('file', path)``
+    root. A ``line`` owned by no visible row (a divergence inside the
+    preamble) skips the landing.
+    """
+    chain = _landing_chain(_md2ansi_doc(_read_document(path)).tree, line)
+    if not chain:
+        return
+    if anchor_id is not None and anchor_id[0] == 'md':
+        root_id = ('md', anchor_id[1], anchor_id[2], None)
+
+        def _rid(node):
+            return ('md', anchor_id[1], anchor_id[2], node.line_offset)
+    else:
+        root_id = ('file', path)
+
+        def _rid(node):
+            return ('content', path, node.line_offset)
+    ctx.expand(root_id)
+    for node in chain[:-1]:
+        ctx.expand(_rid(node))
+    ctx.cursor_to(_rid(chain[-1]))
+
+
 def _apply_section_change(ctx, path, cap, content, where, anchor_id=None):
     """Re-read ``path``'s document, splice ``content`` at ``cap``, persist.
 
@@ -1785,13 +1843,14 @@ def _apply_section_change(ctx, path, cap, content, where, anchor_id=None):
     cache — so a persisted REFERENCED file is re-read and its subtree
     rebuilds — rebuilds the per-file state, and preserves cursor /
     expansion where the ids allow).
-    An insert (``where != 'replace'``) additionally lands the cursor on
-    the new section once the refresh completes: the section starts at the
-    first line where old and new text diverge, and its row id follows the
-    insert anchor's shape — ``('md', anchor, chain, line)`` when
-    ``anchor_id`` is an md reference row, else ``('content', path,
-    line)`` — best-effort (``cursor_to`` leaves the cursor alone when the
-    row isn't visible). Returns ``True`` on success, ``False`` when the
+    An insert or a (non-degenerate) edit additionally lands the cursor
+    once the refresh completes: the changed content starts at the first
+    line where old and new text diverge, and ``_land_on_line`` puts the
+    cursor on the row owning that line — expanded into view, id shaped
+    by ``anchor_id``'s family. A delete keeps the plain refresh: the
+    framework's cursor anchor falls back to an adjacent row when the
+    deleted row's id vanishes from the reloaded tree.
+    Returns ``True`` on success, ``False`` when the
     extent could not be re-addressed (the caller offers the retry
     dialog), and ``None`` when the splice applied but the write failed
     (``_persist_document`` already put up the error — no feedback or
@@ -1804,23 +1863,26 @@ def _apply_section_change(ctx, path, cap, content, where, anchor_id=None):
         return False
     if not _persist_document(ctx, path, new_text):
         return None
+    # First line where old and new text diverge — the landing line for
+    # edit and insert (the changed / new content's first row).
+    prefix = len(os.path.commonprefix((src, new_text)))
+    line = new_text.count('\n', 0, prefix)
     if where == 'replace':
         # Empty content is the delete flow (``d`` / an ``E`` edit saved
         # back empty) — announce it as a deletion, not an edit.
         verb = 'edited' if content else 'deleted section in'
         ctx.flash(f'browse-md: {verb} {os.path.basename(path)} '
                   f'lines {cap.a}-{cap.b}', log=True)
-        ctx.refresh()
+        if content and new_text != src:
+            ctx.refresh(on_complete=lambda: _land_on_line(
+                ctx, path, line, anchor_id))
+        else:
+            ctx.refresh()
     else:
         ctx.flash(f'browse-md: inserted section ({where}) in '
                   f'{os.path.basename(path)}', log=True)
-        prefix = len(os.path.commonprefix((src, new_text)))
-        line = new_text.count('\n', 0, prefix)
-        if anchor_id is not None and anchor_id[0] == 'md':
-            row_id = ('md', anchor_id[1], anchor_id[2], line)
-        else:
-            row_id = ('content', path, line)
-        ctx.refresh(on_complete=lambda: ctx.cursor_to(row_id))
+        ctx.refresh(on_complete=lambda: _land_on_line(
+            ctx, path, line, anchor_id))
     return True
 
 
@@ -1833,9 +1895,9 @@ def _editor_splice_loop(ctx, path, cap, seed, where, anchor_id=None):
     writing. Content coming back EMPTY cancels too for an insert or a
     root capture (the stdin whole-document edit), but a section edit
     saved back empty instead offers the delete flow — see the
-    empty-content arm below. ``anchor_id`` is the insert anchor's row
-    id, passed
-    through for the cursor landing's id shape. The temp file persists
+    empty-content arm below. ``anchor_id`` is the insert anchor's / the
+    edited row's id, passed through for the cursor landing's id
+    family. The temp file persists
     across retry-loop iterations — "Return to editor" re-opens the SAME
     file, so the user's work is never lost (they can save it elsewhere
     from inside the editor).
@@ -1960,7 +2022,10 @@ def _action_edit_section(ctx):
         return
     path, text, node = resolved
     cap = _capture_extent(text, node)
-    _editor_splice_loop(ctx, path, cap, cap.extent, 'replace')
+    # ``nid`` rides along as the landing's id-family witness — an edit
+    # through a reference row must land on an ``('md', …)``-shaped id.
+    _editor_splice_loop(ctx, path, cap, cap.extent, 'replace',
+                        anchor_id=nid)
 
 
 _INSERT_TEMPLATE = '## New section\n'
@@ -2207,8 +2272,9 @@ def _move_section_to(ctx, src_path, src_cap, relation, dest_id):
 
     No editor is involved, so an endpoint that changed underneath the
     marker just flashes — nothing to preserve, re-check and repeat. On
-    success the cursor lands on the section's new row, its id following
-    the DESTINATION's shape (``('md', …)`` vs ``('content', …)``).
+    success the cursor lands on the section's new row (``_land_on_line``
+    — expanded into view), its id following the DESTINATION's shape
+    (``('md', …)`` vs ``('content', …)``).
     """
     ctx.clear_selection()   # the moved-row highlight served its purpose
     if not (isinstance(dest_id, tuple) and dest_id
@@ -2273,11 +2339,8 @@ def _move_section_to(ctx, src_path, src_cap, relation, dest_id):
         ctx.flash(f'browse-md: moved section ({relation}) from '
                   f'{os.path.basename(src_path)} to '
                   f'{os.path.basename(dest_path)}', log=True)
-    if dest_id[0] == 'md':
-        row_id = ('md', dest_id[1], dest_id[2], line)
-    else:
-        row_id = ('content', dest_path, line)
-    ctx.refresh(on_complete=lambda: ctx.cursor_to(row_id))
+    ctx.refresh(on_complete=lambda: _land_on_line(ctx, dest_path, line,
+                                                  dest_id))
 
 
 def _delete_extent(ctx, path, cap):

@@ -4940,6 +4940,7 @@ class _EditCtx:
         self.refreshes = 0
         self.confirm_prompts = []
         self.cursor_tos = []
+        self.expands = []            # ids from the landing's ``expand``
         self.insert_labels = []
         self.on_confirm = None       # stashed by ``insert``
         self.selects = []            # (ids, replace) from ``select``
@@ -4983,6 +4984,11 @@ class _EditCtx:
 
     def cursor_to(self, id, on_complete=None):
         self.cursor_tos.append(id)
+
+    def expand(self, id, on_complete=None, autoscroll=False):
+        self.expands.append(id)
+        if on_complete is not None:
+            on_complete()
 
 
 def _rewrite(path, text):
@@ -6195,7 +6201,11 @@ class TestMoveSectionAction(unittest.TestCase):
             '## Sub\nsub body\n'
             '# Beta\nbeta body\n'
             'alpha body\n')
-        self.assertEqual(ctx.cursor_tos, [('content', self.path, 5)])
+        # The relocated run melts into Beta's leaf body — no row of its
+        # own — so the landing resolves to the owning '# Beta' row (the
+        # pre-#1236 raw line id pointed at nothing and the cursor sat
+        # still).
+        self.assertEqual(ctx.cursor_tos, [('content', self.path, 3)])
 
 
 class TestMoveSectionStdin(unittest.TestCase):
@@ -6796,6 +6806,159 @@ class TestSuccessFeedbackFlashes(unittest.TestCase):
         ctx.on_confirm('after', ('content', self.path, 4))
         self._assert_flashed(
             ctx, f'browse-md: moved section (after) in {self.base}')
+
+
+class TestEditCursorLanding(unittest.TestCase):
+    """``E`` lands the cursor on the edited content's owning row, visibly.
+
+    The landing runs in the refresh ``on_complete`` through
+    ``_land_on_line``: the first divergent line between old and new text
+    is resolved to the deepest visible node owning it, the document root
+    + each ancestor heading are ``expand``-ed (so a row inside a
+    collapsed subtree comes into view — ``cursor_to`` alone no-ops on
+    hidden rows), then ``cursor_to`` lands on the row itself.
+    """
+
+    def setUp(self):
+        self.r = _load_recipe()
+        self._editor_saved = os.environ.get('EDITOR')
+        os.environ['EDITOR'] = 'fake-ed'
+
+    def tearDown(self):
+        if self._editor_saved is None:
+            os.environ.pop('EDITOR', None)
+        else:
+            os.environ['EDITOR'] = self._editor_saved
+
+    def _load(self, text):
+        import tempfile
+        fd, path = tempfile.mkstemp(suffix='.md')
+        os.close(fd)
+        self.addCleanup(os.unlink, path)
+        _rewrite(path, text)
+        self.r._INPUT_FILES = [(path, '')]
+        self.r._reparse()
+        return path
+
+    def _edit(self, path, line, new_content):
+        ctx = _EditCtx(
+            cursor=self.r._FILES[path].by_id[('content', path, line)],
+            editor=lambda tmp, n: _rewrite(tmp, new_content))
+        self.r._action_edit_section(ctx)
+        return ctx
+
+    _DOC = ('# Alpha\nalpha body\n'
+            '## Sub\nsub body\n'
+            '# Beta\nbeta body\n')
+
+    def test_retitle_lands_on_the_new_heading_row(self):
+        # Divergence on the heading line itself — the landing row IS the
+        # retitled heading (its id changes with the title's line intact).
+        path = self._load(self._DOC)
+        ctx = self._edit(path, 4, '# Betamax\nbeta body\n')
+        self.assertEqual(ctx.cursor_tos, [('content', path, 4)])
+        self.assertEqual(ctx.expands, [('file', path)])
+
+    def test_body_edit_lands_on_the_owning_heading(self):
+        # Divergence mid-body (line 5) — a leaf body line is no row, so
+        # the landing resolves to the owning '# Beta' heading.
+        path = self._load(self._DOC)
+        ctx = self._edit(path, 4, '# Beta\nEDITED\n')
+        self.assertEqual(ctx.cursor_tos, [('content', path, 4)])
+
+    def test_deep_edit_expands_the_ancestor_chain(self):
+        # The edited row sits two headings deep; every ancestor is
+        # expanded root-first so the landing is visible even when the
+        # subtree was collapsed at edit time.
+        path = self._load('# A\na body\n## B\nb body\n### C\nc body\n')
+        ctx = self._edit(path, 4, '### C\nCHANGED\n')
+        self.assertEqual(ctx.expands,
+                         [('file', path),
+                          ('content', path, 0),
+                          ('content', path, 2)])
+        self.assertEqual(ctx.cursor_tos, [('content', path, 4)])
+
+    def test_stdin_edit_lands_on_the_in_memory_row(self):
+        self.r._STDIN_TEXT = '# Piped\nintro\n## Inner\ninner body\n'
+        self.r._INPUT_FILES = [(self.r._STDIN_PATH, '')]
+        self.r._reparse()
+        path = self.r._STDIN_PATH
+        ctx = self._edit(path, 2, '## Inner\nCHANGED\n')
+        self.assertEqual(self.r._STDIN_TEXT,
+                         '# Piped\nintro\n## Inner\nCHANGED\n')
+        self.assertEqual(ctx.cursor_tos, [('content', path, 2)])
+        self.assertIn(('file', path), ctx.expands)
+
+
+class TestEditCursorLandingMdRow(_RefRowBase):
+    """``E`` on an ``('md', …)`` reference row lands md-shaped, visibly."""
+
+    def test_md_row_edit_lands_md_shaped(self):
+        ctx = _EditCtx(cursor=_SrcItem(id=self._md_id(2),
+                                       kind='md-heading'),
+                       editor=lambda tmp, n: _rewrite(
+                           tmp, '## Inner\nCHANGED\n'))
+        self.r._action_edit_section(ctx)
+        # Expands walk the REFERENCED doc: its root row, then the
+        # '# Other' ancestor; the landing is '## Inner' itself.
+        self.assertEqual(ctx.expands,
+                         [self._md_id(None), self._md_id(0)])
+        self.assertEqual(ctx.cursor_tos, [self._md_id(2)])
+
+
+class TestDeleteCursorAdjacencyLive(unittest.TestCase):
+    """Post-delete cursor adjacency is the FRAMEWORK's doing — pinned.
+
+    browse-md deliberately keeps the plain ``ctx.refresh()`` on a
+    delete: the sticky cursor anchor (``[primary, next, prev, parent,
+    …]`` — 040-state.py's anchor block) falls back to an adjacent row
+    when the deleted row's id vanishes from the reloaded tree. Pinned
+    end-to-end against a real headless Browser over the recipe's own
+    ``get_children``, because no fake-ctx test can see anchor behavior.
+    """
+
+    _DOC = ('# Alpha\nalpha body\n'
+            '## Sub\nsub body\n'
+            '# Beta\nbeta body\n')
+
+    def test_deleting_the_cursor_row_lands_on_a_neighbour(self):
+        import tempfile
+        r = _load_recipe()
+        _term, data, state, _render, _context, _actions = \
+            _load_framework()
+        # The recipe was loaded against the browse_tui STUB — swap in
+        # the real framework Item so ``to_item`` passes rows through
+        # instead of wrapping the stubs as opaque payloads.
+        r.Item = data.Item
+        fd, path = tempfile.mkstemp(suffix='.md')
+        os.close(fd)
+        self.addCleanup(os.unlink, path)
+        _rewrite(path, self._DOC)
+        r._INPUT_FILES = [(path, '')]
+        r._reparse()
+        b = state.Browser(state.BrowserConfig(
+            _headless=True, root_id=None, get_children=r.get_children))
+        b.start_workers()
+        try:
+            b.refresh()
+            b.run_until_idle()
+            b.expand(('file', path))
+            b.run_until_idle()
+            b.cursor_to(('content', path, 4))            # '# Beta'
+            b.run_until_idle()
+            vis = state.visible_items(b._state)
+            self.assertEqual(vis[b._state.cursor].item.id,
+                             ('content', path, 4))
+            # The delete, as _delete_extent leaves the world: section
+            # gone from disk, then a plain root refresh.
+            _rewrite(path, '# Alpha\nalpha body\n## Sub\nsub body\n')
+            b.refresh()
+            b.run_until_idle()
+            vis = state.visible_items(b._state)
+            self.assertEqual(vis[b._state.cursor].item.id,
+                             ('content', path, 0))       # '# Alpha'
+        finally:
+            b.stop_workers()
 
 
 if __name__ == '__main__':
