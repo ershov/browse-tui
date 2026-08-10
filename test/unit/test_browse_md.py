@@ -1485,9 +1485,10 @@ class TestSelectionDisabled(unittest.TestCase):
         self.assertEqual(flashes, ['selection is disabled in browse-md'])
 
     def test_help_intro_notes_selection_disabled(self):
-        # The composer still renders the framework's static SELECTION
-        # section in the ? overlay (it lists ``default_actions()``
-        # unconditionally), so the intro carries the counter-note.
+        # The composer drops the overridden SELECTION rows (and the
+        # emptied section header) from the ? overlay, so the intro's
+        # one-liner is the only place that tells the user selection
+        # exists but is deliberately off.
         self.assertIn('Multi-select is disabled', self.r._HELP_INTRO)
 
 

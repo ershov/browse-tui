@@ -2835,10 +2835,10 @@ def _build_actions():
     * The framework's multi-select keys (``_SELECTION_KEYS``) are
       overridden to a "selection is disabled" flash — nothing in this
       recipe reads a user selection. Blank labels keep them out of the
-      help's CUSTOM ACTIONS section; the built-in ``?`` overlay still
-      shows the framework's static SELECTION section (the composer
-      renders ``default_actions()`` unconditionally), which the
-      ``_HELP_INTRO`` note counters.
+      help's CUSTOM ACTIONS section, and the composer drops the
+      overridden default rows too, so the whole SELECTION section
+      vanishes from the ``?`` overlay (the ``_HELP_INTRO`` one-liner
+      is what tells the user selection exists but is off).
     """
     actions = [
         Action('m', 'Toggle markdown coloring', _action_toggle_md, 'none'),

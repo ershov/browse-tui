@@ -173,6 +173,62 @@ class TestComposeHelpText(unittest.TestCase):
         # should not appear because its rows would be empty.
         self.assertNotIn('CUSTOM ACTIONS', text)
 
+    def test_overridden_default_key_row_suppressed(self):
+        # A recipe action on a default key owns that key's dispatch
+        # (build_keymap: user wins), so the default row must not render
+        # — it would lie about what the key does. The labeled override
+        # shows under CUSTOM ACTIONS instead; the rest of the default
+        # section survives.
+        b = _make_browser(actions=[
+            Action('space', 'Play / pause', lambda c: None, 'cursor'),
+        ])
+        text = compose_help_text(b)
+        self.assertNotIn('Toggle select (cursor down)', text)
+        self.assertIn('Play / pause', text)
+        # SELECTION keeps its other three rows (and so its header).
+        self.assertIn('SELECTION', text)
+        self.assertIn('Select all visible', text)
+
+    def test_blank_label_override_suppresses_default_row(self):
+        # A blank-label override means "hidden on purpose": the default
+        # row disappears AND nothing shows under CUSTOM ACTIONS.
+        b = _make_browser(actions=[
+            Action('space', '', lambda c: None, 'none'),
+        ])
+        text = compose_help_text(b)
+        self.assertNotIn('Toggle select (cursor down)', text)
+        self.assertNotIn('CUSTOM ACTIONS', text)
+
+    def test_section_emptied_by_overrides_loses_header(self):
+        # Overriding every key of a default section (browse-md disables
+        # all four SELECTION bindings) removes the section entirely,
+        # header included.
+        b = _make_browser(actions=[
+            Action(k, '', lambda c: None, 'none')
+            for k in ('space', 'alt- ', 'ctrl-a', 'ctrl-n')
+        ])
+        text = compose_help_text(b)
+        self.assertNotIn('SELECTION', text)
+        for label in ('Toggle select (cursor down)', 'Toggle select (cursor up)',
+                      'Select all visible', 'Deselect all'):
+            self.assertNotIn(label, text)
+        # Neighbouring sections are untouched.
+        self.assertIn('SEARCH', text)
+        self.assertIn('OTHER', text)
+
+    def test_no_user_actions_filter_is_inert(self):
+        # With no user actions the override filter has nothing to do:
+        # ``actions=None`` and ``actions=[]`` compose identically and
+        # every default section — SELECTION rows included — still
+        # renders. (Not a byte-for-byte guard against pre-filter
+        # output; it pins that the filter is a no-op when idle.)
+        text_none = compose_help_text(_make_browser())
+        text_empty = compose_help_text(_make_browser(actions=[]))
+        self.assertEqual(text_none, text_empty)
+        self.assertIn('SELECTION', text_none)
+        self.assertIn('Toggle select (cursor down)', text_none)
+        self.assertIn('Deselect all', text_none)
+
     def test_help_intro_appears_at_top(self):
         b = _make_browser(help_intro='Welcome to the browser')
         text = compose_help_text(b)

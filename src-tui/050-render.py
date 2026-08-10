@@ -3381,7 +3381,15 @@ def compose_help_text(browser, *, include_usage: bool = False) -> str:
         [help_outro]              (omitted when None / empty)
 
     Sections without content are omitted: no empty CUSTOM ACTIONS
-    header, no leading or trailing blank lines.
+    header, no leading or trailing blank lines. Default rows whose key
+    is re-bound by a ``browser.actions`` entry are omitted too (the
+    override owns the key's dispatch; a labeled one shows under CUSTOM
+    ACTIONS, a blank-label one is hidden on purpose) — a default
+    section emptied that way loses its header as well. Known limit:
+    the display-only pseudo rows (``alt-1..4``; the ``\\`` row that
+    also covers F1 / right-click) are keyed by strings that aren't
+    real dispatch keys, so an override of those keys wouldn't hide
+    them (no recipe binds any today).
 
     ``include_usage`` selects whether the recipe's command-line usage /
     flags block (``browser.help_usage``) is emitted. It is True for the
@@ -3410,9 +3418,18 @@ def compose_help_text(browser, *, include_usage: bool = False) -> str:
     # ``\``/F1/right-click permanently open the context menu (#1061), so
     # the static ``default_actions()`` labels are already correct — no
     # conditional rewriting is needed.
+    #
+    # Keys re-bound by the recipe are skipped: ``build_keymap`` gives a
+    # user action on the same key the dispatch, so the default row would
+    # lie about what the key does. A labeled override already renders
+    # under CUSTOM ACTIONS; a blank-label override means "hidden on
+    # purpose". A section whose every row is overridden (e.g. a recipe
+    # that disables all four SELECTION keys) drops out entirely via the
+    # existing empty-section elision below.
+    overridden = {a.key for a in (getattr(browser, 'actions', None) or [])}
     sections = {}   # section_name -> list[(key, label)]
     for a in default_actions():
-        if not a.section or not a.label:
+        if not a.section or not a.label or a.key in overridden:
             continue
         sections.setdefault(a.section, []).append((a.key, a.label))
 
