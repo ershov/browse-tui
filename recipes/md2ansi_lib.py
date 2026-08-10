@@ -1835,11 +1835,16 @@ def _m2a_resolve_bare(text, doc, query, frag):
                 f"them; re-list to get fresh hashes)"
             )
         if len(matches) > 1:
+            extents = {text[n.byte_offset:n.byte_offset + n.byte_size]
+                       for _p, n in matches}
+            hint = ("the extents are byte-identical — no prefix can "
+                    "disambiguate; address by #<line> instead"
+                    if len(extents) == 1 else "use a longer prefix")
             raise ValueError(
                 f"ambiguous query {query!r}: hash prefix {prefix!r} matches "
                 f"{len(matches)} chapters:\n"
                 f"{_m2a_candidate_listing(text, doc, matches)}\n"
-                f"use a longer prefix"
+                f"{hint}"
             )
         return _m2a_heading_target(text, *matches[0])
     # tag == "line" | "hlevel": the smallest / the level-N chapter whose
