@@ -4922,9 +4922,9 @@ class _EditCtx:
     ``insert`` (records the marker-mode entry and stashes ``on_confirm``
     for the test to fire), ``cursor_to`` and ``refresh`` (the latter
     invoking ``on_complete`` synchronously, as the real Pending would
-    once the reload lands), plus ``flash`` / ``log`` recorders.
-    ``selected`` exists (and must stay ignored by ``E``) so the
-    selection-ignored test can populate it. ``select`` /
+    once the reload lands), plus ``flash`` / ``log`` / ``error``
+    recorders. ``selected`` exists (and must stay ignored by ``E``) so
+    the selection-ignored test can populate it. ``select`` /
     ``clear_selection`` record the move flow's row highlight.
     """
 
@@ -4936,6 +4936,7 @@ class _EditCtx:
         self.calls = []              # run_external argv snapshots
         self.flashes = []
         self.logs = []
+        self.errors = []
         self.refreshes = 0
         self.confirm_prompts = []
         self.cursor_tos = []
@@ -4971,6 +4972,9 @@ class _EditCtx:
 
     def log(self, text):
         self.logs.append(text)
+
+    def error(self, text):
+        self.errors.append(text)
 
     def refresh(self, id=None, on_complete=None):
         self.refreshes += 1
@@ -6262,6 +6266,9 @@ class TestMoveSectionCrossDocument(_RefRowBase):
         self.assertTrue(any('moved section (after) from main.md to other.md'
                             in line for line in ctx.logs),
                         msg=f'logs: {ctx.logs}')
+        self.assertTrue(any('moved section (after) from main.md to other.md'
+                            in line for line in ctx.flashes),
+                        msg=f'flashes: {ctx.flashes}')
         self.assertEqual(ctx.cursor_tos, [self._md_id(4)])
         self.assertEqual(ctx.refreshes, 1)
 
@@ -6517,6 +6524,278 @@ class TestMoveSectionAliasedPaths(unittest.TestCase):
         self.assertIn('nothing moved — the destination is within the '
                       'section', ctx.flashes)
         self.assertEqual(_read(self.other_real), self._OTHER)
+
+
+class TestTwinSections(unittest.TestCase):
+    """Byte-identical ('twin') sections — ops land on the exact twin acted
+    on, never its double.
+
+    The capture chain re-addresses by hash + position; two sections with
+    the SAME bytes are the ambiguous case worth pinning: ``d`` / an
+    ``E``-saved-back-empty on twin #2 must remove exactly twin #2, a
+    move must survive a twin source, and a move whose DESTINATION
+    anchor is twin #2 must insert at twin #2 — not at the equal-bytes
+    twin #1.
+    """
+
+    _DOC = ('# Doc\n\n'
+            '## Twin\ntwin body\n\n'     # twin #1 at 0-based line 2
+            '## Twin\ntwin body\n\n'     # twin #2 at line 5
+            '## Tail\ntail body\n')      # line 8
+
+    def setUp(self):
+        import tempfile
+        self.r = _load_recipe()
+        fd, self.path = tempfile.mkstemp(suffix='.md')
+        os.close(fd)
+        self.addCleanup(os.unlink, self.path)
+        _rewrite(self.path, self._DOC)
+        self.r._INPUT_FILES = [(self.path, '')]
+        self.r._reparse()
+        self._editor_saved = os.environ.get('EDITOR')
+        os.environ['EDITOR'] = 'fake-ed'
+
+    def tearDown(self):
+        if self._editor_saved is None:
+            os.environ.pop('EDITOR', None)
+        else:
+            os.environ['EDITOR'] = self._editor_saved
+
+    def _item(self, line):
+        return self.r._FILES[self.path].by_id[('content', self.path, line)]
+
+    def _move(self, src_line, relation, dest_id):
+        ctx = _EditCtx(cursor=self._item(src_line))
+        self.r._action_move_section(ctx)
+        if ctx.on_confirm is not None:
+            ctx.on_confirm(relation, dest_id)
+        return ctx
+
+    def test_delete_second_twin_removes_exactly_it(self):
+        ctx = _EditCtx(cursor=self._item(5), confirms=[True])
+        self.r._action_delete_section(ctx)
+        self.assertEqual(_read(self.path),
+                         '# Doc\n\n## Twin\ntwin body\n\n'
+                         '## Tail\ntail body\n')
+        # The capture quotes twin #2's own line range, not twin #1's.
+        self.assertIn(f'browse-md: deleted section in '
+                      f'{os.path.basename(self.path)} lines 6-8',
+                      ctx.flashes)
+
+    def test_edit_empty_then_delete_second_twin(self):
+        ctx = _EditCtx(cursor=self._item(5), confirms=[True],
+                       editor=lambda tmp, n: _rewrite(tmp, ''))
+        self.r._action_edit_section(ctx)
+        self.assertEqual(_read(self.path),
+                         '# Doc\n\n## Twin\ntwin body\n\n'
+                         '## Tail\ntail body\n')
+
+    def test_move_with_twin_source_smoke(self):
+        # Smoke only: moving twin #1 vs twin #2 here yields byte-identical
+        # files by construction, so this proves a twin SOURCE doesn't
+        # break the move — the destination-anchor test below is the real
+        # disambiguation proof.
+        ctx = self._move(2, 'after', ('content', self.path, 8))
+        self.assertEqual(_read(self.path),
+                         '# Doc\n\n## Twin\ntwin body\n\n'
+                         '## Tail\ntail body\n## Twin\ntwin body\n\n')
+        self.assertTrue(any('moved section (after)' in f
+                            for f in ctx.flashes),
+                        msg=f'flashes: {ctx.flashes}')
+
+    def test_move_with_twin_destination_anchor(self):
+        # Tail 'before' twin #2: anchoring on twin #1 instead would put
+        # Tail at the very top of the twins — the pinned bytes prove the
+        # insert landed at twin #2.
+        ctx = self._move(8, 'before', ('content', self.path, 5))
+        self.assertEqual(_read(self.path),
+                         '# Doc\n\n## Twin\ntwin body\n\n'
+                         '## Tail\ntail body\n## Twin\ntwin body\n\n')
+        self.assertTrue(any('moved section (before)' in f
+                            for f in ctx.flashes),
+                        msg=f'flashes: {ctx.flashes}')
+
+
+@unittest.skipIf(os.geteuid() == 0,
+                 'read-only files remain writable when running as root')
+class TestPersistFailureReadOnly(_RefRowBase):
+    """Failed disk writes — error surfaced, no crash, no partial state.
+
+    A read-only file makes ``_persist_document``'s write raise; every
+    mutation flow must then surface a ``ctx.error``, leave the documents
+    exactly as they were (the cross-document move ROLLS BACK its
+    already-written destination insert), and let no exception escape —
+    the pre-fix failure mode was an uncaught ``PermissionError`` out of
+    the marker-confirm callback with a duplicate left in the
+    destination.
+    """
+
+    _MAIN = ('# Main\nSee [other](other.md) for more.\n'
+             '## Movable\nmovable body\n')
+
+    def _readonly(self, path):
+        os.chmod(path, 0o444)
+        self.addCleanup(os.chmod, path, 0o644)
+
+    def _move(self, src_id, relation, dest_id):
+        ctx = _EditCtx(cursor=_SrcItem(id=src_id, kind='heading'))
+        self.r._action_move_section(ctx)
+        if ctx.on_confirm is not None:
+            ctx.on_confirm(relation, dest_id)
+        return ctx
+
+    def test_cross_doc_move_readonly_source_rolls_back_destination(self):
+        # Two attempts: the destination must be byte-identical after
+        # each rollback, so retries can never accumulate copies.
+        self._readonly(self.main)
+        for attempt in (1, 2):
+            self.r._reparse()
+            ctx = self._move(('content', self.main, 2), 'after',
+                             self._md_id(2))
+            self.assertTrue(any('could not write main.md' in e
+                                for e in ctx.errors),
+                            msg=f'attempt {attempt} errors: {ctx.errors}')
+            self.assertFalse(any('moved section' in line
+                                 for line in ctx.logs),
+                             msg=f'attempt {attempt} logs: {ctx.logs}')
+            self.assertEqual(ctx.refreshes, 0)
+            self.assertEqual(_read(self.other), self._OTHER,
+                             msg=f'attempt {attempt}')
+            self.assertEqual(_read(self.main), self._MAIN)
+
+    def test_readonly_delete_errors_without_conflict_flash(self):
+        self._readonly(self.main)
+        ctx = _EditCtx(cursor=_SrcItem(id=('content', self.main, 2),
+                                       kind='heading'),
+                       confirms=[True])
+        self.r._action_delete_section(ctx)
+        self.assertTrue(any('could not write main.md' in e
+                            for e in ctx.errors),
+                        msg=f'errors: {ctx.errors}')
+        # The changed-underneath wording is the re-addressing failure's;
+        # a write failure must not claim it.
+        self.assertFalse(any('could not delete' in f for f in ctx.flashes),
+                         msg=f'flashes: {ctx.flashes}')
+        self.assertEqual(_read(self.main), self._MAIN)
+        self.assertEqual(ctx.refreshes, 0)
+
+    def test_readonly_edit_offers_write_failure_dialog(self):
+        self._readonly(self.main)
+        ctx = _EditCtx(cursor=_SrcItem(id=('content', self.main, 2),
+                                       kind='heading'),
+                       editor=lambda tmp, n: _rewrite(
+                           tmp, '## Movable\nCHANGED\n'))
+        self.r._action_edit_section(ctx)
+        self.assertTrue(any('could not write main.md' in e
+                            for e in ctx.errors),
+                        msg=f'errors: {ctx.errors}')
+        # The retry dialog reads as a write failure, not as the target
+        # section having changed underneath the editor.
+        self.assertTrue(any('could not save' in p
+                            for p in ctx.confirm_prompts),
+                        msg=f'prompts: {ctx.confirm_prompts}')
+        self.assertFalse(any('changed or moved underneath' in p
+                             for p in ctx.confirm_prompts),
+                         msg=f'prompts: {ctx.confirm_prompts}')
+        self.assertIn('edit cancelled', ctx.flashes)
+        self.assertEqual(_read(self.main), self._MAIN)
+
+    def test_rollback_write_failure_names_both_files(self):
+        # The destination becomes unwritable AFTER its insert landed (a
+        # persist hook chmods it), so the source-cut failure's rollback
+        # fails too — the loud error names both files and the manual
+        # fix; the duplicate is documented as left in the destination.
+        self._readonly(self.main)
+        orig = self.r._persist_document
+
+        def hook(ctx, path, new_text):
+            ok = orig(ctx, path, new_text)
+            if ok and os.path.realpath(path) == os.path.realpath(
+                    self.other):
+                self._readonly(self.other)
+            return ok
+
+        self.r._persist_document = hook
+        self.addCleanup(setattr, self.r, '_persist_document', orig)
+        ctx = self._move(('content', self.main, 2), 'after',
+                         self._md_id(2))
+        loud = [e for e in ctx.errors if 'rollback FAILED' in e]
+        self.assertTrue(loud, msg=f'errors: {ctx.errors}')
+        self.assertIn('main.md', loud[0])
+        self.assertIn('other.md', loud[0])
+        self.assertEqual(_read(self.other).count('## Movable'), 1)
+        self.assertEqual(_read(self.main), self._MAIN)
+        self.assertEqual(ctx.refreshes, 0)
+
+
+class TestSuccessFeedbackFlashes(unittest.TestCase):
+    """Every successful mutation FLASHES its outcome (``log=True``).
+
+    A log line alone is invisible until ``~`` — a user who cannot see
+    that anything happened repeats the gesture and duplicates the
+    change. One op of each kind pins the message in ``ctx.flashes`` AND
+    ``ctx.logs`` (the same string the log-based assertions elsewhere
+    rely on).
+    """
+
+    _DOC = ('# Alpha\nalpha body\n'
+            '## Sub\nsub body\n'
+            '# Beta\nbeta body\n')
+
+    def setUp(self):
+        import tempfile
+        self.r = _load_recipe()
+        fd, self.path = tempfile.mkstemp(suffix='.md')
+        os.close(fd)
+        self.addCleanup(os.unlink, self.path)
+        _rewrite(self.path, self._DOC)
+        self.r._INPUT_FILES = [(self.path, '')]
+        self.r._reparse()
+        self.base = os.path.basename(self.path)
+        self._editor_saved = os.environ.get('EDITOR')
+        os.environ['EDITOR'] = 'fake-ed'
+
+    def tearDown(self):
+        if self._editor_saved is None:
+            os.environ.pop('EDITOR', None)
+        else:
+            os.environ['EDITOR'] = self._editor_saved
+
+    def _item(self, line):
+        return self.r._FILES[self.path].by_id[('content', self.path, line)]
+
+    def _assert_flashed(self, ctx, msg):
+        self.assertIn(msg, ctx.flashes)
+        self.assertIn(msg, ctx.logs)
+
+    def test_edit_flashes(self):
+        ctx = _EditCtx(cursor=self._item(4),
+                       editor=lambda tmp, n: _rewrite(
+                           tmp, '# Beta\nEDITED\n'))
+        self.r._action_edit_section(ctx)
+        self._assert_flashed(ctx,
+                             f'browse-md: edited {self.base} lines 5-6')
+
+    def test_insert_flashes(self):
+        ctx = _EditCtx(editor=lambda tmp, n: _rewrite(
+            tmp, '# New\nnew body\n'))
+        self.r._insert_section_at(ctx, 'after', ('content', self.path, 4))
+        self._assert_flashed(
+            ctx, f'browse-md: inserted section (after) in {self.base}')
+
+    def test_delete_flashes(self):
+        ctx = _EditCtx(cursor=self._item(4), confirms=[True])
+        self.r._action_delete_section(ctx)
+        self._assert_flashed(
+            ctx,
+            f'browse-md: deleted section in {self.base} lines 5-6')
+
+    def test_move_flashes(self):
+        ctx = _EditCtx(cursor=self._item(2))
+        self.r._action_move_section(ctx)
+        ctx.on_confirm('after', ('content', self.path, 4))
+        self._assert_flashed(
+            ctx, f'browse-md: moved section (after) in {self.base}')
 
 
 if __name__ == '__main__':

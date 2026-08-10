@@ -1576,7 +1576,8 @@ def _action_view_source(ctx):
 # documents: both endpoints are re-addressed by the same chain
 # (``_resolve_capture``); a same-document move is one string surgery
 # (``_apply_section_move``), a cross-document one persists the destination
-# insert before the source cut (``_apply_cross_document_move``).
+# insert before the source cut (``_apply_cross_document_move``), rolling
+# the insert back if the cut fails to write.
 
 
 # The at-action-time address of a section extent, consumed by
@@ -1686,15 +1687,25 @@ def _persist_document(ctx, path, new_text):
 
     The stdin document has no file — the new text replaces ``_STDIN_TEXT``
     and a flash makes the in-memory-only nature explicit (logged, so tests
-    and the message log carry it too).
+    and the message log carry it too). Returns ``True`` once the new text
+    landed; a failed disk write (read-only file, vanished directory)
+    surfaces as a sticky ``ctx.error`` and returns ``False`` — callers
+    treat that as operation-failed and skip their success feedback /
+    refresh.
     """
     global _STDIN_TEXT
     if path == _STDIN_PATH:
         _STDIN_TEXT = new_text
         ctx.flash('applied to in-memory copy - not saved to disk', log=True)
-    else:
+        return True
+    try:
         with open(path, 'w', encoding='utf-8') as f:
             f.write(new_text)
+    except OSError as e:
+        ctx.error(f'could not write {os.path.basename(path)}: '
+                  f'{e.strerror or e}')
+        return False
+    return True
 
 
 # Node-shaped carrier for a document root that has no per-file Item — the
@@ -1768,11 +1779,12 @@ def _apply_section_change(ctx, path, cap, content, where, anchor_id=None):
     ``where='replace'`` with empty ``content`` — the library removes the
     extent outright, no trailing-LF massage): ``_read_document`` gives
     the document as it is NOW, ``_apply_splice`` re-addresses the captured
-    extent in it, and on success the new text is persisted, the mutation
-    logged, and ``ctx.refresh()`` re-parses everything (the framework's
-    full-reload path clears the ``md_doc`` cache — so a persisted
-    REFERENCED file is re-read and its subtree rebuilds — rebuilds the
-    per-file state, and preserves cursor / expansion where the ids allow).
+    extent in it, and on success the new text is persisted, the
+    mutation flashed + logged, and ``ctx.refresh()`` re-parses
+    everything (the framework's full-reload path clears the ``md_doc``
+    cache — so a persisted REFERENCED file is re-read and its subtree
+    rebuilds — rebuilds the per-file state, and preserves cursor /
+    expansion where the ids allow).
     An insert (``where != 'replace'``) additionally lands the cursor on
     the new section once the refresh completes: the section starts at the
     first line where old and new text diverge, and its row id follows the
@@ -1781,23 +1793,27 @@ def _apply_section_change(ctx, path, cap, content, where, anchor_id=None):
     line)`` — best-effort (``cursor_to`` leaves the cursor alone when the
     row isn't visible). Returns ``True`` on success, ``False`` when the
     extent could not be re-addressed (the caller offers the retry
-    dialog).
+    dialog), and ``None`` when the splice applied but the write failed
+    (``_persist_document`` already put up the error — no feedback or
+    refresh here, and the callers' changed-underneath wording does not
+    apply).
     """
     src = _read_document(path)
     new_text = _apply_splice(src, cap, content, where=where)
     if new_text is None:
         return False
-    _persist_document(ctx, path, new_text)
+    if not _persist_document(ctx, path, new_text):
+        return None
     if where == 'replace':
         # Empty content is the delete flow (``d`` / an ``E`` edit saved
-        # back empty) — log it as a deletion, not an edit.
+        # back empty) — announce it as a deletion, not an edit.
         verb = 'edited' if content else 'deleted section in'
-        ctx.log(f'browse-md: {verb} {os.path.basename(path)} '
-                f'lines {cap.a}-{cap.b}')
+        ctx.flash(f'browse-md: {verb} {os.path.basename(path)} '
+                  f'lines {cap.a}-{cap.b}', log=True)
         ctx.refresh()
     else:
-        ctx.log(f'browse-md: inserted section ({where}) in '
-                f'{os.path.basename(path)}')
+        ctx.flash(f'browse-md: inserted section ({where}) in '
+                  f'{os.path.basename(path)}', log=True)
         prefix = len(os.path.commonprefix((src, new_text)))
         line = new_text.count('\n', 0, prefix)
         if anchor_id is not None and anchor_id[0] == 'md':
@@ -1860,18 +1876,29 @@ def _editor_splice_loop(ctx, path, cap, seed, where, anchor_id=None):
                     return
                 ctx.flash(f'{verb} cancelled (empty content)')
                 return
-            if _apply_section_change(ctx, path, cap, content, where,
-                                     anchor_id):
+            applied = _apply_section_change(ctx, path, cap, content, where,
+                                            anchor_id)
+            if applied:
                 return
-            # Both addressing steps failed — the target section changed or
-            # moved underneath the editor. Loop back into the same temp
-            # file on "Return"; esc / "Cancel" both land in the falsy arm.
+            # Two distinct failures, one recovery: the retry dialog.
+            # ``None`` — the splice was fine but the disk write failed
+            # (the sticky error names the file and reason); ``False`` —
+            # both addressing steps failed, the target section changed
+            # or moved underneath the editor. Loop back into the same
+            # temp file on "Return"; esc / "Cancel" both land in the
+            # falsy arm.
+            if applied is None:
+                msg = 'could not save: writing the file failed'
+                title = f'{verb} write failure'
+            else:
+                msg = ('could not apply: the target section changed or '
+                       f'moved underneath the {verb}')
+                title = f'{verb} conflict'
             if not ctx.confirm(
-                    'could not apply: the target section changed or moved '
-                    f'underneath the {verb}',
+                    msg,
                     [(f'&Cancel {verb}', False),
                      ('&Return to editor', True)],
-                    title=f'{verb} conflict'):
+                    title=title):
                 ctx.flash(f'{verb} cancelled')
                 return
     finally:
@@ -2128,15 +2155,17 @@ def _apply_cross_document_move(src_path, src_cap, dest_path, dest_cap,
                                relation):
     """Re-address a move whose endpoints live in DIFFERENT documents.
 
-    Returns ``(status, new_src, new_dest, line)``. Status ``'ok'`` carries
-    the source document with the extent cut out, the destination document
-    with it inserted, and the moved block's new 0-based start line in the
+    Returns ``(status, new_src, new_dest, dest_before, line)``. Status
+    ``'ok'`` carries the source document with the extent cut out, the
+    destination document with it inserted, the destination's fresh
+    PRE-insert bytes (the caller's rollback text should the source cut
+    fail to write), and the moved block's new 0-based start line in the
     destination (the cursor-landing row); ``'lost'`` — an endpoint could
-    not be re-addressed — carries ``(None, None, 0)``. Both endpoints
-    resolve against fresh reads of their OWN documents before anything is
-    computed, so a lost endpoint costs nothing; the caller then writes the
-    destination insert before the source cut, so the worst interruption
-    case is a duplicate, never a loss. The block keeps the
+    not be re-addressed — carries ``(None, None, None, 0)``. Both
+    endpoints resolve against fresh reads of their OWN documents before
+    anything is computed, so a lost endpoint costs nothing; the caller
+    then writes the destination insert before the source cut, so the
+    worst interruption case is a duplicate, never a loss. The block keeps the
     trailing-newline guarantee (``_move_surgery``'s rule); the
     within-extent no-op rule cannot apply across documents by
     construction (the insert point lies in the other file).
@@ -2147,14 +2176,14 @@ def _apply_cross_document_move(src_path, src_cap, dest_path, dest_cap,
     dest_doc = _md2ansi_doc(dest_text)
     dest_t = _resolve_capture(dest_text, dest_cap, dest_doc)
     if src_t is None or dest_t is None:
-        return 'lost', None, None, 0
+        return 'lost', None, None, None, 0
     block = src_text[src_t.start:src_t.end]
     if block and not block.endswith('\n'):
         block += '\n'
     ins = _insert_offset(dest_t, relation, dest_doc)
     new_src = src_text[:src_t.start] + src_text[src_t.end:]
     new_dest = dest_text[:ins] + block + dest_text[ins:]
-    return 'ok', new_src, new_dest, dest_text.count('\n', 0, ins)
+    return 'ok', new_src, new_dest, dest_text, dest_text.count('\n', 0, ins)
 
 
 def _move_section_to(ctx, src_path, src_cap, relation, dest_id):
@@ -2172,7 +2201,9 @@ def _move_section_to(ctx, src_path, src_cap, relation, dest_id):
       * DIFFERENT documents — ``_apply_cross_document_move``: both
         endpoints re-addressed against fresh reads FIRST (any failure
         flashes, nothing written), then the destination insert is
-        persisted before the source cut.
+        persisted before the source cut; a source cut that fails to
+        WRITE rolls the destination back to its pre-insert bytes, so
+        the duplicate never survives the failure.
 
     No editor is involved, so an endpoint that changed underneath the
     marker just flashes — nothing to preserve, re-check and repeat. On
@@ -2212,23 +2243,36 @@ def _move_section_to(ctx, src_path, src_cap, relation, dest_id):
             ctx.flash('could not move: the document changed underneath — '
                       'Ctrl-R and retry')
             return
-        _persist_document(ctx, src_path, new_text)
-        ctx.log(f'browse-md: moved section ({relation}) in '
-                f'{os.path.basename(src_path)}')
+        if not _persist_document(ctx, src_path, new_text):
+            return
+        ctx.flash(f'browse-md: moved section ({relation}) in '
+                  f'{os.path.basename(src_path)}', log=True)
     else:
-        status, new_src, new_dest, line = _apply_cross_document_move(
-            src_path, src_cap, dest_path, dest_cap, relation)
+        status, new_src, new_dest, dest_before, line = (
+            _apply_cross_document_move(
+                src_path, src_cap, dest_path, dest_cap, relation))
         if status == 'lost':
             ctx.flash('could not move: a document changed underneath — '
                       'Ctrl-R and retry')
             return
         # Destination insert first, source cut second — an interruption
-        # between the two writes leaves a duplicate, never a loss.
-        _persist_document(ctx, dest_path, new_dest)
-        _persist_document(ctx, src_path, new_src)
-        ctx.log(f'browse-md: moved section ({relation}) from '
-                f'{os.path.basename(src_path)} to '
-                f'{os.path.basename(dest_path)}')
+        # between the two writes leaves a duplicate, never a loss. A
+        # source cut that FAILS to write rolls the destination back to
+        # its pre-insert bytes, so a retry cannot accumulate copies.
+        if not _persist_document(ctx, dest_path, new_dest):
+            return
+        if not _persist_document(ctx, src_path, new_src):
+            if not _persist_document(ctx, dest_path, dest_before):
+                ctx.error(
+                    'move rollback FAILED: '
+                    f'{os.path.basename(dest_path)} kept a copy of the '
+                    'section that could not be cut from '
+                    f'{os.path.basename(src_path)} — remove the '
+                    f'duplicate from {dest_path} by hand')
+            return
+        ctx.flash(f'browse-md: moved section ({relation}) from '
+                  f'{os.path.basename(src_path)} to '
+                  f'{os.path.basename(dest_path)}', log=True)
     if dest_id[0] == 'md':
         row_id = ('md', dest_id[1], dest_id[2], line)
     else:
@@ -2242,13 +2286,14 @@ def _delete_extent(ctx, path, cap):
     The shared tail of ``d`` and the E-saved-back-empty dialog — the same
     hash-verified ``_apply_section_change`` chain as an edit, with empty
     content (which the library treats as pure extent removal, no
-    trailing-LF massage). On success that logs the deletion and
-    refreshes; a document that changed underneath just flashes — no
+    trailing-LF massage). On success that flashes + logs the deletion
+    and refreshes; a document that changed underneath just flashes — no
     retry dialog, a delete carries nothing to preserve (Ctrl-R and
-    repeat). Stdin deletions land on the in-memory copy with its usual
+    repeat); a failed write (``None``) already put up its own error.
+    Stdin deletions land on the in-memory copy with its usual
     not-saved flash.
     """
-    if not _apply_section_change(ctx, path, cap, '', 'replace'):
+    if _apply_section_change(ctx, path, cap, '', 'replace') is False:
         ctx.flash('could not delete: the document changed underneath — '
                   'Ctrl-R and retry')
 
