@@ -42,12 +42,11 @@ Custom actions on top of the framework defaults:
 
   m   toggle md2ansi coloring of the preview.
   M   page the preview through ``$MDCAT`` / external ``mdcat``.
-  V   page the source for cursor/selection in ``$PAGER``. On a
-      per-file root opens that file; on non-root rows pages a temp
-      file containing the merged byte-range slices. Cross-file
-      multi-select groups targets by file, merges byte ranges per
-      file, and concatenates the resulting slices with a
-      ``\\n===== <filename> =====\\n`` separator between groups.
+  V   page the source for the CURSOR row in ``$PAGER``. On a
+      document root — a per-file root or an ``[md]`` referenced-doc
+      root — opens that file directly; on a heading / text row
+      (primary or inside a referenced file) pages a temp file
+      containing the section's byte slice.
   E   edit the section under the cursor in ``$EDITOR``. A document
       ROOT row — a per-file root or an ``[md]`` reference-subtree
       doc root — edits its file in place; a heading / text row
@@ -55,7 +54,7 @@ Custom actions on top of the framework defaults:
       extent in a temp .md and re-applies it via a hash-verified
       splice, so a file that changed underneath the editor is
       re-addressed rather than corrupted. The stdin document applies
-      to the in-memory copy. Cursor only — selection is ignored.
+      to the in-memory copy.
   a/i insert a new section via the framework's placement marker:
       confirm yields ``(relation, dest_id)`` (before / after / first)
       which maps 1:1 onto the splice position; ``$EDITOR`` opens a
@@ -80,6 +79,12 @@ Custom actions on top of the framework defaults:
       is auto-expanded too, so a single-heading document reveals its
       sections in one keystroke. The same cascade runs on the
       single-file startup auto-expand.
+
+The framework's multi-select keys (space, alt-space, ctrl-a, ctrl-n)
+are overridden to a "selection is disabled in browse-md" flash — every
+action here is cursor-only, so a user-built selection could only
+mislead. The selection SET itself stays in use programmatically: ``x``
+re-points it at the moving row as the move highlight.
 
 Usage:  browse-md [FILE.md[#anchor] | DIR ... | -]
 """
@@ -1456,291 +1461,86 @@ def _split_cmd(s):
     return shlex.split(s)
 
 
-def _merge_ranges(ranges):
-    """Sort + merge overlapping/adjacent ``(byte_offset, byte_size)`` ranges.
-
-    Returns a new list, sorted by ``byte_offset`` ascending, with no
-    overlaps and no adjacent ranges (adjacent ranges are merged into
-    one). Adjacency means ``next.byte_offset == current_end`` — the
-    next range starts exactly where the current ends, so concatenation
-    is byte-perfect with no gap.
-
-    Algorithm: stable sort by ``byte_offset``, then a single linear
-    walk. For each next range, if its start is ``<= current_end``,
-    extend ``current_end`` to ``max(current_end, next_end)``;
-    otherwise emit the current range and start a new one. The
-    ``<= current_end`` test covers both overlap and adjacency in one
-    branch.
-
-    Edge cases:
-      * Empty input → empty output.
-      * Single range → list with that one range.
-      * Identical ranges → deduped to one.
-      * A range fully contained in another → the outer survives.
-    """
-    if not ranges:
-        return []
-    ordered = sorted(ranges, key=lambda r: r[0])
-    merged = []
-    cur_bo, cur_bs = ordered[0]
-    cur_end = cur_bo + cur_bs
-    for nxt_bo, nxt_bs in ordered[1:]:
-        nxt_end = nxt_bo + nxt_bs
-        if nxt_bo <= cur_end:
-            # Overlap or adjacency — extend the current range's end.
-            if nxt_end > cur_end:
-                cur_end = nxt_end
-        else:
-            merged.append((cur_bo, cur_end - cur_bo))
-            cur_bo = nxt_bo
-            cur_end = nxt_end
-    merged.append((cur_bo, cur_end - cur_bo))
-    return merged
-
-
-def _write_range_excerpts(ranges, file_text=None):
-    """Write merged byte-range slices to a temp .md file.
-
-    ``ranges`` is the output of ``_merge_ranges`` — sorted,
-    non-overlapping ``(byte_offset, byte_size)`` tuples. Each slice is
-    ``file_text[bo:bo+bs]``; when the previous slice doesn't end with
-    ``\\n`` and there's a next slice, an explicit ``\\n`` is inserted
-    so the boundary between two adjacent-but-not-adjacent ranges still
-    reads as a line break. (Truly adjacent ranges — the kind
-    ``_merge_ranges`` already coalesces — never reach this branch.)
-
-    ``file_text`` defaults to ``_FILE_TEXT`` so legacy callers (and
-    tests that populate the module-level shim directly) keep working
-    without explicit plumbing. Multi-file callers should pass the
-    right file's text in explicitly — the per-file
-    ``_FILES[path].text`` is the source of truth in that mode.
-
-    Returns the path to the written file; the caller is responsible
-    for ``os.unlink`` in a ``finally``. ``errors='surrogateescape'``
-    matches the convention used by ``_action_md_preview`` so stray
-    non-UTF-8 bytes round-trip rather than raising.
-    """
-    import tempfile
-    if file_text is None:
-        file_text = _FILE_TEXT
-    tmp = tempfile.NamedTemporaryFile(
-        'w', suffix='.md', delete=False,
-        encoding='utf-8', errors='surrogateescape',
-    )
-    try:
-        prev_slice = ''
-        for bo, bs in ranges:
-            piece = file_text[bo:bo + bs]
-            if prev_slice and not prev_slice.endswith('\n'):
-                tmp.write('\n')
-            tmp.write(piece)
-            prev_slice = piece
-    finally:
-        tmp.close()
-    return tmp.name
-
-
-def _write_range_excerpts_grouped(groups):
-    """Write per-file merged byte-range slices to a single temp .md file.
-
-    ``groups`` is an ordered list of ``(path, file_text, merged_ranges)``
-    tuples — typically produced by ``_run_source_command`` grouping
-    targets by ``file_path`` (in argv order) and running
-    ``_merge_ranges`` per file.
-
-    When ``groups`` contains MORE THAN ONE file, every group is
-    prefixed with a ``===== <basename(path)> =====\\n`` header —
-    including the FIRST group — so the reader can tell where each
-    file's content begins. When ``groups`` contains a single file,
-    no header is emitted (the user already knows which file they
-    selected from). Within a group, slices are written via the same
-    ``\\n``-insertion logic used by ``_write_range_excerpts`` —
-    boundaries between non-adjacent ranges get an explicit newline.
-
-    Returns the path to the written file; caller unlinks in
-    ``finally``.
-    """
-    import tempfile
-    multi = len(groups) > 1
-    tmp = tempfile.NamedTemporaryFile(
-        'w', suffix='.md', delete=False,
-        encoding='utf-8', errors='surrogateescape',
-    )
-    try:
-        for path, file_text, ranges in groups:
-            if multi:
-                # Header before every group, including the first, so
-                # the first file's boundary is just as visible as the
-                # subsequent ones.
-                tmp.write(f'===== {os.path.basename(path)} =====\n')
-            prev_slice = ''
-            for bo, bs in ranges:
-                piece = file_text[bo:bo + bs]
-                if prev_slice and not prev_slice.endswith('\n'):
-                    tmp.write('\n')
-                tmp.write(piece)
-                prev_slice = piece
-    finally:
-        tmp.close()
-    return tmp.name
-
-
 def _run_source_command(ctx):
-    """Body of ``V``: resolve targets, dispatch ``$PAGER`` (default
-    ``less -R``).
+    """Body of ``V``: page the CURSOR row's source in ``$PAGER``
+    (default ``less -R``).
 
-    Strategy:
+    Dispatch on the row resolved through ``_row_document`` — the same
+    single row→document mapping the section operations (E / a / x)
+    route through, which also serves the framework's synthetic
+    scope-root pseudo-Item (#552: the id is the lookup key, not the
+    Item's attrs):
 
-      * ``ctx.targets`` handles "selection-or-cursor".
-      * **Exactly one target, and it is a file-root** → open the
-        original file directly (no tempfile). Covers both "cursor on
-        a file row, no selection" and "one file row space-marked,
-        nothing else".
-      * **Anything else** (any multi-target situation, including
-        roots mixed with content) → produce a temp file. Every
-        target contributes a byte range to be sliced out of its
-        file's text:
-          * a file-root expands to that file's whole text
-            ``(0, len(file_text))``;
-          * a content target uses its own
-            ``(byte_offset, byte_size)``.
-        Ranges are grouped by file in argv order, merged per file
-        (so a whole-file range naturally absorbs any sub-ranges
-        from the same file), then concatenated into one temp ``.md``
-        passed to ``$PAGER``. When more than one file contributes,
-        every group is prefixed with a ``===== <basename> =====``
-        header — including the first — so the reader can spot file
-        boundaries.
+      * a document ROOT — a per-file root ``('file', path)`` or an
+        ``[md]`` referenced-doc root ``('md', anchor, chain, None)`` —
+        opens the original file directly (no tempfile), so E edits to
+        it persist naturally;
+      * a heading / text row — primary ``('content', path, line)`` or
+        inside a referenced file ``('md', anchor, chain, line)`` —
+        pages a temp ``.md`` holding the section's
+        ``(byte_offset, byte_size)`` slice;
+      * anything else (no cursor, the References umbrella, a stale
+        id) — silent no-op.
 
-    Empty ``targets`` (no cursor, no selection) is a no-op. The stdin
-    document has no on-disk source, so ``V`` flashes a message and
-    returns rather than fabricating a temp file.
-
-    Root detection — there are two "open the file directly" shapes, both
-    carrying a ``('file', path)`` id:
-      * Real per-file root: ``kind == 'root'``.
-      * Framework's synthetic scope-root pseudo-Item (#552): no
-        ``kind`` attr at all; its id is the scope id ``('file', path)``
-        whose ``path`` is a key in ``_FILES`` (or ``_ROOT_PATH`` in the
-        legacy single-file test path).
+    The stdin document has no on-disk source to page, and we add no
+    temp-file machinery for it. Degrade gracefully with a flash — the
+    framework's built-in ``v`` (which pages the rendered preview text,
+    not the source) still works for the piped document, and ``E`` edits
+    its in-memory copy. Stdin mode is always a single document, so its
+    presence in ``_FILES`` means every row belongs to it.
     """
-    targets = ctx.targets
-    if not targets:
+    item = ctx.cursor
+    if item is None:
         return
-
-    # The stdin document has no on-disk source to page. ``V`` is about the
-    # file on disk; there is none, and we add no temp-file machinery for
-    # it. Degrade gracefully with a flash — the framework's built-in ``v``
-    # (which pages the rendered preview text, not the source) still works
-    # for the piped document, and ``E`` edits its in-memory copy. Stdin
-    # mode is always a single document, so its presence in ``_FILES``
-    # means every target belongs to it.
     if _STDIN_PATH in _FILES:
         ctx.flash('no source file for the stdin document — use v for '
                   'the preview text')
         return
-
-    def _id_file_path(it):
-        # The abspath inside a ``('file', path)`` id, else ``None``.
-        if isinstance(it.id, tuple) and it.id and it.id[0] == 'file':
-            return it.id[1]
-        return None
-
-    def _is_root(it):
-        # Real per-file root attr first — common case.
-        if getattr(it, 'kind', None) == 'root':
-            return True
-        # Framework's scope-root pseudo-Item lacks ``kind`` but its
-        # id is ``('file', path)``: a root iff that path is a known
-        # file. Legacy single-file callers fall through to ``_ROOT_PATH``
-        # when ``_FILES`` is empty (tests don't go through ``_reparse``).
-        path = _id_file_path(it)
-        return path is not None and (path in _FILES or path == _ROOT_PATH)
-
-    def _root_path(it):
-        # The file abspath for a real per-file root or scope-root
-        # pseudo-Item (both carry a ``('file', path)`` id).
-        return _id_file_path(it) or _ROOT_PATH
-
+    resolved = _row_document(item.id)
+    if resolved is None:
+        return
+    path, text, node = resolved
     cmd = _split_cmd(os.environ.get('PAGER') or 'less -R')
-
-    # Single-target shortcut: cursor or sole-selection on a file row
-    # → open the file directly. Edits via E persist. This is the ONLY
-    # path that bypasses the tempfile pipeline — any larger selection
-    # (even if it contains one file-root and one heading) flows
-    # through the unified expansion below.
-    if len(targets) == 1 and _is_root(targets[0]):
-        ctx.run_external(cmd + [_root_path(targets[0])])
+    if node.kind == 'root':
+        ctx.run_external(cmd + [path])
         return
-
-    # Otherwise: expand every target into a (file_path, byte_offset,
-    # byte_size) triple. File-root targets expand to the file's full
-    # byte range so when merged with sibling content targets the
-    # whole-file range naturally absorbs them.
-    expanded = []
-    for t in targets:
-        if _is_root(t):
-            path = _root_path(t)
-            fs = _FILES.get(path)
-            if fs is not None:
-                expanded.append((path, 0, len(fs.text)))
-            elif path == _ROOT_PATH:
-                # Legacy single-file fixture path (no ``_FILES``
-                # entry — tests populate ``_FILE_TEXT`` / ``_ROOT_PATH``
-                # directly). Fall through with ``file_path=None`` so
-                # the grouping branch picks up ``_FILE_TEXT``.
-                expanded.append((None, 0, len(_FILE_TEXT)))
-        else:
-            fp = getattr(t, 'file_path', None)
-            bo = getattr(t, 'byte_offset', None)
-            bs = getattr(t, 'byte_size', None)
-            if bo is None or bs is None:
-                # Defensive: skip targets we can't slice.
-                continue
-            expanded.append((fp, bo, bs))
-
-    if not expanded:
-        return
-
-    # Group by file in argv order. Files not in ``_INPUT_FILES``
-    # (legacy single-file tests where ``file_path`` is None) go last
-    # and fall through to ``_FILE_TEXT``.
-    by_path = {}
-    for path, bo, bs in expanded:
-        by_path.setdefault(path, []).append((bo, bs))
-    groups = []
-    seen = set()
-    for p, _ in _INPUT_FILES:
-        if p in by_path and p not in seen:
-            seen.add(p)
-            fs = _FILES.get(p)
-            if fs is not None:
-                groups.append((p, fs.text, _merge_ranges(by_path[p])))
-    if None in by_path:
-        groups.append(
-            (_ROOT_PATH or '', _FILE_TEXT, _merge_ranges(by_path[None]))
-        )
-
-    if not groups:
-        return
-    tmp_path = _write_range_excerpts_grouped(groups)
+    import tempfile
+    tmp = tempfile.NamedTemporaryFile(
+        'w', suffix='.md', delete=False,
+        encoding='utf-8', errors='surrogateescape',
+    )
     try:
-        ctx.run_external(cmd + [tmp_path])
+        tmp.write(text[node.byte_offset:node.byte_offset + node.byte_size])
+    finally:
+        tmp.close()
+    try:
+        ctx.run_external(cmd + [tmp.name])
     finally:
         try:
-            os.unlink(tmp_path)
+            os.unlink(tmp.name)
         except OSError:
             pass
 
 
-def _action_view_source(ctx):
-    """``V`` — page the source for the cursor row (or selection) in $PAGER.
+def _action_selection_disabled(ctx):
+    """Any framework multi-select key — flash instead of selecting.
 
-    On a per-file root row this pages the original file directly; on
-    non-root rows it pages a temp .md file containing the merged
-    byte-range slices for every targeted item. Cross-file selections
-    group ranges by file and concatenate the per-file slices with a
-    ``\\n===== <filename> =====\\n`` separator. Pairs with the
+    Every browse-md action is cursor-only, so a user-built selection
+    could only mislead (nothing reads it). The four default selection
+    keys are overridden to this handler so they are discoverably dead
+    rather than silently confusing. The selection SET itself stays in
+    use programmatically — ``x`` re-points it at the moving row as the
+    move highlight.
+    """
+    ctx.flash('selection is disabled in browse-md')
+
+
+def _action_view_source(ctx):
+    """``V`` — page the source for the cursor row in $PAGER.
+
+    On a document root row (per-file or ``[md]`` referenced-doc) this
+    pages the original file directly; on a heading / text row it pages
+    a temp .md file containing the section's byte slice. Pairs with the
     framework's built-in ``v`` (which pages the *preview* text, not
     the on-disk source).
     """
@@ -2053,8 +1853,9 @@ def _editor_splice_loop(ctx, path, cap, seed, where, anchor_id=None):
 def _action_edit_section(ctx):
     """``E`` — edit the section under the CURSOR in ``$EDITOR``.
 
-    Cursor node only — the selection is ignored (``V`` keeps the
-    multi-select grouping behavior). Dispatch on the cursor id:
+    Cursor node only — even a programmatically populated selection
+    (x's move highlight) never widens the edit. Dispatch on the
+    cursor id:
 
       * a document ROOT row backed by an on-disk file — the per-file root
         ``('file', path)`` and the ``[md]`` doc root of a referenced file
@@ -2630,22 +2431,27 @@ def context_menu_ref(ctx, item_id):
     (``item_id[3]``): the DOC ROOT row's "Edit referenced file" IS the ``E``
     action on that row (in-place $EDITOR + refresh — one behavior, hinted),
     while a heading / text row inside the file gets the section-level
-    "Edit section (E)" / "Move section (x)" plus the plain whole-file
-    "Edit referenced file" (which is NOT what ``E`` does there, so no
-    hint). "Insert here (a)" enters the same marker mode the keybinding
-    does; the section lands in the referenced file. "Show link target"
+    "Edit section (E)" / "Move section (x)" / "View section in $PAGER
+    (V)" plus the plain whole-file "Edit referenced file" (which is NOT
+    what ``E`` does there, so no hint). "Insert here (a)" enters the
+    same marker mode the keybinding does; the section lands in the
+    referenced file. The View rows duplicate the ``V`` action (the doc
+    ROOT pages the referenced file itself; a section row pages its byte
+    slice), ordered as in the file / content menus. "Show link target"
     pops up the resolved absolute path the reference points at.
     """
     rows = [('Open referenced doc in browse-md', 'ref.open')]
     if item_id[3] is None:
-        rows.append(('Edit referenced file (E)', 'md.edit'))
-        rows.append(('Insert here (a)',          'md.insert'))
+        rows.append(('Edit referenced file (E)',            'md.edit'))
+        rows.append(('Insert here (a)',                     'md.insert'))
+        rows.append(('View referenced file in $PAGER (V)',  'md.view'))
     else:
         # Section-level actions adjacent, the whole-file arm after them.
-        rows.append(('Edit section (E)',     'md.edit'))
-        rows.append(('Insert here (a)',      'md.insert'))
-        rows.append(('Move section (x)',     'md.move'))
-        rows.append(('Edit referenced file', 'ref.edit'))
+        rows.append(('Edit section (E)',           'md.edit'))
+        rows.append(('Insert here (a)',            'md.insert'))
+        rows.append(('Move section (x)',           'md.move'))
+        rows.append(('View section in $PAGER (V)', 'md.view'))
+        rows.append(('Edit referenced file',       'ref.edit'))
     rows.append(('Show link target', 'ref.target'))
     return rows
 
@@ -2657,7 +2463,7 @@ def context_menu_ref(ctx, item_id):
 # pulls the fields it needs from the id tuple. The per-row source actions reuse
 # the recipe's existing action handlers (``_action_edit_section`` /
 # ``_action_view_source`` / ``_action_md_preview`` / ``_action_toggle_md``),
-# which read ``ctx.cursor`` / ``ctx.targets`` themselves, so the menu rows stay
+# which read ``ctx.cursor`` themselves, so the menu rows stay
 # single-sourced with the E / a / V / M / m keybindings. "Re-scan all files"
 # reuses the framework's reload via ``ctx.refresh()`` — the same call the Ctrl-R action
 # makes (a root refresh enqueues with ``reload=True`` → ``get_children(None,
@@ -2682,11 +2488,12 @@ _MENU_ACTIONS = {
     'content.anchor':   lambda c, i: _cm_content_anchor(c, i),
     'content.expand':   lambda c, i: _cm_content_expand(c, i),
     'content.collapse': lambda c, i: _cm_content_collapse(c, i),
-    # cross-file reference — E / a / x on the row (section-level, or in-place
-    # on the doc root), open / edit the referenced file, show its path.
+    # cross-file reference — E / a / x / V on the row (section-level, or
+    # in-place on the doc root), open / edit the referenced file, show its path.
     'md.edit':     lambda c, i: _action_edit_section(c),
     'md.insert':   lambda c, i: _action_insert_section(c),
     'md.move':     lambda c, i: _action_move_section(c),
+    'md.view':     lambda c, i: _action_view_source(c),
     'ref.open':    lambda c, i: _cm_ref_open(c, _md_ref_target(i)),
     'ref.edit':    lambda c, i: _cm_ref_edit(c, _md_ref_target(i)),
     'ref.target':  lambda c, i: c.alert(_md_ref_target(i), title='link target'),
@@ -2780,17 +2587,16 @@ browse-md — markdown browser for one or more files.
 
   m       Toggle md2ansi coloring.
   M       Render the preview through ``$MDCAT`` / mdcat.
-  V       Page source for cursor/selection in ``$PAGER``. On a
-          per-file root opens that file directly; on non-root rows
-          pages a temp file with the merged byte-range slices
-          (cross-file selections group by file with a per-file header).
-  E       Edit the section under the cursor in ``$EDITOR`` (cursor
-          only — selection ignored). A file / referenced-doc root row
-          edits its file in place; a heading / text row — primary or
-          inside a referenced file — edits the section in a temp file
-          and re-applies it via a hash-verified splice, so a file that
-          changed underneath the editor is never corrupted. The stdin
-          document applies to its in-memory copy.
+  V       Page the cursor row's source in ``$PAGER``. On a file /
+          referenced-doc root opens that file directly; on a heading /
+          text row pages a temp file with the section's byte slice.
+  E       Edit the section under the cursor in ``$EDITOR``. A file /
+          referenced-doc root row edits its file in place; a heading /
+          text row — primary or inside a referenced file — edits the
+          section in a temp file and re-applies it via a hash-verified
+          splice, so a file that changed underneath the editor is
+          never corrupted. The stdin document applies to its in-memory
+          copy.
   a / i   Insert a new section: place the marker (arrows; enter
           confirms, esc cancels) on any file / heading / text row —
           reference rows land in the referenced file — then ``$EDITOR``
@@ -2803,12 +2609,16 @@ browse-md — markdown browser for one or more files.
           conflict-safe re-addressing as E; stdin stays in-memory).
   Ctrl-R  Re-slurp every input file and rebuild the tree.
 
+Multi-select is disabled — every action is cursor-only, and the
+framework's selection keys (space and friends) flash instead.
+
 Right-click a row (or the backslash / F1 keys) for a menu keyed to its
 kind: a file row edits / inserts / views / renders, opens its dir in
 browse-fs, shows its path, or re-scans; a heading / text row acts on
 the section, inserts, moves, shows the heading anchor, and expands or
-collapses; a cross-file reference edits / inserts / moves on the row,
-opens or edits the referenced file, and shows its resolved path.\
+collapses; a cross-file reference edits / inserts / moves / views on
+the row, opens or edits the referenced file, and shows its resolved
+path.\
 """
 
 
@@ -2994,6 +2804,63 @@ def _resolve_roots(raw_values):
     return roots
 
 
+# The framework's four multi-select defaults, overridden per-recipe (a
+# user action on the same key wins the keymap — 070-actions
+# ``build_keymap``). Module-level so tests can pin the exact key set.
+_SELECTION_KEYS = ('space', 'alt- ', 'ctrl-a', 'ctrl-n')
+
+
+def _build_actions():
+    """The recipe's Action list — everything ``main()`` hands the Browser.
+
+    * ``m`` (toggle library coloring) and ``M`` (page through the
+      external ``$MDCAT`` / ``mdcat`` program) are both always bound.
+      ``m`` is safe to wire unconditionally because md2ansi_lib is a
+      hard dependency past the ``main()`` gate, so ``_md2ansi_fn`` is
+      always present. ``M`` errors gracefully when no external renderer
+      is found, so users still discover the env-var hook.
+    * ``V`` / ``E`` are cursor-only but gated ``'none'`` so they also
+      fire on the synthetic scope row of a scoped session (a normal
+      cursor row to the handlers, filtered by a ``'cursor'`` gate).
+    * ``a`` and ``i`` are the same insert action (vim's two spellings
+      of "add here") — both enter the framework's marker mode; the
+      splice happens on marker confirm. Help shows one row (the ``i``
+      alias's description is blank, matching how the framework
+      collapses paired default keys).
+    * ``x`` cuts the section under the cursor and re-inserts it at a
+      marker-chosen position (browse-plan's move keys ``m``/``M`` are
+      both taken here — the coloring toggle and the $MDCAT view). The
+      cursor row stays highlighted via the selection while the marker
+      is up.
+    * The framework's multi-select keys (``_SELECTION_KEYS``) are
+      overridden to a "selection is disabled" flash — nothing in this
+      recipe reads a user selection. Blank labels keep them out of the
+      help's CUSTOM ACTIONS section; the built-in ``?`` overlay still
+      shows the framework's static SELECTION section (the composer
+      renders ``default_actions()`` unconditionally), which the
+      ``_HELP_INTRO`` note counters.
+    """
+    actions = [
+        Action('m', 'Toggle markdown coloring', _action_toggle_md, 'none'),
+        Action('M', 'View preview via $MDCAT / mdcat',
+               _action_md_preview, 'cursor'),
+        Action('V', 'View source for cursor row in $PAGER',
+               _action_view_source, 'none'),
+        Action('E', 'Edit section under cursor in $EDITOR',
+               _action_edit_section, 'none'),
+        Action('a', 'Insert new section at marker',
+               _action_insert_section, 'none'),
+        Action('i', '', _action_insert_section, 'none'),
+        Action('x', 'Move section to marker (cut + re-insert)',
+               _action_move_section, 'none'),
+    ]
+    actions.extend(
+        Action(key, '', _action_selection_disabled, 'none')
+        for key in _SELECTION_KEYS
+    )
+    return actions
+
+
 def main():
     global _ANCHOR, _BROWSER, _INPUT_FILES, _ROOTS, _STDIN_TEXT
     # ``-h`` / ``--help``: popped BEFORE the leftover-option scan below
@@ -3120,38 +2987,6 @@ def main():
     else:
         initial_scope = None
 
-    # ``m`` (toggle library coloring) and ``M`` (page through the
-    # external ``$MDCAT`` / ``mdcat`` program) are both always
-    # bound. ``m`` is safe to wire unconditionally because md2ansi_lib
-    # is a hard dependency past the gate above, so ``_md2ansi_fn`` is
-    # always present. ``M`` errors gracefully when no external renderer
-    # is found, so users still discover the env-var hook.
-    actions = [Action('m', 'Toggle markdown coloring',
-                      _action_toggle_md, 'none'),
-               Action('M', 'View preview via $MDCAT / mdcat',
-                      _action_md_preview, 'cursor')]
-    # ``V`` operates on ``ctx.targets`` (selection-or-cursor), including
-    # the synthetic root row of a scoped session — hence the ``'none'``
-    # gate. ``E`` is cursor-only (the scope row is a normal cursor row,
-    # so the same gate serves it).
-    actions.append(Action('V', 'View source for cursor/selection in $PAGER',
-                          _action_view_source, 'none'))
-    actions.append(Action('E', 'Edit section under cursor in $EDITOR',
-                          _action_edit_section, 'none'))
-    # ``a`` and ``i`` are the same insert action (vim's two spellings of
-    # "add here") — both enter the framework's marker mode; the splice
-    # happens on marker confirm. Help shows one row (the ``i`` alias's
-    # description is blank, matching how the framework collapses paired
-    # default keys).
-    actions.append(Action('a', 'Insert new section at marker',
-                          _action_insert_section, 'none'))
-    actions.append(Action('i', '', _action_insert_section, 'none'))
-    # ``x`` cuts the section under the cursor and re-inserts it at a
-    # marker-chosen position (browse-plan's move keys ``m``/``M`` are both
-    # taken here — the coloring toggle and the $MDCAT view). The cursor row
-    # stays highlighted via the selection while the marker is up.
-    actions.append(Action('x', 'Move section to marker (cut + re-insert)',
-                          _action_move_section, 'none'))
     # The built-in Right-arrow (``_nav_right``) handles expand and
     # step-into-first-child; the lone-heading auto-expand rides the
     # ``on_expand`` hook below so it fires for every expansion source,
@@ -3165,7 +3000,7 @@ def main():
         get_preview=get_preview,
         initial_scope=initial_scope,
         on_enter='noop',
-        actions=actions,
+        actions=_build_actions(),
         on_expand=_on_expand,
         # Right-click (or the backslash / F1 keys) on a row opens a menu keyed
         # to the cursor's kind: file roots offer file-level source actions +

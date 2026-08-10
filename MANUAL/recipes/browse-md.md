@@ -28,9 +28,10 @@ files or directories; `FILE.md#section` deep-links straight to a heading.
   the layout changes.
 - Dim `[text]` rows synthesised for a non-empty body run that precedes a
   scope's first sub-heading (a leaf section's body stays in its preview).
-- Cross-file multi-select viewing — `V` groups selected rows by file,
-  merges their byte ranges, and concatenates the slices with a per-file
-  separator.
+- Framework defaults overridden per-recipe — every action is
+  cursor-only, so the built-in selection keys (space, alt-space,
+  ctrl-a, ctrl-n) are rebound to a "selection is disabled" flash; the
+  selection set itself survives as `x`'s programmatic move highlight.
 - Conflict-safe section editing — `E` opens the cursor row's section in
   `$EDITOR` (a file or referenced-doc root row edits its file in place)
   and re-applies the result through `md2ansi_lib`'s hash-addressed
@@ -80,7 +81,9 @@ git show HEAD:README.md | ./recipes/browse-md - --root "$(git rev-parse --show-t
 ```
 
 Keys: `m` toggle md2ansi coloring, `M` page the preview through
-`$MDCAT` / `mdcat`, `V` page the source in `$PAGER`, `E` edit the
+`$MDCAT` / `mdcat`, `V` page the cursor row's source in `$PAGER` (a
+root row opens the file itself, a section row pages its byte slice),
+`E` edit the
 section under the cursor in `$EDITOR` (conflict-safe splice on save;
 reference rows edit the referenced file), `a` / `i` insert a new
 section at a marker-chosen position (primary or referenced document),

@@ -128,7 +128,19 @@ def _stub_browse_tui():
         def expand(self, id, *a, **kw):
             self.expand_calls.append((id, a, kw))
 
-    mod.Action = _Stub
+    class _ActionStub:
+        """Action stub mirroring the framework dataclass's field order
+        (key, label, handler, requires, section) so tests can inspect
+        the recipe's ``_build_actions()`` output."""
+        def __init__(self, key='', label='', handler=None,
+                     requires='none', section=''):
+            self.key = key
+            self.label = label
+            self.handler = handler
+            self.requires = requires
+            self.section = section
+
+    mod.Action = _ActionStub
     mod.Browser = _BrowserStub
     mod.BrowserConfig = _Stub
     mod.Item = _Stub
@@ -1196,137 +1208,16 @@ class TestResolveMdPager(unittest.TestCase):
             restore()
 
 
-class TestMergeRanges(unittest.TestCase):
-    """``_merge_ranges`` — sort + dedupe + adjacency-merge ``(bo, bs)``."""
-
-    @classmethod
-    def setUpClass(cls):
-        cls.r = _load_recipe()
-
-    def test_empty_list(self):
-        self.assertEqual(self.r._merge_ranges([]), [])
-
-    def test_single_range(self):
-        self.assertEqual(self.r._merge_ranges([(10, 5)]), [(10, 5)])
-
-    def test_two_disjoint_in_order(self):
-        # Disjoint and already sorted — passthrough.
-        self.assertEqual(
-            self.r._merge_ranges([(0, 5), (10, 3)]),
-            [(0, 5), (10, 3)],
-        )
-
-    def test_two_disjoint_out_of_order(self):
-        # Same disjoint ranges but reversed input — sorted in output.
-        self.assertEqual(
-            self.r._merge_ranges([(10, 3), (0, 5)]),
-            [(0, 5), (10, 3)],
-        )
-
-    def test_two_overlapping(self):
-        # (0..5) overlaps (3..13) → (0..13).
-        self.assertEqual(
-            self.r._merge_ranges([(0, 5), (3, 10)]),
-            [(0, 13)],
-        )
-
-    def test_two_adjacent(self):
-        # (0..5) followed by (5..3) — adjacent, no gap. Merge to (0..8).
-        self.assertEqual(
-            self.r._merge_ranges([(0, 5), (5, 3)]),
-            [(0, 8)],
-        )
-
-    def test_range_fully_contained(self):
-        # (0..20) contains (5..3) — result is just the outer.
-        self.assertEqual(
-            self.r._merge_ranges([(0, 20), (5, 3)]),
-            [(0, 20)],
-        )
-
-    def test_three_two_merge_one_disjoint(self):
-        # (0..5)+(4..3) merge into (0..7); (20..5) stays separate.
-        self.assertEqual(
-            self.r._merge_ranges([(0, 5), (4, 3), (20, 5)]),
-            [(0, 7), (20, 5)],
-        )
-
-    def test_identical_ranges_deduped(self):
-        self.assertEqual(
-            self.r._merge_ranges([(10, 5), (10, 5)]),
-            [(10, 5)],
-        )
-
-
-class TestWriteRangeExcerpts(unittest.TestCase):
-    """``_write_range_excerpts`` — concatenate slices into a temp .md file."""
-
-    def setUp(self):
-        self.r = _load_recipe()
-        # The recipe slices ``_FILE_TEXT``; install our own buffer.
-        self.r._FILE_TEXT = (
-            'AAAA\n'      # bytes  0..4  (line ends in \n)
-            'BBBB\n'      # bytes  5..9
-            'CCCC\n'      # bytes 10..14
-            'DDDD'        # bytes 15..18 (no trailing newline)
-        )
-        self.tmp_paths = []
-
-    def tearDown(self):
-        import os
-        for p in self.tmp_paths:
-            try:
-                os.unlink(p)
-            except OSError:
-                pass
-
-    def _read(self, path):
-        with open(path, 'r', encoding='utf-8', errors='surrogateescape') as f:
-            return f.read()
-
-    def test_single_range(self):
-        path = self.r._write_range_excerpts([(0, 5)])
-        self.tmp_paths.append(path)
-        self.assertEqual(self._read(path), 'AAAA\n')
-
-    def test_two_ranges_first_ends_with_newline(self):
-        # First slice ends in \n → no extra separator inserted.
-        path = self.r._write_range_excerpts([(0, 5), (10, 5)])
-        self.tmp_paths.append(path)
-        self.assertEqual(self._read(path), 'AAAA\nCCCC\n')
-
-    def test_two_ranges_first_lacks_newline(self):
-        # First slice is 'DDDD' (no \n); separator \n inserted before next.
-        path = self.r._write_range_excerpts([(15, 4), (0, 5)])
-        # Note: caller is responsible for merging/sorting; this helper
-        # writes whatever it's given in order. We pass ranges in the
-        # given order to exercise the "needs separator" branch.
-        self.tmp_paths.append(path)
-        self.assertEqual(self._read(path), 'DDDD\nAAAA\n')
-
-    def test_three_ranges_mixed_newline_endings(self):
-        # First two end in \n (no separator inserted between them);
-        # third slice ('DDDD') has no trailing newline → file ends raw.
-        path = self.r._write_range_excerpts([(0, 5), (5, 5), (15, 4)])
-        self.tmp_paths.append(path)
-        self.assertEqual(self._read(path), 'AAAA\nBBBB\nDDDD')
-
-    def test_empty_input(self):
-        path = self.r._write_range_excerpts([])
-        self.tmp_paths.append(path)
-        self.assertEqual(self._read(path), '')
-
-    def test_path_has_md_suffix(self):
-        path = self.r._write_range_excerpts([(0, 1)])
-        self.tmp_paths.append(path)
-        self.assertTrue(path.endswith('.md'))
-
-
 class _SrcCmdCtx:
-    """Recorder for ``ctx`` in ``_run_source_command`` tests."""
+    """Recorder for ``ctx`` in ``_run_source_command`` tests.
 
-    def __init__(self, targets):
-        self.targets = list(targets)
+    Deliberately defines NO ``targets`` / ``selected`` attributes —
+    ``V`` is cursor-only, so any access to the selection surface raises
+    ``AttributeError`` and fails the test.
+    """
+
+    def __init__(self, cursor):
+        self.cursor = cursor
         self.calls = []
         self.errors = []
         self.flashes = []
@@ -1385,29 +1276,28 @@ class _ScopeRootPseudoItem:
 
 
 class TestRunSourceCommand(unittest.TestCase):
-    """``_run_source_command`` — root vs non-root dispatch + tempfile flow."""
+    """``_run_source_command`` — cursor-only root vs section dispatch."""
+
+    _TEXT = (
+        'AAAA\n'      # bytes  0..4
+        'BBBB\n'      # bytes  5..9
+        'CCCC\n'      # bytes 10..14
+        'DDDD\n'      # bytes 15..19
+        'EEEE\n'      # bytes 20..24
+    )
 
     def setUp(self):
         import os
         self.r = _load_recipe()
-        self.r._FILE_TEXT = (
-            'AAAA\n'      # bytes  0..4
-            'BBBB\n'      # bytes  5..9
-            'CCCC\n'      # bytes 10..14
-            'DDDD\n'      # bytes 15..19
-            'EEEE\n'      # bytes 20..24
-        )
         self.path = '/tmp/src.md'
-        # Snapshot module state we might patch (so the scope-root
-        # pseudo-item branch can be exercised). ``_load_recipe`` gives a
-        # fresh module per test, but we restore explicitly for clarity
-        # and to honour the ticket's "restore _BY_ID / _ROOT_PATH"
-        # request (#552).
-        self._mod_saved = {
-            '_ROOT_PATH': self.r._ROOT_PATH,
-            '_BY_ID': dict(self.r._BY_ID),
-        }
-        self.r._ROOT_PATH = self.path
+        # Minimal per-file state so ``_row_document`` (the row->document
+        # mapping V routes through) resolves the fixture ids without a
+        # disk parse: a root Item plus whatever ``_heading`` registers.
+        self.root = _SrcItem(id=('file', self.path), kind='root')
+        self.by_id = {self.root.id: self.root}
+        self.r._FILES = {self.path: self.r._FileState(
+            path=self.path, text=self._TEXT, by_id=self.by_id,
+            by_line={}, lines_sorted=[], file_root=self.root)}
         # Snapshot env so per-test PAGER/EDITOR overrides don't leak.
         self._env_saved = {k: os.environ.get(k) for k in ('PAGER', 'EDITOR')}
         # Force defaults so we don't pick up host PAGER/EDITOR.
@@ -1421,120 +1311,60 @@ class TestRunSourceCommand(unittest.TestCase):
                 os.environ.pop(k, None)
             else:
                 os.environ[k] = v
-        # Restore patched module state.
-        self.r._ROOT_PATH = self._mod_saved['_ROOT_PATH']
-        self.r._BY_ID = self._mod_saved['_BY_ID']
 
-    def test_empty_targets_noop(self):
-        ctx = _SrcCmdCtx(targets=[])
+    def _heading(self, line, byte_offset, byte_size):
+        item = _SrcItem(id=('content', self.path, line), kind='heading',
+                        byte_offset=byte_offset, byte_size=byte_size)
+        self.by_id[item.id] = item
+        return item
+
+    def test_no_cursor_noop(self):
+        ctx = _SrcCmdCtx(cursor=None)
         self.r._run_source_command(ctx)
         self.assertEqual(ctx.calls, [])
 
-    def test_root_only_opens_original_path(self):
-        # ``root.id`` is the absolute path; the command should be the
-        # default split + that path. No tempfile.
-        root = _SrcItem(id=('file', self.path), kind='root')
-        ctx = _SrcCmdCtx(targets=[root])
+    def test_root_cursor_opens_original_path(self):
+        # Cursor on the per-file root -> the command is the default
+        # split + the original path. No tempfile.
+        ctx = _SrcCmdCtx(cursor=self.root)
         self.r._run_source_command(ctx)
         self.assertEqual(ctx.calls, [['less', '-R', self.path]])
 
-    def test_single_root_cursor_only_opens_file(self):
-        # #572: cursor on a file-root with NO selection → single
-        # target → opens the file directly (no tempfile). This is
-        # the same shape as ``test_root_only_opens_original_path``
-        # but pinned with the post-#572 name to document the
-        # single-target shortcut contract.
-        import os
-        root = _SrcItem(id=('file', self.path), kind='root')
-        ctx = _SrcCmdCtx(targets=[root])
-        self.r._run_source_command(ctx)
-        self.assertEqual(ctx.calls, [['less', '-R', self.path]])
-        # No tempfile was produced — last argv is the original path.
-        argv = ctx.calls[0]
-        self.assertFalse(argv[-1].endswith('.md') and argv[-1] != self.path)
-
-    def test_single_root_marked_alone_opens_file(self):
-        # #572: one file-root space-marked, nothing else in the
-        # selection → ``ctx.targets`` returns just that root → single
-        # target → opens the file directly. Same outcome as
-        # cursor-only; this asserts the contract still holds when
-        # the single target came from a space-mark rather than the
-        # cursor.
-        root = _SrcItem(id=('file', self.path), kind='root')
-        ctx = _SrcCmdCtx(targets=[root])
-        self.r._run_source_command(ctx)
-        self.assertEqual(ctx.calls, [['less', '-R', self.path]])
-
-    def test_root_mixed_with_non_root_combines_into_tempfile(self):
-        # #572: Mixed targets no longer trigger root-wins. The
-        # file-root expands to the whole file range and merges with
-        # the heading's sub-range (the whole-file range absorbs it),
-        # producing a tempfile that contains the entire file body.
-        root = _SrcItem(id=('file', self.path), kind='root')
-        leaf = _SrcItem(id=('content', self.path, 3), kind='heading',
-                        byte_offset=0, byte_size=5)
-        ctx = _SrcCmdCtx(targets=[leaf, root])
+    def test_section_cursor_writes_temp_and_runs(self):
+        ctx = _SrcCmdCtx(cursor=self._heading(2, 10, 5))
         self.r._run_source_command(ctx)
         # Exactly one call; last argv is the tempfile path with .md.
         self.assertEqual(len(ctx.calls), 1)
         argv = ctx.calls[0]
         self.assertEqual(argv[:2], ['less', '-R'])
         self.assertTrue(argv[2].endswith('.md'))
-        # Single-file output → no header. Whole-file range absorbs
-        # the heading's sub-range.
-        self.assertEqual(ctx.last_tmp_contents, self.r._FILE_TEXT)
-
-    def test_single_non_root_writes_temp_and_runs(self):
-        leaf = _SrcItem(id=('content', self.path, 2), kind='heading',
-                        byte_offset=10, byte_size=5)
-        ctx = _SrcCmdCtx(targets=[leaf])
-        self.r._run_source_command(ctx)
-        # Exactly one call; last argv is the tempfile path with .md.
-        self.assertEqual(len(ctx.calls), 1)
-        argv = ctx.calls[0]
-        self.assertEqual(argv[:2], ['less', '-R'])
-        self.assertTrue(argv[2].endswith('.md'))
-        # Tempfile contents = the leaf's byte slice.
+        # Tempfile contents = the section's byte slice.
         self.assertEqual(ctx.last_tmp_contents, 'CCCC\n')
 
-    def test_three_non_root_out_of_order_merged_file_order(self):
-        # Three non-root targets handed in out of file order; the
-        # produced temp file should contain merged ranges in file
-        # order with no duplication. We use disjoint ranges so the
-        # output is just concatenation (no slice loss).
-        a = _SrcItem(id=('content', self.path, 0), kind='heading',
-                     byte_offset=0, byte_size=5)   # 'AAAA\n'
-        b = _SrcItem(id=('content', self.path, 2), kind='heading',
-                     byte_offset=10, byte_size=5)  # 'CCCC\n'
-        c = _SrcItem(id=('content', self.path, 4), kind='heading',
-                     byte_offset=20, byte_size=5)  # 'EEEE\n'
-        # Out of file order.
-        ctx = _SrcCmdCtx(targets=[c, a, b])
+    def test_selection_surface_never_consulted(self):
+        # ``_SrcCmdCtx`` defines no ``targets`` / ``selected`` at all,
+        # so this passing proves V reads only the cursor — a
+        # programmatic selection (x's move highlight) can't widen it.
+        ctx = _SrcCmdCtx(cursor=self._heading(0, 0, 5))
         self.r._run_source_command(ctx)
-        self.assertEqual(len(ctx.calls), 1)
-        # Expected: file order, no duplication.
-        self.assertEqual(ctx.last_tmp_contents, 'AAAA\nCCCC\nEEEE\n')
+        self.assertEqual(ctx.last_tmp_contents, 'AAAA\n')
 
-    def test_overlapping_ranges_deduped(self):
-        # Two overlapping non-root targets → merged into one range,
-        # no slice duplication in the temp file.
-        a = _SrcItem(id=('content', self.path, 0), kind='heading',
-                     byte_offset=0, byte_size=10)   # 'AAAA\nBBBB\n'
-        b = _SrcItem(id=('content', self.path, 1), kind='heading',
-                     byte_offset=5, byte_size=10)   # 'BBBB\nCCCC\n'
-        ctx = _SrcCmdCtx(targets=[a, b])
+    def test_stale_id_noop(self):
+        # A cursor whose id resolves to no known row (stale after an
+        # edit, or the References umbrella) is a silent no-op.
+        ghost = _SrcItem(id=('content', self.path, 99), kind='heading',
+                         byte_offset=0, byte_size=5)
+        ctx = _SrcCmdCtx(cursor=ghost)
         self.r._run_source_command(ctx)
-        # Merged range covers bytes 0..15 — one contiguous slice.
-        self.assertEqual(ctx.last_tmp_contents, 'AAAA\nBBBB\nCCCC\n')
+        self.assertEqual(ctx.calls, [])
+        self.assertEqual(ctx.flashes, [])
 
     def test_tempfile_is_unlinked_after_run(self):
         # The tempfile path captured by the ctx call should not exist
         # on disk after _run_source_command returns (unlinked in
         # ``finally``).
         import os
-        leaf = _SrcItem(id=('content', self.path, 0), kind='heading',
-                        byte_offset=0, byte_size=5)
-        ctx = _SrcCmdCtx(targets=[leaf])
+        ctx = _SrcCmdCtx(cursor=self._heading(0, 0, 5))
         self.r._run_source_command(ctx)
         argv = ctx.calls[0]
         self.assertFalse(os.path.exists(argv[2]))
@@ -1545,69 +1375,120 @@ class TestRunSourceCommand(unittest.TestCase):
         import os
         os.environ['PAGER'] = 'bat --paging=always'
         try:
-            leaf = _SrcItem(id=('content', self.path, 0), kind='heading',
-                            byte_offset=0, byte_size=5)
-            ctx = _SrcCmdCtx(targets=[leaf])
+            ctx = _SrcCmdCtx(cursor=self._heading(0, 0, 5))
             self.r._run_source_command(ctx)
             argv = ctx.calls[0]
             self.assertEqual(argv[:2], ['bat', '--paging=always'])
         finally:
             os.environ.pop('PAGER', None)
 
-    def test_multi_select_two_non_root_same_file_both_ranges_in_tempfile(self):
-        # #568 regression: ``V`` / ``E`` with a multi-select of two
-        # non-root targets in the SAME file must hand PAGER / EDITOR a
-        # tempfile containing BOTH targets' byte slices — not just the
-        # cursor's. This guards the consumer-code path: given a ctx
-        # whose ``targets`` returns both items (per the framework's
-        # ``selected if non-empty, else [cursor]`` contract), the
-        # recipe MUST process every target and the tempfile MUST
-        # include every selected section. The ticket cites a
-        # symptom where only the cursor's section appears even
-        # though both items are marked.
-        a = _SrcItem(id=('content', self.path, 0), kind='heading',
-                     byte_offset=0, byte_size=5)    # 'AAAA\n'
-        b = _SrcItem(id=('content', self.path, 2), kind='heading',
-                     byte_offset=10, byte_size=5)   # 'CCCC\n'
-        ctx = _SrcCmdCtx(targets=[a, b])
-        self.r._run_source_command(ctx)
-        # Exactly one PAGER invocation on a tempfile (last argv).
-        self.assertEqual(len(ctx.calls), 1)
-        argv = ctx.calls[0]
-        self.assertTrue(argv[-1].endswith('.md'))
-        # Both ranges present in the tempfile contents (captured by
-        # ``_SrcCmdCtx.run_external`` synchronously before the
-        # ``finally`` unlinks the path).
-        self.assertIn('AAAA\n', ctx.last_tmp_contents)
-        self.assertIn('CCCC\n', ctx.last_tmp_contents)
-
     def test_scope_root_pseudo_item_takes_root_path(self):
         # #552: when the framework hands us its synthetic scope-root
-        # pseudo-Item (no ``kind`` / ``byte_offset`` attrs but
-        # ``id == _ROOT_PATH``), classify it as root and open the
-        # original file directly — no tempfile, no AttributeError.
+        # pseudo-Item (no ``kind`` / ``byte_offset`` attrs but a
+        # ``('file', path)`` id), ``_row_document`` resolves the id to
+        # the real per-file root — open the original file directly, no
+        # tempfile, no AttributeError.
         pseudo = _ScopeRootPseudoItem(id=('file', self.path))
-        ctx = _SrcCmdCtx(targets=[pseudo])
+        ctx = _SrcCmdCtx(cursor=pseudo)
         self.r._run_source_command(ctx)
         self.assertEqual(ctx.calls, [['less', '-R', self.path]])
 
-    def test_scope_root_pseudo_item_mixed_with_non_root_combines(self):
-        # #572: mixed targets no longer trigger root-wins. The
-        # scope-root pseudo-Item, like a real root, expands to the
-        # whole-file range and merges with the heading's sub-range.
-        # Result: a tempfile containing the whole file body.
-        pseudo = _ScopeRootPseudoItem(id=('file', self.path))
-        leaf = _SrcItem(id=('content', self.path, 3), kind='heading',
-                        byte_offset=0, byte_size=5)
-        ctx = _SrcCmdCtx(targets=[leaf, pseudo])
+
+class TestViewSourceMdRows(unittest.TestCase):
+    """``V`` on ``('md', …)`` reference-subtree rows.
+
+    ``_row_document`` resolves the chain's last document, so the
+    cursor-only ``V`` pages a referenced file (doc root) or a section
+    slice inside it — previously a silent no-op on md rows.
+    """
+
+    def setUp(self):
+        import os
+        import tempfile
+        self.r = _load_recipe()
+        self.dir = tempfile.TemporaryDirectory()
+        self.target = os.path.join(self.dir.name, 'target.md')
+        with open(self.target, 'w', encoding='utf-8') as f:
+            f.write('# T1\nbody of T1\n# T2\ntail\n')
+        # The primary anchor's file never needs to exist for md-row
+        # resolution — only the chain's last document is read.
+        self.anchor = ('file', os.path.join(self.dir.name, 'primary.md'))
+        self._env_saved = os.environ.pop('PAGER', None)
+
+    def tearDown(self):
+        import os
+        if self._env_saved is not None:
+            os.environ['PAGER'] = self._env_saved
+        self.dir.cleanup()
+        if self.r.md_doc is not None:
+            self.r.md_doc.clear_cache()
+
+    def test_md_doc_root_opens_referenced_file(self):
+        row_id = ('md', self.anchor, (self.target,), None)
+        ctx = _SrcCmdCtx(cursor=_SrcItem(id=row_id, kind='md-doc'))
+        self.r._run_source_command(ctx)
+        self.assertEqual(ctx.calls, [['less', '-R', self.target]])
+
+    def test_md_heading_pages_section_slice(self):
+        # Line 0 is ``# T1`` — its boundary-rule section runs to ``# T2``.
+        row_id = ('md', self.anchor, (self.target,), 0)
+        ctx = _SrcCmdCtx(cursor=_SrcItem(id=row_id, kind='md-heading'))
         self.r._run_source_command(ctx)
         self.assertEqual(len(ctx.calls), 1)
         argv = ctx.calls[0]
-        self.assertEqual(argv[:2], ['less', '-R'])
-        self.assertTrue(argv[2].endswith('.md'))
-        # Single-file output → no header; whole-file range absorbs
-        # the heading's sub-range.
-        self.assertEqual(ctx.last_tmp_contents, self.r._FILE_TEXT)
+        self.assertTrue(argv[-1].endswith('.md'))
+        self.assertNotEqual(argv[-1], self.target)
+        self.assertEqual(ctx.last_tmp_contents, '# T1\nbody of T1\n')
+
+
+class TestSelectionDisabled(unittest.TestCase):
+    """The framework's multi-select keys are overridden to a flash.
+
+    browse-md is cursor-only: the four default selection keys are
+    rebound (a user action on the same key wins ``build_keymap``) to
+    ``_action_selection_disabled`` with a blank label, keeping them out
+    of the help's CUSTOM ACTIONS while making the keys discoverably
+    dead. The selection set itself remains in programmatic use as x's
+    move highlight (TestMoveSection pins that).
+    """
+
+    @classmethod
+    def setUpClass(cls):
+        cls.r = _load_recipe()
+
+    def test_covers_all_four_framework_selection_keys(self):
+        # Must match the framework's SELECTION defaults in
+        # src-tui/070-actions.py: space, alt+space ('alt- '), ctrl-a,
+        # ctrl-n.
+        self.assertEqual(self.r._SELECTION_KEYS,
+                         ('space', 'alt- ', 'ctrl-a', 'ctrl-n'))
+
+    def test_overrides_registered_blank_and_ungated(self):
+        actions = {a.key: a for a in self.r._build_actions()}
+        for key in self.r._SELECTION_KEYS:
+            with self.subTest(key=key):
+                self.assertIn(key, actions)
+                a = actions[key]
+                # Blank label -> skipped by the help composer's
+                # CUSTOM ACTIONS section.
+                self.assertEqual(a.label, '')
+                self.assertIs(a.handler, self.r._action_selection_disabled)
+                # 'none' gate: the flash fires even on an empty list /
+                # the scope row, never half-working.
+                self.assertEqual(a.requires, 'none')
+
+    def test_handler_flashes(self):
+        flashes = []
+        ctx = types.SimpleNamespace(
+            flash=lambda msg, log=False: flashes.append(msg))
+        self.r._action_selection_disabled(ctx)
+        self.assertEqual(flashes, ['selection is disabled in browse-md'])
+
+    def test_help_intro_notes_selection_disabled(self):
+        # The composer still renders the framework's static SELECTION
+        # section in the ? overlay (it lists ``default_actions()``
+        # unconditionally), so the intro carries the counter-note.
+        self.assertIn('Multi-select is disabled', self.r._HELP_INTRO)
 
 
 class TestReload(unittest.TestCase):
@@ -2985,13 +2866,12 @@ class TestGetPreviewMulti(_MultiCaseBase):
 
 
 class TestRunSourceCommandMulti(_MultiCaseBase):
-    """``_run_source_command`` semantics on multi-file selections.
+    """``_run_source_command`` cursor-only semantics on real multi-file state.
 
-    Post-#559: no synthetic multi-root, so no "open first file"
-    short-circuit. Per-file root rows open that file directly;
-    non-root selections — including ones spanning multiple files —
-    are honoured by grouping ranges per file and concatenating the
-    per-file slices into one temp file with a header separator.
+    The single-file suite (TestRunSourceCommand) covers the dispatch
+    shapes on a hand-built ``_FileState``; these run the same paths
+    through ``_reparse``-built state — per-file roots open their own
+    file, content rows page their own file's slice.
     """
 
     def setUp(self):
@@ -3012,149 +2892,29 @@ class TestRunSourceCommandMulti(_MultiCaseBase):
         super().tearDown()
 
     def test_per_file_root_opens_that_file(self):
-        # Per-file root target → opens that specific file.
+        # Cursor on a per-file root -> opens that specific file.
         self._load_multi(self.path_a, self.path_b)
         b_root = self.r._FILES[self.path_b].file_root
-        ctx = _SrcCmdCtx(targets=[b_root])
+        ctx = _SrcCmdCtx(cursor=b_root)
         self.r._run_source_command(ctx)
         self.assertEqual(ctx.calls, [['less', '-R', self.path_b]])
 
-    def test_two_roots_combines_with_headers(self):
-        # #572: two per-file roots selected → no longer root-wins.
-        # Each root expands to its whole-file range; output is a
-        # tempfile containing both files concatenated with the
-        # ``===== <basename> =====`` header before EACH group
-        # (including the first).
-        import os
+    def test_content_row_pages_own_file_slice(self):
+        # Cursor on B's first heading -> a tempfile holding B's slice,
+        # untouched by file A's presence.
         self._load_multi(self.path_a, self.path_b)
-        a_root = self.r._FILES[self.path_a].file_root
-        b_root = self.r._FILES[self.path_b].file_root
-        # Selection order reversed — argv order is what matters.
-        ctx = _SrcCmdCtx(targets=[b_root, a_root])
+        b_h1 = self.r._BY_ID[('content', self.path_b, 0)]
+        ctx = _SrcCmdCtx(cursor=b_h1)
         self.r._run_source_command(ctx)
         self.assertEqual(len(ctx.calls), 1)
         argv = ctx.calls[0]
         self.assertEqual(argv[:2], ['less', '-R'])
         self.assertTrue(argv[2].endswith('.md'))
-        out = ctx.last_tmp_contents
-        # Headers before EACH group, including the first.
-        a_sep = f'===== {os.path.basename(self.path_a)} ====='
-        b_sep = f'===== {os.path.basename(self.path_b)} ====='
-        self.assertIn(a_sep, out)
-        self.assertIn(b_sep, out)
-        # Argv order: A's group precedes B's.
-        self.assertLess(out.find(a_sep), out.find(b_sep))
-        # Each group contains the whole file body.
-        self.assertIn(self.A_TEXT, out)
-        self.assertIn(self.B_TEXT, out)
-        # Header before the first group → output starts with A's sep.
-        self.assertTrue(out.startswith(a_sep + '\n'))
-
-    def test_same_file_non_root_targets_merge_in_one_tempfile(self):
-        # Two non-root targets from the SAME file → one tempfile, the
-        # merged byte ranges in file order.
-        self._load_multi(self.path_a, self.path_b)
-        a_h1 = self.r._BY_ID[('content', self.path_a, 0)]
-        a_h1b = self.r._BY_ID[('content', self.path_a, 3)]
-        ctx = _SrcCmdCtx(targets=[a_h1b, a_h1])
-        self.r._run_source_command(ctx)
-        self.assertEqual(len(ctx.calls), 1)
-        # File-order: A1 slice first, then A1b slice. Together they
-        # cover the whole A file (A1 spans to A1b, A1b spans to EOF).
-        self.assertEqual(ctx.last_tmp_contents, self.A_TEXT)
-
-    def test_cross_file_groups_by_file_in_argv_order(self):
-        # Targets span both files → temp file contains BOTH files'
-        # slices, grouped per file with a ``===== <basename> =====``
-        # header before EACH group (including the first, post-#572).
-        # Files appear in argv order (A before B) regardless of
-        # selection order.
-        import os
-        self._load_multi(self.path_a, self.path_b)
-        a_h1 = self.r._BY_ID[('content', self.path_a, 0)]
-        b_h1 = self.r._BY_ID[('content', self.path_b, 0)]
-        ctx = _SrcCmdCtx(targets=[b_h1, a_h1])
-        self.r._run_source_command(ctx)
-        self.assertEqual(len(ctx.calls), 1)
-        out = ctx.last_tmp_contents
-        # Both files' headings are present.
-        self.assertIn('# A1', out)
-        self.assertIn('# B1', out)
-        # Argv order: A's slice precedes B's.
-        a_idx = out.find('# A1')
-        b_idx = out.find('# B1')
-        self.assertLess(a_idx, b_idx)
-        # #572: Header appears before EACH group, including the first.
-        a_sep = f'===== {os.path.basename(self.path_a)} ====='
-        b_sep = f'===== {os.path.basename(self.path_b)} ====='
-        self.assertIn(a_sep, out)
-        self.assertIn(b_sep, out)
-        # A's header must come before A's body, and B's after A's.
-        self.assertLess(out.find(a_sep), a_idx)
-        self.assertLess(a_idx, out.find(b_sep))
-        # Output starts with A's header (first group gets one now).
-        self.assertTrue(out.startswith(a_sep + '\n'))
-
-    def test_cross_file_argv_order_independent_of_selection_order(self):
-        # Even when B's target is listed FIRST in the selection, the
-        # groups in the temp file appear in argv order (A then B).
-        self._load_multi(self.path_a, self.path_b)
-        a_h1 = self.r._BY_ID[('content', self.path_a, 0)]
-        b_h1 = self.r._BY_ID[('content', self.path_b, 0)]
-        ctx = _SrcCmdCtx(targets=[b_h1, a_h1])
-        self.r._run_source_command(ctx)
-        out = ctx.last_tmp_contents
-        # A's content comes first.
-        self.assertLess(out.find('# A1'), out.find('# B1'))
-
-    def test_root_plus_content_same_file_combines(self):
-        # #572: file-root A space-marked + heading from file A → temp
-        # file with the whole-file range absorbing the heading's
-        # sub-range. Single-file output → NO header.
-        import os
-        self._load_multi(self.path_a, self.path_b)
-        a_root = self.r._FILES[self.path_a].file_root
-        a_h1 = self.r._BY_ID[('content', self.path_a, 0)]
-        ctx = _SrcCmdCtx(targets=[a_root, a_h1])
-        self.r._run_source_command(ctx)
-        self.assertEqual(len(ctx.calls), 1)
-        argv = ctx.calls[0]
-        self.assertTrue(argv[-1].endswith('.md'))
-        # Single-file group → no ``=====`` header. Whole-file range
-        # absorbs the heading's sub-range → output is the whole A
-        # body.
-        out = ctx.last_tmp_contents
-        a_sep = f'===== {os.path.basename(self.path_a)} ====='
-        self.assertNotIn(a_sep, out)
-        self.assertEqual(out, self.A_TEXT)
-
-    def test_root_A_plus_content_B_combines_with_headers(self):
-        # #572: file-root A + heading from file B → temp file with
-        # two groups; BOTH groups get a ``===== <basename> =====``
-        # header (including the first). A's group is the whole-file
-        # range; B's group is the heading's slice.
-        import os
-        self._load_multi(self.path_a, self.path_b)
-        a_root = self.r._FILES[self.path_a].file_root
-        b_h1 = self.r._BY_ID[('content', self.path_b, 0)]
-        ctx = _SrcCmdCtx(targets=[a_root, b_h1])
-        self.r._run_source_command(ctx)
-        self.assertEqual(len(ctx.calls), 1)
-        argv = ctx.calls[0]
-        self.assertTrue(argv[-1].endswith('.md'))
-        out = ctx.last_tmp_contents
-        a_sep = f'===== {os.path.basename(self.path_a)} ====='
-        b_sep = f'===== {os.path.basename(self.path_b)} ====='
-        # Header before EACH group, including the first.
-        self.assertIn(a_sep, out)
-        self.assertIn(b_sep, out)
-        # Output starts with A's header.
-        self.assertTrue(out.startswith(a_sep + '\n'))
-        # A's group contains the whole A body; B's group contains B1.
-        self.assertIn(self.A_TEXT, out)
-        self.assertIn('# B1', out)
-        # Argv order: A's header precedes B's.
-        self.assertLess(out.find(a_sep), out.find(b_sep))
+        expected = self.B_TEXT[b_h1.byte_offset:
+                               b_h1.byte_offset + b_h1.byte_size]
+        self.assertEqual(ctx.last_tmp_contents, expected)
+        self.assertIn('# B1', ctx.last_tmp_contents)
+        self.assertNotIn('# A1', ctx.last_tmp_contents)
 
 
 class TestReloadMulti(_MultiCaseBase):
@@ -4816,7 +4576,7 @@ class TestStdinDocument(unittest.TestCase):
         # through its own pipeline (TestEditSectionStdin).
         self._run_main('# Title\n## Section\nbody\n')
         root = _SrcItem(id=('file', self.r._STDIN_PATH), kind='root')
-        ctx = _SrcCmdCtx(targets=[root])
+        ctx = _SrcCmdCtx(cursor=root)
         self.r._run_source_command(ctx)
         self.assertEqual(ctx.calls, [],
                          'no external tool should run for stdin')
@@ -5319,8 +5079,10 @@ class TestEditSectionAction(unittest.TestCase):
         self.assertIn('edit cancelled (editor exited non-zero)', ctx.flashes)
 
     def test_selection_is_ignored(self):
-        # A populated multi-select must not widen the edit: only the
+        # A populated selection must not widen the edit: only the
         # CURSOR node's extent goes to the editor, only it is replaced.
+        # (User selection keys are disabled recipe-wide, but the set is
+        # still populated programmatically as x's move highlight.)
         payloads = []
 
         def ed(tmp, n):

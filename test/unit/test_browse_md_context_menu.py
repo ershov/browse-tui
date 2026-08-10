@@ -207,39 +207,45 @@ class TestPerKindMenus(unittest.TestCase):
 
     def test_cross_file_ref_menu_rows(self):
         # A cross-file reference node (a referenced-doc root) gets open /
-        # edit / insert / show-target. On the ROOT row "Edit referenced
-        # file" IS the E action (in-place $EDITOR + refresh), so it
-        # carries the E hint and routes through the reused action.
+        # edit / insert / view / show-target. On the ROOT row "Edit
+        # referenced file" IS the E action (in-place $EDITOR + refresh),
+        # so it carries the E hint and routes through the reused action;
+        # the View row is the V action (pages the referenced file itself).
         item = Item(
             id=('md', ('file', '/proj/doc.md'), ('/proj/other.md',), None),
             title='other.md', tag='md', has_children=True)
         rows = self.r.context_menu_options(self._ctx(item))
         self.assertEqual(_tokens(rows), [
-            'ref.open', 'md.edit', 'md.insert', 'ref.target', 'toggle_md',
+            'ref.open', 'md.edit', 'md.insert', 'md.view', 'ref.target',
+            'toggle_md',
         ])
         labels = dict((t, l) for l, t in rows)
         self.assertEqual(labels['ref.open'], 'Open referenced doc in browse-md')
         self.assertEqual(labels['md.edit'], 'Edit referenced file (E)')
         self.assertEqual(labels['md.insert'], 'Insert here (a)')
+        self.assertEqual(labels['md.view'],
+                         'View referenced file in $PAGER (V)')
         self.assertEqual(labels['ref.target'], 'Show link target')
 
     def test_cross_file_ref_heading_node_gets_section_rows(self):
         # A heading INSIDE a referenced file (line set) gets the
-        # section-level Edit/Insert/Move adjacent (single-sourced with the
-        # E / a / x keybindings), THEN the plain whole-file "Edit
-        # referenced file" (no hint — E means the section edit there).
+        # section-level Edit/Insert/Move/View adjacent (single-sourced
+        # with the E / a / x / V keybindings, in the content-menu order),
+        # THEN the plain whole-file "Edit referenced file" (no hint — E
+        # means the section edit there).
         item = Item(
             id=('md', ('file', '/proj/doc.md'), ('/proj/other.md',), 3),
             title='Section', tag='h2', has_children=True)
         rows = self.r.context_menu_options(self._ctx(item))
         self.assertEqual(_tokens(rows), [
-            'ref.open', 'md.edit', 'md.insert', 'md.move', 'ref.edit',
-            'ref.target', 'toggle_md',
+            'ref.open', 'md.edit', 'md.insert', 'md.move', 'md.view',
+            'ref.edit', 'ref.target', 'toggle_md',
         ])
         labels = dict((t, l) for l, t in rows)
         self.assertEqual(labels['md.edit'], 'Edit section (E)')
         self.assertEqual(labels['md.insert'], 'Insert here (a)')
         self.assertEqual(labels['md.move'], 'Move section (x)')
+        self.assertEqual(labels['md.view'], 'View section in $PAGER (V)')
         self.assertEqual(labels['ref.edit'], 'Edit referenced file')
 
     def test_refs_umbrella_yields_only_toggle(self):
@@ -465,20 +471,22 @@ class TestDispatchReusesActions(unittest.TestCase):
         self.r._MENU_ACTIONS['content.mdcat'](ctx, cid)
         self.assertEqual(calls, ['edit', 'insert', 'move', 'view', 'mdcat'])
 
-    def test_md_row_tokens_reuse_edit_insert_move_actions(self):
-        # The reference-row Edit/Insert/Move entries are single-sourced
-        # with the E / a / x keybindings — same handlers, dispatch reads
-        # ctx.cursor.
+    def test_md_row_tokens_reuse_edit_insert_move_view_actions(self):
+        # The reference-row Edit/Insert/Move/View entries are
+        # single-sourced with the E / a / x / V keybindings — same
+        # handlers, dispatch reads ctx.cursor.
         calls = []
         self.r._action_edit_section = lambda c: calls.append('edit')
         self.r._action_insert_section = lambda c: calls.append('insert')
         self.r._action_move_section = lambda c: calls.append('move')
+        self.r._action_view_source = lambda c: calls.append('view')
         ctx = object()
         mid = ('md', ('file', '/d.md'), ('/o.md',), 3)
         self.r._MENU_ACTIONS['md.edit'](ctx, mid)
         self.r._MENU_ACTIONS['md.insert'](ctx, mid)
         self.r._MENU_ACTIONS['md.move'](ctx, mid)
-        self.assertEqual(calls, ['edit', 'insert', 'move'])
+        self.r._MENU_ACTIONS['md.view'](ctx, mid)
+        self.assertEqual(calls, ['edit', 'insert', 'move', 'view'])
 
     def test_toggle_md_reuses_handler(self):
         calls = []
@@ -659,8 +667,8 @@ class TestCrossFileRefRealFixture(unittest.TestCase):
         ctx = Context(self.b)
         rows = self.r.context_menu_options(ctx)
         self.assertEqual(_tokens(rows),
-                         ['ref.open', 'md.edit', 'md.insert', 'ref.target',
-                          'toggle_md'])
+                         ['ref.open', 'md.edit', 'md.insert', 'md.view',
+                          'ref.target', 'toggle_md'])
 
         alerted = {}
 
