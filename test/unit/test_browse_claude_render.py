@@ -18,6 +18,7 @@ import datetime
 import importlib.util
 import os
 import sys
+import time
 import types
 import unittest
 from importlib.machinery import SourceFileLoader
@@ -769,11 +770,49 @@ class TestChrome(unittest.TestCase):
             'isSidechain': True,
         })
         for needle in ('uuid', 'abc', 'def', 'sess', '/home/u', 'main',
-                       '2026-05-07', '2.1.39', 'sidechain'):
+                       self.r._local_ts('2026-05-07T00:00:00Z'),
+                       '2.1.39', 'sidechain'):
             self.assertIn(needle, out, f'missing {needle!r}')
 
     def test_empty(self):
         self.assertEqual(self.r._fmt_chrome({}), '')
+
+
+class TestLocalTs(unittest.TestCase):
+    """``_local_ts`` converts to the host zone, or gets out of the way."""
+
+    @classmethod
+    def setUpClass(cls):
+        cls.r = _load_recipe()
+
+    def setUp(self):
+        old = os.environ.get('TZ')
+        self.addCleanup(time.tzset)
+        if old is None:
+            self.addCleanup(os.environ.pop, 'TZ', None)
+        else:
+            self.addCleanup(os.environ.__setitem__, 'TZ', old)
+        os.environ['TZ'] = 'America/New_York'
+        time.tzset()
+
+    def test_summer_stamp_is_edt(self):
+        self.assertEqual(self.r._local_ts('2026-05-07T00:00:00Z'),
+                         '2026-05-06 20:00:00 EDT')
+
+    def test_winter_stamp_is_est(self):
+        self.assertEqual(self.r._local_ts('2026-01-07T00:00:00Z'),
+                         '2026-01-06 19:00:00 EST')
+
+    def test_explicit_offset_is_converted(self):
+        self.assertEqual(self.r._local_ts('2026-05-07T02:00:00+02:00'),
+                         '2026-05-06 20:00:00 EDT')
+
+    def test_unparseable_returned_unchanged(self):
+        for bad in ('garbage', '', None):
+            self.assertEqual(self.r._local_ts(bad), bad)
+
+    def test_naive_stamp_returned_unchanged(self):
+        self.assertEqual(self.r._local_ts('2026-05-14'), '2026-05-14')
 
 
 class TestColorToggle(unittest.TestCase):

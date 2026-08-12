@@ -303,6 +303,22 @@ def _human_time(epoch):
     return f'{int(delta // 86400)}d ago'
 
 
+def _local_ts(iso):
+    """Render an ISO-8601 timestamp in the local zone (``date``(1) rules).
+
+    Anything that doesn't parse is returned unchanged, as is a naive
+    stamp (a bare date, say) — without an offset there's no zone to
+    convert *from*, and guessing one would silently shift the value.
+    """
+    try:
+        dt = datetime.datetime.fromisoformat(str(iso).replace('Z', '+00:00'))
+    except (ValueError, TypeError):
+        return iso
+    if dt.tzinfo is None:
+        return iso
+    return dt.astimezone().strftime('%Y-%m-%d %H:%M:%S %Z')
+
+
 def _trim(s, n):
     """Strip surrounding whitespace and truncate, preserving inner newlines.
 
@@ -4936,7 +4952,7 @@ def _render_metadata(obj):
                 f'{WHITE}{obj.get("prRepository", "")}'
                 f'#{obj.get("prNumber", "")}{RESET}\n'
                 f'{BLUE}{obj.get("prUrl", "")}{RESET}\n'
-                f'{MUTE}linked: {obj.get("timestamp", "")}{RESET}')
+                f'{MUTE}linked: {_local_ts(obj.get("timestamp", ""))}{RESET}')
     if t == 'worktree-state':
         ws = obj.get('worktreeSession')
         if ws is None:
@@ -5084,7 +5100,9 @@ def _fmt_chrome(obj, turn_root_ts=None):
     ts = obj.get('timestamp', '')
     ver = obj.get('version', '')
     if ts or ver:
-        rows.append(('timestamp', f'{ts}  {MUTE}version:{RESET} {ver}' if ver else ts))
+        # _ts_offset parses the raw ISO strings itself — only the shown value converts.
+        shown = _local_ts(ts)
+        rows.append(('timestamp', f'{shown}  {MUTE}version:{RESET} {ver}' if ver else shown))
         offset = _ts_offset(turn_root_ts, ts)
         if offset:
             rows.append(('offset', offset))
