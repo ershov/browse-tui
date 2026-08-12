@@ -306,17 +306,19 @@ def _human_time(epoch):
 def _local_ts(iso):
     """Render an ISO-8601 timestamp in the local zone (``date``(1) rules).
 
-    Anything that doesn't parse is returned unchanged, as is a naive
-    stamp (a bare date, say) — without an offset there's no zone to
-    convert *from*, and guessing one would silently shift the value.
+    Anything that doesn't parse — or that the conversion can't represent,
+    such as a stamp near ``datetime.max`` shifted by a positive offset —
+    is returned unchanged, as is a naive stamp (a bare date, say): without
+    an offset there's no zone to convert *from*, and guessing one would
+    silently shift the value.
     """
     try:
         dt = datetime.datetime.fromisoformat(str(iso).replace('Z', '+00:00'))
-    except (ValueError, TypeError):
+        if dt.tzinfo is None:
+            return iso
+        return dt.astimezone().strftime('%Y-%m-%d %H:%M:%S %Z')
+    except (ValueError, OverflowError, OSError):
         return iso
-    if dt.tzinfo is None:
-        return iso
-    return dt.astimezone().strftime('%Y-%m-%d %H:%M:%S %Z')
 
 
 def _trim(s, n):

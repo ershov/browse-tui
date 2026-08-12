@@ -709,6 +709,8 @@ class TestMetadataRenderers(unittest.TestCase):
         })
         self.assertIn('foo/bar#12', out)
         self.assertIn('https://github.com/foo/bar/pull/12', out)
+        self.assertIn(self.r._local_ts('2026-05-07T00:00:00Z'), out)
+        self.assertNotIn('2026-05-07T00:00:00Z', out)
 
     def test_permission_mode(self):
         out = self.r._render_metadata({
@@ -773,6 +775,7 @@ class TestChrome(unittest.TestCase):
                        self.r._local_ts('2026-05-07T00:00:00Z'),
                        '2.1.39', 'sidechain'):
             self.assertIn(needle, out, f'missing {needle!r}')
+        self.assertNotIn('2026-05-07T00:00:00Z', out)
 
     def test_empty(self):
         self.assertEqual(self.r._fmt_chrome({}), '')
@@ -813,6 +816,13 @@ class TestLocalTs(unittest.TestCase):
 
     def test_naive_stamp_returned_unchanged(self):
         self.assertEqual(self.r._local_ts('2026-05-14'), '2026-05-14')
+
+    def test_max_stamp_in_ahead_of_utc_zone_returned_unchanged(self):
+        """Converting datetime.max eastwards overflows — don't crash on it."""
+        os.environ['TZ'] = 'Asia/Tokyo'
+        time.tzset()
+        self.assertEqual(self.r._local_ts('9999-12-31T23:59:59Z'),
+                         '9999-12-31T23:59:59Z')
 
 
 class TestColorToggle(unittest.TestCase):
