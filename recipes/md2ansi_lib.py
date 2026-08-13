@@ -1673,11 +1673,15 @@ def _m2a_query_split(query):
     return path_part, (_m2a_parse_fragment(frag, query) if frag else None)
 
 
-def _m2a_path_pattern(path):
+def _m2a_path_pattern(path, cross_final=False):
     """The §5.2 regex (pattern string) for a query path, built exactly by the
     spec's rules — matched with `re.search` + `IGNORECASE` against every
     heading's path string. The root path `/` never reaches here (the caller
-    short-circuits it); a trailing empty component is an error."""
+    short-circuits it); a trailing empty component is an error.
+    `cross_final=True` builds the §5.3 slash-title fallback variant: the last
+    component's trailing padding widens from `[^/]*` to `.*`, so the match may
+    end inside a `/`-bearing title's collapsed pseudo-levels (no-op when that
+    component is `$`-anchored or a wildcard)."""
     anchored = path.startswith("/")
     # Strip every component up front so a whitespace-only component is
     # empty EVERYWHERE below — in particular for the trailing-empty check,
@@ -1706,7 +1710,9 @@ def _m2a_path_pattern(path):
         # collapse just reduced every whitespace run to a single space.
         body = re.escape(_M2A_WS_RUN_RE.sub(" ", comp)).replace("\\ ", " ")
         head = ("(^|/)" if i == 0 and not anchored else "") if lead else "[^/]*"
-        pieces.append(head + body + ("" if trail else "[^/]*"))
+        tail = "" if trail else (
+            ".*" if cross_final and i == len(comps) - 1 else "[^/]*")
+        pieces.append(head + body + tail)
     return ("^" if anchored else "") + "/".join(pieces) + "$"
 
 
@@ -1923,6 +1929,19 @@ def _m2a_path_candidates(text, doc, query, path_part, frag, regex):
         ) from None
     candidates = [(p, n) for p, n in _m2a_walk_paths(doc.tree)
                   if compiled.search(p)]
+
+    if not candidates and not regex:
+        # §5.3 slash-title fallback: the §4 slash collapse renders a
+        # `/`-bearing title as pseudo-levels, so a query ending inside its
+        # pre-slash part can never reach the path's `$`. Retry allowing the
+        # last component's match to cross `/`, but only onto nodes whose OWN
+        # title carries a `/` — a parent title match stays strict (the parent
+        # matched its own path in the strict pass, or doesn't match at all).
+        fallback = _m2a_path_pattern(path_part, cross_final=True)
+        if fallback != pattern:
+            fb = re.compile(fallback, re.IGNORECASE)
+            candidates = [(p, n) for p, n in _m2a_walk_paths(doc.tree)
+                          if "/" in n.clean and fb.search(p)]
 
     if frag is not None and frag[0] != "text" and candidates:
         kept = [(p, n) for p, n in candidates
