@@ -88,10 +88,10 @@ Custom actions on top of the framework defaults:
       single-file startup auto-expand.
 
 The framework's multi-select keys (space, alt-space, ctrl-a, ctrl-n)
-are overridden to a "selection is disabled in browse-md" flash — every
-action here is cursor-only, so a user-built selection could only
-mislead. The selection SET itself stays in use programmatically: ``x``
-re-points it at the moving row as the move highlight.
+are overridden to silent no-ops, as if unassigned — every action here
+is cursor-only, so a user-built selection could only mislead. The
+selection SET itself stays in use programmatically: ``x`` re-points it
+at the moving row as the move highlight.
 
 Usage:  browse-md [FILE.md[#anchor] | DIR ... | -]
 """
@@ -1529,19 +1529,6 @@ def _run_source_command(ctx):
             pass
 
 
-def _action_selection_disabled(ctx):
-    """Any framework multi-select key — flash instead of selecting.
-
-    Every browse-md action is cursor-only, so a user-built selection
-    could only mislead (nothing reads it). The four default selection
-    keys are overridden to this handler so they are discoverably dead
-    rather than silently confusing. The selection SET itself stays in
-    use programmatically — ``x`` re-points it at the moving row as the
-    move highlight.
-    """
-    ctx.flash('selection is disabled in browse-md')
-
-
 def _action_view_source(ctx):
     """``V`` — page the source for the cursor row in $PAGER.
 
@@ -2809,7 +2796,7 @@ browse-md — markdown browser for one or more files.
   Ctrl-R  Re-slurp every input file and rebuild the tree.
 
 Multi-select is disabled — every action is cursor-only, and the
-framework's selection keys (space and friends) flash instead.
+framework's selection keys (space and friends) do nothing here.
 
 Right-click a row (or the backslash / F1 keys) for a menu keyed to its
 kind: a file row edits / inserts / views / renders, opens its dir in
@@ -3034,12 +3021,13 @@ def _build_actions():
     * ``d`` deletes the section under the cursor behind a confirm
       dialog (see ``_action_delete_section``).
     * The framework's multi-select keys (``_SELECTION_KEYS``) are
-      overridden to a "selection is disabled" flash — nothing in this
-      recipe reads a user selection. Blank labels keep them out of the
-      help's CUSTOM ACTIONS section, and the composer drops the
-      overridden default rows too, so the whole SELECTION section
-      vanishes from the ``?`` overlay (the ``_HELP_INTRO`` one-liner
-      is what tells the user selection exists but is off).
+      overridden to handler-less no-ops — the keys are swallowed as if
+      unassigned, since nothing in this recipe reads a user selection.
+      Blank labels keep them out of the help's CUSTOM ACTIONS section,
+      and the composer drops the overridden default rows too, so the
+      whole SELECTION section vanishes from the ``?`` overlay (the
+      ``_HELP_INTRO`` one-liner is what tells the user selection exists
+      but is off).
     """
     actions = [
         Action('m', 'Toggle markdown coloring', _action_toggle_md, 'none'),
@@ -3058,7 +3046,10 @@ def _build_actions():
                _action_delete_section, 'none'),
     ]
     actions.extend(
-        Action(key, '', _action_selection_disabled, 'none')
+        # ``handler=None`` — the dispatcher swallows the key without
+        # calling anything, exactly as if it were never bound (but the
+        # override still shadows the framework's select behaviour).
+        Action(key, '', None, 'none')
         for key in _SELECTION_KEYS
     )
     return actions

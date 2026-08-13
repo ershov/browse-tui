@@ -30,8 +30,8 @@ files or directories; `FILE.md#section` deep-links straight to a heading.
   scope's first sub-heading (a leaf section's body stays in its preview).
 - Framework defaults overridden per-recipe — every action is
   cursor-only, so the built-in selection keys (space, alt-space,
-  ctrl-a, ctrl-n) are rebound to a "selection is disabled" flash; the
-  selection set itself survives as `x`'s programmatic move highlight.
+  ctrl-a, ctrl-n) are unbound (silent no-ops); the selection set
+  itself survives as `x`'s programmatic move highlight.
 - Conflict-safe section editing — `E` opens the cursor row's section in
   `$EDITOR` (a file or referenced-doc root row edits its file in place)
   and re-applies the result through `md2ansi_lib`'s hash-addressed

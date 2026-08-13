@@ -1442,14 +1442,15 @@ class TestViewSourceMdRows(unittest.TestCase):
 
 
 class TestSelectionDisabled(unittest.TestCase):
-    """The framework's multi-select keys are overridden to a flash.
+    """The framework's multi-select keys are overridden to silent no-ops.
 
     browse-md is cursor-only: the four default selection keys are
-    rebound (a user action on the same key wins ``build_keymap``) to
-    ``_action_selection_disabled`` with a blank label, keeping them out
-    of the help's CUSTOM ACTIONS while making the keys discoverably
-    dead. The selection set itself remains in programmatic use as x's
-    move highlight (TestMoveSection pins that).
+    rebound (a user action on the same key wins ``build_keymap``) to a
+    handler-less, blank-label Action — the dispatcher swallows the key
+    without calling anything, exactly as if it were never assigned,
+    and the blank label keeps it out of the help's CUSTOM ACTIONS. The
+    selection set itself remains in programmatic use as x's move
+    highlight (TestMoveSection pins that).
     """
 
     @classmethod
@@ -1463,7 +1464,7 @@ class TestSelectionDisabled(unittest.TestCase):
         self.assertEqual(self.r._SELECTION_KEYS,
                          ('space', 'alt- ', 'ctrl-a', 'ctrl-n'))
 
-    def test_overrides_registered_blank_and_ungated(self):
+    def test_overrides_registered_blank_handlerless_and_ungated(self):
         actions = {a.key: a for a in self.r._build_actions()}
         for key in self.r._SELECTION_KEYS:
             with self.subTest(key=key):
@@ -1472,17 +1473,12 @@ class TestSelectionDisabled(unittest.TestCase):
                 # Blank label -> skipped by the help composer's
                 # CUSTOM ACTIONS section.
                 self.assertEqual(a.label, '')
-                self.assertIs(a.handler, self.r._action_selection_disabled)
-                # 'none' gate: the flash fires even on an empty list /
-                # the scope row, never half-working.
+                # No handler: the dispatcher swallows the key without
+                # calling anything — silent, as if never assigned.
+                self.assertIsNone(a.handler)
+                # 'none' gate: swallowed even on an empty list / the
+                # scope row, never half-working.
                 self.assertEqual(a.requires, 'none')
-
-    def test_handler_flashes(self):
-        flashes = []
-        ctx = types.SimpleNamespace(
-            flash=lambda msg, log=False: flashes.append(msg))
-        self.r._action_selection_disabled(ctx)
-        self.assertEqual(flashes, ['selection is disabled in browse-md'])
 
     def test_help_intro_notes_selection_disabled(self):
         # The composer drops the overridden SELECTION rows (and the
