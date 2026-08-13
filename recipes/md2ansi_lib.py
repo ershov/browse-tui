@@ -8,6 +8,7 @@ and what is borrowed from v1 (§9); the two modules never import each other.
 """
 
 import re
+import unicodedata
 from dataclasses import dataclass, field, replace
 from typing import Any
 
@@ -190,9 +191,23 @@ def _m2a_split_table_row(s):
     return cells
 
 
+def _m2a_char_width(ch):
+    """Display cells for one character: 2 for East Asian Wide/Fullwidth
+    (`W`/`F` — CJK ideographs, fullwidth forms), else 1. Combining marks and
+    ambiguous-width (`A`) characters count 1 (design §6)."""
+    return 2 if unicodedata.east_asian_width(ch) in ("W", "F") else 1
+
+
+def _m2a_cells(s):
+    """Display cells of escape-free `s` under the `_m2a_char_width` rule."""
+    if s.isascii():
+        return len(s)
+    return sum(_m2a_char_width(ch) for ch in s)
+
+
 def _m2a_visible_len(s):
-    """Length of s with ANSI escapes stripped — used for width calculations."""
-    return len(_M2A_ANSI_ESCAPE_RE.sub("", s))
+    """Display cells of s with ANSI escapes stripped — used for width math."""
+    return _m2a_cells(_M2A_ANSI_ESCAPE_RE.sub("", s))
 
 
 def _m2a_align_cell(content, width, align):
@@ -271,7 +286,7 @@ def _m2a_styled(text, current_style, sgr):
 
 
 def _m2a_wrap_ansi_line(line, line_width, continuation="", reset_sgr=""):
-    """Greedy ANSI-aware word-wrap: wraps at visible-character positions (with
+    """Greedy ANSI-aware word-wrap: wraps at visible-cell positions (with
     a small no-break zone at line start) and re-emits the last seen SGR on each
     new line so styling survives the break."""
     if _m2a_visible_len(line) <= line_width:
@@ -293,9 +308,10 @@ def _m2a_wrap_ansi_line(line, line_width, continuation="", reset_sgr=""):
             continue
         if tok[0].isspace():
             pending.append(tok)
-            pending_vlen += len(tok)
+            pending_vlen += _m2a_cells(tok)
             continue
-        attempt_vlen = current_vlen + pending_vlen + len(tok)
+        tok_cells = _m2a_cells(tok)
+        attempt_vlen = current_vlen + pending_vlen + tok_cells
         if attempt_vlen <= line_width or current_vlen < threshold or current_vlen == 0:
             current.extend(pending)
             current.append(tok)
@@ -306,7 +322,7 @@ def _m2a_wrap_ansi_line(line, line_width, continuation="", reset_sgr=""):
             if last_sgr:
                 current.append(last_sgr)
             current.append(tok)
-            current_vlen = len(continuation) + len(tok)
+            current_vlen = _m2a_cells(continuation) + tok_cells
         pending = []
         pending_vlen = 0
 
@@ -776,9 +792,10 @@ def _m2a_fmt_code(m, name, current_style, state, code_context, lang=None, label=
     )
     if label is None:
         label = f"Code: {lang}" if lang else "Code"
-    min_inner = len(label) + 6
+    label_cells = _m2a_cells(label)
+    min_inner = label_cells + 6
     inner = max(body_width, min_inner)
-    right_dashes = inner - 4 - len(label)
+    right_dashes = inner - 4 - label_cells
     top_text = f"┌── {label} {'─' * right_dashes}┐"
     bot_text = f"└{'─' * inner}┘"
     top = _m2a_styled(top_text, current_style, M2A_COLOR_FRAME)
