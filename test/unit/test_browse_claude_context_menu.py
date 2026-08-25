@@ -1073,6 +1073,15 @@ class TestCrossLinkMenu(unittest.TestCase):
         self.assertEqual(rows[0][1], ('link.jump', ('msg', self.sess, 1)))
         self.assertIn('agent.view', _tokens(rows))
 
+    def test_backlink_row_on_worker_side_msg(self):
+        # A row INSIDE the teammate transcript resolves through the
+        # owning master's reverse index: the worker's SendMessage row
+        # backlinks to the master's inbound-reply line.
+        ctx = self._ctx(Item(id=('msg', self.ap, 1), title='send'))
+        rows = self.r.context_menu_options(ctx)
+        self.assertEqual(rows[0][1], ('link.jump', ('msg', self.sess, 3)))
+        self.assertIn('msg.edit', _tokens(rows))
+
     def test_no_link_rows_on_plain_row(self):
         ctx = self._ctx(Item(id=('msg', self.sess, 0), title='m'))
         rows = self.r.context_menu_options(ctx)

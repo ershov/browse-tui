@@ -60,18 +60,19 @@ dimmed. Expand a subagent row to browse its own transcript as a nested
 tree.
 
 **Cross-link jumps.** Rows that participate in a leader↔teammate
-interaction carry a `[↗]` marker in their title: the spawn site
-(`Agent`/`Task` call), each `SendMessage` the leader sent a teammate, each
-inbound teammate reply, and the subagent group row itself. `Enter` on a
-marked row jumps across the link — a spawn site jumps to the subagent's
-first prompt, the n-th `SendMessage` to the teammate's matching inbound
-message, an inbound reply to the teammate's `SendMessage` that produced
-it, and the subagent group row jumps back to its spawn site. When one row
-carries several links (an assistant record spawning or messaging several
-teammates at once), `Enter` opens a menu of targets; the same jump rows
-also lead the row's context menu (`\` / F1 / right-click). A target
-hidden by the active detail level lands on its nearest visible row
-instead. `Enter` on an unmarked row does nothing.
+interaction carry a `[↗]` marker in their title, on both sides of the
+interaction — every link is one half of a two-way pair, so `Enter` jumps
+across it in either direction. At the session level the spawn site
+(`Agent`/`Task` call) pairs with the subagent group row. At the message
+level each `SendMessage` the leader sent pairs with the teammate's
+matching inbound message, each inbound teammate reply pairs with the
+teammate's `SendMessage` that produced it, and the teammate's first
+inbound message (the spawn prompt delivery) jumps back to the spawn
+record. When one row carries several links (an assistant record spawning
+or messaging several teammates at once), `Enter` opens a menu of targets;
+the same jump rows also lead the row's context menu (`\` / F1 /
+right-click). A target hidden by the active detail level lands on its
+nearest visible row instead. `Enter` on an unmarked row does nothing.
 
 Keys: `Enter` follow a `[↗]` cross-link, `1`-`6` set the detail level,
 `e` / `o` open in `$EDITOR`, `y` show id (debugging).

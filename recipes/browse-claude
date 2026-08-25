@@ -7790,24 +7790,33 @@ def _ancestor_ids_for(item_id):
     return []
 
 
-# ---- cross-link jumps (#1247) ---------------------------------------------
+# ---- cross-link jumps (#1247, two-way since #1243) -------------------------
 #
 # Navigation between a session's main thread and its subagent transcripts.
 # Rows that participate in a leader↔teammate interaction carry ``[↗]`` in
 # their title; Enter jumps across (a menu chooses when a row carries several
-# links, e.g. one assistant record spawning multiple agents). The map is:
+# links, e.g. one assistant record spawning multiple agents). Every link is
+# one half of a symmetric pair:
 #
-#   * spawn site (Agent/Task tool_use)      → the subagent's first turn root
-#   * n-th SendMessage to a teammate        → the teammate's (n+1)-th inbound
-#     teammate-message turn root (its 1st IS the spawn prompt)
-#   * n-th inbound teammate-message reply   → the teammate's n-th
-#     SendMessage-to-leader tool_use line
-#   * subagent group row                    → back to its spawn site
-#     (the only backlink)
+#   * SESSION level — spawn site (Agent/Task tool_use) ↔ the subagent
+#     GROUP row.
+#   * MESSAGE level —
+#       n-th SendMessage to a teammate    ↔ the teammate's (n+1)-th inbound
+#                                           teammate-message line (its 1st
+#                                           IS the spawn prompt);
+#       n-th inbound teammate-message
+#       reply                             ↔ the teammate's n-th
+#                                           SendMessage-to-leader line;
+#       teammate's FIRST inbound line
+#       (the spawn prompt delivery)       → the spawn record (its
+#                                           message-level counterpart — the
+#                                           spawn row itself keeps its one
+#                                           forward link, the group row).
 #
 # Both directions of the order join skip auto-generated idle notifications
 # (they aren't sent via SendMessage, so they'd shift the join); a join that
-# runs past the end falls back to the subagent group row.
+# runs past the end falls back to the subagent group row (no reverse half —
+# the group row's backlink is the session-level pair).
 
 
 def _is_idle_notification(body):
@@ -7834,16 +7843,40 @@ def _spawn_use_name(rec, tu_id):
     return None
 
 
+def _inbound_lines(std):
+    """Lines of delivered inbound teammate messages, in order.
+
+    The 1st is the spawn prompt delivery; idle notices are excluded so
+    the order join stays aligned with the leader's SendMessage list.
+    """
+    return [wn for wn, wrec in enumerate(std.records)
+            if isinstance(wrec, dict) and wrec.get('type') == 'user'
+            and _is_agent_message(wrec)
+            and not _is_idle_notification(_parse_agent_message(wrec)[1])]
+
+
 def _link_map(path):
     """Lazy cross-link map for one session (see the section comment).
 
     Returns ``{'lines': {master_line: [target_id, …]},
-    'agents': {agent_id: spawn_site_id}}`` cached on
+    'agents': {agent_id: spawn_site_id},
+    'rev': {(agent_jsonl, agent_line): [master_id, …]},
+    'agent_counts': {agent_jsonl: record_count_at_build}}`` cached on
     ``td.link_map``; rebuilt when the record count changed (a tail
     append can add spawn/send/reply rows). Target ids are ordinary row
     ids — ``('msg', jsonl, n)`` or the ``('agent', …)`` group row for
     an unresolvable join — so the jump path reuses the existing
     ancestor/expand machinery.
+
+    ``rev`` holds the reverse half of every message-level pair, keyed
+    by the subagent-side line, so rows INSIDE a subagent transcript
+    resolve their backlinks. The rebuild check here keys on the MASTER
+    count only; subagent transcripts grow independently, so
+    ``_links_for_id`` compares ``agent_counts`` against the live count
+    of the transcript it is resolving and forces a rebuild on mismatch
+    — a stale entry therefore survives only until the master grows or
+    the next lookup on a row of the grown transcript (which the
+    jump-to-group flow itself causes; self-healing).
     """
     td = _scan_tree(path)
     lm = td.link_map
@@ -7851,6 +7884,8 @@ def _link_map(path):
         return lm
     lines = {}
     agents = {}
+    rev = {}
+    agent_counts = {}
 
     # One master pass: SendMessage dispatch lines per recipient and
     # inbound teammate-message reply lines per sender (idle notices and
@@ -7892,27 +7927,26 @@ def _link_map(path):
         if not os.path.isfile(agent_path):
             continue
         std = _scan_tree(agent_path)
-        first = next((e['line'] for e in std.roots_in_order
-                      if e['kind'] == 'turn'), 0)
-        lines.setdefault(spawn_line, []).append(('msg', agent_path, first))
+        agent_counts[agent_path] = len(std.records)
+        # Session-level pair: spawn site ↔ group row (the group row's
+        # half lives in ``agents``). The message-level counterpart of
+        # the spawn is the teammate's FIRST inbound line — the spawn
+        # prompt delivery — which backlinks to the spawn record.
+        lines.setdefault(spawn_line, []).append(('agent', path, aid))
         agents[aid] = ('msg', path, spawn_line)
+        inbound = _inbound_lines(std)
+        if inbound:
+            rev.setdefault((agent_path, inbound[0]), []).append(
+                ('msg', path, spawn_line))
         rec = td.records[spawn_line]
         name = _spawn_use_name(rec, tu_id)
         if name:
-            by_name[name] = (aid, agent_path, std, spawn_line)
+            by_name[name] = (aid, agent_path, std, spawn_line, inbound)
 
-    for name, (aid, agent_path, std, spawn_line) in by_name.items():
+    for name, (aid, agent_path, std, spawn_line, inbound) in by_name.items():
         group_id = ('agent', path, aid)
-        # Teammate-side lists: inbound teammate-messages (the 1st is
-        # the spawn prompt itself) and SendMessage-to-leader lines. The
-        # leader's name is the sender of that first inbound message.
-        inbound = []
-        for wn, wrec in enumerate(std.records):
-            if (isinstance(wrec, dict) and wrec.get('type') == 'user'
-                    and _is_agent_message(wrec)
-                    and not _is_idle_notification(
-                        _parse_agent_message(wrec)[1])):
-                inbound.append(wn)
+        # Teammate-side SendMessage-to-leader lines; the leader's name
+        # is the sender of the first inbound message (the spawn prompt).
         leader = (_parse_agent_message(std.records[inbound[0]])[0]
                   if inbound else '')
         wsends = []
@@ -7933,19 +7967,27 @@ def _link_map(path):
         # Only traffic AFTER the owning spawn joins — an earlier
         # incarnation of a reused name exchanged its own messages, and
         # walking those into this transcript would link them to the
-        # wrong records. They carry no link instead.
+        # wrong records. They carry no link instead. Each resolved join
+        # also records its reverse half; a group-row fallback does not.
         for k, mline in enumerate(
                 [n for n in sends_to.get(name, []) if n > spawn_line]):
-            tgt = (('msg', agent_path, inbound[k + 1])
-                   if k + 1 < len(inbound) else group_id)
+            if k + 1 < len(inbound):
+                tgt = ('msg', agent_path, inbound[k + 1])
+                rev.setdefault(tgt[1:], []).append(('msg', path, mline))
+            else:
+                tgt = group_id
             lines.setdefault(mline, []).append(tgt)
         for k, mline in enumerate(
                 [n for n in replies_from.get(name, []) if n > spawn_line]):
-            tgt = (('msg', agent_path, wsends[k])
-                   if k < len(wsends) else group_id)
+            if k < len(wsends):
+                tgt = ('msg', agent_path, wsends[k])
+                rev.setdefault(tgt[1:], []).append(('msg', path, mline))
+            else:
+                tgt = group_id
             lines.setdefault(mline, []).append(tgt)
 
-    lm = {'nrecords': len(td.records), 'lines': lines, 'agents': agents}
+    lm = {'nrecords': len(td.records), 'lines': lines, 'agents': agents,
+          'rev': rev, 'agent_counts': agent_counts}
     td.link_map = lm
     return lm
 
@@ -7955,7 +7997,12 @@ def _links_for_id(item_id):
 
     A leaf and the umbrella wrapping it share the record line, so both
     resolve the same links (``('msg'|'tool'|'prompt', jsonl, line)``).
-    The ``('agent', …)`` group row resolves its one backlink.
+    The ``('agent', …)`` group row resolves its spawn-site backlink.
+    Rows inside a subagent transcript resolve through the OWNING master
+    session's reverse index; when this transcript grew since that map
+    was built (the master's own rebuild check only watches the master
+    count) the map is rebuilt first, so worker-side growth self-heals
+    both directions on the next lookup here.
     """
     if not isinstance(item_id, tuple) or len(item_id) != 3:
         return []
@@ -7965,9 +8012,18 @@ def _links_for_id(item_id):
     if tag == 'agent':
         tgt = _link_map(path)['agents'].get(key)
         return [tgt] if tgt else []
-    if tag in ('msg', 'tool', 'prompt') and isinstance(key, int):
-        return list(_link_map(path)['lines'].get(key, ()))
-    return []
+    if tag not in ('msg', 'tool', 'prompt') or not isinstance(key, int):
+        return []
+    links = list(_link_map(path)['lines'].get(key, ()))
+    outer = _outer_subagent_group_id(path)
+    if outer is None or not os.path.isfile(outer[1]):
+        return links
+    lm = _link_map(outer[1])
+    count = len(_scan_tree(path).records)
+    if lm['agent_counts'].get(path, count) != count:
+        _scan_tree(outer[1]).link_map = None
+        lm = _link_map(outer[1])
+    return links + list(lm['rev'].get((path, key), ()))
 
 
 def _link_marker(item_id):
@@ -9135,9 +9191,10 @@ a transcript with Right/Alt-Down; preview shows the rendered turn.
   t       toggle flat / tree view.
   1-6     detail level: 1 summary, 2 voice, 3 edits, 4 tools,
           5 detailed, 6 all.
-  Enter   follow a row's [↗] cross-link (spawn site <-> subagent,
-          SendMessage <-> inbound reply); a row with several links
-          opens a menu of targets.
+  Enter   follow a row's [↗] cross-link — every link is two-way: the
+          spawn site pairs with the subagent row, message rows pair
+          with their counterpart in the other transcript; a row with
+          several links opens a menu of targets.
 
 Right-click a row (or the backslash / F1 keys) for a menu: message and
 turn / tool / span umbrella rows offer the source actions above
@@ -9296,9 +9353,11 @@ def main():
         get_preview=get_preview,
         root_id=None,
         initial_scope=initial_scope,
-        # Enter follows a row's cross-link ([↗] rows — spawn sites,
-        # SendMessage dispatches, teammate replies, subagent group
-        # rows); everything else stays a silent no-op.
+        # Enter follows a row's cross-link ([↗] rows on both sides of a
+        # leader↔teammate interaction — spawn sites, SendMessage
+        # dispatches, teammate replies, subagent group rows, and the
+        # worker-side inbound / send-to-leader rows); everything else
+        # stays a silent no-op.
         on_enter=_on_enter_jump,
         actions=[
             # v / e are the framework defaults (page / edit the preview text).

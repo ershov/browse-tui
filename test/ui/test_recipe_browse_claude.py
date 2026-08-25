@@ -2134,6 +2134,55 @@ class TestBrowseClaude(unittest.TestCase):
                                  'cursor after the jump')
                 t.send('q')
 
+    def test_enter_backlink_from_subagent_message_row(self):
+        """Enter on a worker-side message row jumps BACK to the master.
+
+        Round trip over the real key binding (#1243 two-way pairs): the
+        master reply row forward-jumps onto the agent's SendMessage row —
+        itself ``[↗]``-marked now — and a second Enter follows the
+        reverse half of the pair back to the master's inbound reply row.
+        """
+        import tempfile
+        with tempfile.TemporaryDirectory() as tmp:
+            sess = self._make_forward_jump_fixture(tmp)
+            with TmuxFixture(cols=160, rows=30, env=self._launch_env(tmp)) as t:
+                t.launch(_BIN, '--run-py', _RECIPE, '--detail', 'all',
+                         '--tree', '--file', sess)
+                t.wait_for('← w1', timeout=4.0)
+                deadline = time.time() + 4.0
+                while True:
+                    cur = self._cursor_line(t.capture(colors=True))
+                    if cur and '← w1' in cur:
+                        break
+                    if time.time() > deadline:
+                        self.fail(f'cursor never settled on the reply '
+                                  f'row; on: {cur!r}')
+                    time.sleep(0.05)
+                t.send('Enter')
+                deadline = time.time() + 4.0
+                while True:
+                    cur = self._cursor_line(t.capture(colors=True))
+                    if cur and '→ team-lead' in cur:
+                        break
+                    if time.time() > deadline:
+                        self.fail(f'cursor never reached the SendMessage '
+                                  f'target; on: {cur!r}')
+                    time.sleep(0.05)
+                self.assertIn('[↗]', cur or '',
+                              'the worker-side SendMessage row must carry '
+                              'the backlink marker; on: ' + repr(cur))
+                t.send('Enter')
+                deadline = time.time() + 4.0
+                while True:
+                    cur = self._cursor_line(t.capture(colors=True))
+                    if cur and '← w1' in cur:
+                        break
+                    if time.time() > deadline:
+                        self.fail(f'cursor never returned to the master '
+                                  f'reply row; on: {cur!r}')
+                    time.sleep(0.05)
+                t.send('q')
+
     def test_tree_no_dividers_without_subagents(self):
         """A session with NO subagents shows no dividers."""
         import tempfile

@@ -6157,9 +6157,9 @@ class TestCrossLinks(unittest.TestCase):
         with tempfile.TemporaryDirectory() as tmp:
             sess, ap = self._build(tmp)
             lm = self.r._link_map(sess)
-            lines, agents = lm['lines'], lm['agents']
+            lines, agents, rev = lm['lines'], lm['agents'], lm['rev']
             group = ('agent', sess, 'W1')
-            self.assertEqual(lines[1], [('msg', ap, 0)])   # spawn → 1st root
+            self.assertEqual(lines[1], [group])            # spawn → group row
             self.assertEqual(lines[4], [('msg', ap, 3)])   # send#1 → inbound#2
             self.assertEqual(lines[8], [group])            # send#2 → fallback
             self.assertEqual(lines[3], [('msg', ap, 2)])   # reply#1 → wsend#1
@@ -6167,10 +6167,20 @@ class TestCrossLinks(unittest.TestCase):
             self.assertNotIn(7, lines)                     # idle notice
             self.assertEqual(sorted(lines), [1, 3, 4, 6, 8])
             self.assertEqual(agents, {'W1': ('msg', sess, 1)})
+            # Every resolved forward link has its reverse half; the
+            # group-row fallback (send#2) has none, and inbound#1 (the
+            # spawn prompt delivery) backlinks to the spawn record.
+            self.assertEqual(rev, {
+                (ap, 0): [('msg', sess, 1)],   # inbound#1 → spawn
+                (ap, 3): [('msg', sess, 4)],   # inbound#2 → send#1
+                (ap, 2): [('msg', sess, 3)],   # wsend#1 → reply#1
+                (ap, 4): [('msg', sess, 6)],   # wsend#2 → reply#2
+            })
+            self.assertEqual(lm['agent_counts'], {ap: 5})
 
     def test_links_for_id_row_shapes(self):
         # A leaf and its wrapping umbrella share the line → same links;
-        # the agent group row resolves the one backlink.
+        # the agent group row resolves the spawn-site backlink.
         import tempfile
         with tempfile.TemporaryDirectory() as tmp:
             sess, ap = self._build(tmp)
@@ -6179,14 +6189,25 @@ class TestCrossLinks(unittest.TestCase):
             self.assertEqual(self.r._links_for_id(('tool', sess, 4)), want)
             self.assertEqual(self.r._links_for_id(('prompt', sess, 3)),
                              [('msg', ap, 2)])
+            self.assertEqual(self.r._links_for_id(('msg', sess, 1)),
+                             [('agent', sess, 'W1')])
             self.assertEqual(self.r._links_for_id(('agent', sess, 'W1')),
+                             [('msg', sess, 1)])
+            # Worker-side rows resolve their backlinks through the
+            # owning master's reverse index — umbrellas share the line.
+            self.assertEqual(self.r._links_for_id(('msg', ap, 2)),
+                             [('msg', sess, 3)])
+            self.assertEqual(self.r._links_for_id(('tool', ap, 2)),
+                             [('msg', sess, 3)])
+            self.assertEqual(self.r._links_for_id(('msg', ap, 0)),
+                             [('msg', sess, 1)])
+            self.assertEqual(self.r._links_for_id(('prompt', ap, 0)),
                              [('msg', sess, 1)])
             # Rows without links, foreign shapes, missing files.
             self.assertEqual(self.r._links_for_id(('msg', sess, 0)), [])
             self.assertEqual(self.r._links_for_id(('span', sess, 0)), [])
             self.assertEqual(self.r._links_for_id(('msg', '/nope', 1)), [])
-            # No backlinks from inside the worker transcript.
-            self.assertEqual(self.r._links_for_id(('msg', ap, 2)), [])
+            self.assertEqual(self.r._links_for_id(('msg', ap, 1)), [])
 
     def test_link_marker_in_titles(self):
         import tempfile
@@ -6206,6 +6227,16 @@ class TestCrossLinks(unittest.TestCase):
             # The subagent group row (backlink) carries it.
             rows = self.r._tree_subagents_for_session(sess, td)
             self.assertTrue(rows[0].title.startswith('[↗] '))
+            # Worker-side rows carry it too: the spawn prompt delivery,
+            # an inbound message and a SendMessage-to-leader — but not
+            # a plain assistant voice.
+            std = self.r._scan_tree(ap)
+            for wn in (0, 2, 3, 4):
+                self.assertTrue(self.r._tree_item(
+                    ap, std.records[wn], std).title.startswith('[↗] '),
+                    f'worker line {wn} should carry the marker')
+            self.assertFalse(self.r._tree_item(
+                ap, std.records[1], std).title.startswith('[↗]'))
             # Link-less rows do not.
             self.assertFalse(self.r._tree_item(
                 sess, td.records[0], td).title.startswith('[↗]'))
@@ -6224,9 +6255,13 @@ class TestCrossLinks(unittest.TestCase):
             rows = self.r._link_menu_rows(('msg', sess, 1))
             self.assertEqual(len(rows), 1)
             label, token = rows[0]
-            self.assertEqual(token, ('link.jump', ('msg', ap, 0)))
-            self.assertTrue(label.startswith('↗ W1:1'), label)
-            self.assertLessEqual(len(label), 80)
+            self.assertEqual(token, ('link.jump', ('agent', sess, 'W1')))
+            self.assertEqual(label, '↗ subagent W1')
+            # A worker-side backlink labels the master session line.
+            rows = self.r._link_menu_rows(('msg', ap, 2))
+            self.assertEqual(rows[0][1], ('link.jump', ('msg', sess, 3)))
+            self.assertTrue(rows[0][0].startswith('↗ parent.jsonl:4'),
+                            rows[0][0])
             # Group-row fallback label names the subagent.
             rows = self.r._link_menu_rows(('msg', sess, 8))
             self.assertEqual(rows[0][1], ('link.jump', ('agent', sess, 'W1')))
@@ -6247,6 +6282,27 @@ class TestCrossLinks(unittest.TestCase):
             lm = self.r._link_map(sess)
             # reply#3 has no matching worker send → group-row fallback.
             self.assertEqual(lm['lines'][10], [('agent', sess, 'W1')])
+
+    def test_worker_side_lookup_self_heals_on_agent_growth(self):
+        # The master's rebuild check only watches ITS record count; when
+        # the WORKER transcript grows (send#2's pending inbound finally
+        # delivered), a worker-side lookup must detect the stale
+        # agent_counts entry and rebuild — resolving both halves of the
+        # pair that was a group-row fallback before.
+        import json as _json
+        import tempfile
+        with tempfile.TemporaryDirectory() as tmp:
+            sess, ap = self._build(tmp)
+            lm = self.r._link_map(sess)
+            self.assertEqual(lm['lines'][8], [('agent', sess, 'W1')])
+            with open(ap, 'a') as f:
+                f.write(_json.dumps(self._tm('team-lead', 'one more'))
+                        + '\n')
+            self.r._read_new_records(ap)
+            self.assertEqual(self.r._links_for_id(('msg', ap, 5)),
+                             [('msg', sess, 8)])
+            self.assertEqual(self.r._link_map(sess)['lines'][8],
+                             [('msg', ap, 5)])
 
     def test_respawn_joins_only_post_spawn_traffic(self):
         # A reused teammate name: the latest spawn owns the order join,
@@ -6304,17 +6360,26 @@ class TestCrossLinks(unittest.TestCase):
                         f.write(_json.dumps(rec) + '\n')
             lm = self.r._link_map(sess)
             lines = lm['lines']
-            # Both incarnations keep their spawn link + backlink.
-            self.assertEqual(lines[1], [('msg', paths['OLD'], 0)])
-            self.assertEqual(lines[4], [('msg', paths['NEW'], 0)])
+            # Both incarnations keep their session-level pair (spawn ↔
+            # group) and their first-inbound spawn backlink.
+            self.assertEqual(lines[1], [('agent', sess, 'OLD')])
+            self.assertEqual(lines[4], [('agent', sess, 'NEW')])
             self.assertEqual(lm['agents'],
                              {'OLD': ('msg', sess, 1),
                               'NEW': ('msg', sess, 4)})
+            self.assertEqual(lm['rev'][(paths['OLD'], 0)],
+                             [('msg', sess, 1)])
+            self.assertEqual(lm['rev'][(paths['NEW'], 0)],
+                             [('msg', sess, 4)])
             # The pre-respawn send (delivered to OLD) carries NO link —
             # in particular it must not point into NEW's transcript.
             self.assertNotIn(3, lines)
-            # The post-respawn send joins as NEW's send#1 → inbound#2.
+            # The post-respawn send joins as NEW's send#1 → inbound#2,
+            # with its reverse half; OLD's inbound#2 stays link-less.
             self.assertEqual(lines[6], [('msg', paths['NEW'], 1)])
+            self.assertEqual(lm['rev'][(paths['NEW'], 1)],
+                             [('msg', sess, 6)])
+            self.assertNotIn((paths['OLD'], 1), lm['rev'])
 
     def test_multi_link_row_collects_all_targets(self):
         # One assistant record spawning TWO agents → two links on its line.
@@ -6360,10 +6425,8 @@ class TestCrossLinks(unittest.TestCase):
                         'message': {'role': 'user', 'content': 'inside'},
                     }) + '\n')
             links = self.r._links_for_id(('msg', sess, 1))
-            self.assertEqual(len(links), 2)
-            self.assertEqual({t[1] for t in links},
-                             {os.path.join(sub_dir, 'agent-A1.jsonl'),
-                              os.path.join(sub_dir, 'agent-A2.jsonl')})
+            self.assertEqual(sorted(links),
+                             [('agent', sess, 'A1'), ('agent', sess, 'A2')])
 
 
 class TestRowBgForKind(unittest.TestCase):
