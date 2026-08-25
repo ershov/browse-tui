@@ -4752,6 +4752,7 @@ class TestSubagentUmbrellaVoice(unittest.TestCase):
 
             class _State:
                 cursor = 0
+                expanded = set()
 
             class _Pending:
                 def __init__(self):
@@ -4826,6 +4827,7 @@ class TestSubagentUmbrellaVoice(unittest.TestCase):
 
             class _State:
                 cursor = 0
+                expanded = set()
 
             class _Pending:
                 def __init__(self):
@@ -4912,7 +4914,7 @@ class TestSubagentUmbrellaVoice(unittest.TestCase):
         the cursor strands on a ``<prompt>`` umbrella whose heavy
         streaming preview hasn't composed yet, leaving the preview pane
         blank. The fix: ``_focus_latest_voice_when_ready`` records the
-        scope_root it owns in ``_DEFERRED_FOCUS_SCOPE_ROOT``, and
+        scope_root it owns in ``_VOICE_JUMP_SUPPRESSED``, and
         ``_on_expand`` skips its jump for that id, letting the deep
         landing win. The cross-file preview upgrade still fires.
         """
@@ -4946,8 +4948,8 @@ class TestSubagentUmbrellaVoice(unittest.TestCase):
             self.r._BROWSER = _FakeBrowser()
             # Simulate _focus_latest_voice_when_ready claiming the
             # scope_root's landing (the no-``--item`` path).
-            self.r._DEFERRED_FOCUS_SCOPE_ROOT.add(scope)
-            self.addCleanup(self.r._DEFERRED_FOCUS_SCOPE_ROOT.discard, scope)
+            self.r._VOICE_JUMP_SUPPRESSED.add(scope)
+            self.addCleanup(self.r._VOICE_JUMP_SUPPRESSED.discard, scope)
             try:
                 # Sanity: the competing target exists and is a top-level
                 # umbrella (NOT the scope_root itself).
@@ -4974,7 +4976,7 @@ class TestSubagentUmbrellaVoice(unittest.TestCase):
                 self.r._BROWSER = saved_browser
                 self.r._TREE_MODE = saved_mode
                 self.r._AWAITING_VOICE_JUMP.discard(scope)
-                self.r._DEFERRED_FOCUS_SCOPE_ROOT.discard(scope)
+                self.r._VOICE_JUMP_SUPPRESSED.discard(scope)
 
     def test_on_expand_scope_root_claim_is_consumed_once(self):
         """#720: the deferred-focus claim is one-shot.
@@ -5013,8 +5015,8 @@ class TestSubagentUmbrellaVoice(unittest.TestCase):
             saved_browser = self.r._BROWSER
             self.r._BROWSER = _FakeBrowser()
             # Focus claims the scope_root's startup landing.
-            self.r._DEFERRED_FOCUS_SCOPE_ROOT.add(scope)
-            self.addCleanup(self.r._DEFERRED_FOCUS_SCOPE_ROOT.discard, scope)
+            self.r._VOICE_JUMP_SUPPRESSED.add(scope)
+            self.addCleanup(self.r._VOICE_JUMP_SUPPRESSED.discard, scope)
             ctx = _Ctx()
             try:
                 # 1st expand (startup) — suppressed AND the claim is
@@ -5025,7 +5027,7 @@ class TestSubagentUmbrellaVoice(unittest.TestCase):
                     'startup scope_root expand must be suppressed',
                 )
                 self.assertNotIn(
-                    scope, self.r._DEFERRED_FOCUS_SCOPE_ROOT,
+                    scope, self.r._VOICE_JUMP_SUPPRESSED,
                     'the claim must be consumed on the first expand',
                 )
                 # 2nd expand (manual re-expand) — drills in normally now.
@@ -5046,7 +5048,7 @@ class TestSubagentUmbrellaVoice(unittest.TestCase):
         """#720 guard: with no deferred focus (``--item`` launch) the
         scope_root keeps its latest-voice landing.
 
-        ``_DEFERRED_FOCUS_SCOPE_ROOT`` is empty when launched with
+        ``_VOICE_JUMP_SUPPRESSED`` is empty when launched with
         ``--item`` (no ``_focus_latest_voice_when_ready``). The generic
         ``on_expand`` jump must then still land the scope_root on its
         latest top-level voice, preserving the long-standing flat-mode
@@ -5079,7 +5081,7 @@ class TestSubagentUmbrellaVoice(unittest.TestCase):
             saved_browser = self.r._BROWSER
             self.r._BROWSER = _FakeBrowser()
             # No deferred-focus claim — the --item launch path.
-            self.r._DEFERRED_FOCUS_SCOPE_ROOT.discard(scope)
+            self.r._VOICE_JUMP_SUPPRESSED.discard(scope)
             try:
                 self.r._on_expand(_Ctx(), [scope])
                 expected = self.r._latest_voice_among_children(scope)
@@ -5124,8 +5126,8 @@ class TestSubagentUmbrellaVoice(unittest.TestCase):
             saved_browser = self.r._BROWSER
             self.r._BROWSER = _FakeBrowser()
             # The scope_root claim must not suppress a different id.
-            self.r._DEFERRED_FOCUS_SCOPE_ROOT.add(sess)
-            self.addCleanup(self.r._DEFERRED_FOCUS_SCOPE_ROOT.discard, sess)
+            self.r._VOICE_JUMP_SUPPRESSED.add(sess)
+            self.addCleanup(self.r._VOICE_JUMP_SUPPRESSED.discard, sess)
             try:
                 self.r._on_expand(_Ctx(), [umbrella])
                 # The umbrella's latest voice must be landed on.

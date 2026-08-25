@@ -1136,5 +1136,147 @@ class TestCrossLinkMenu(unittest.TestCase):
         self.assertEqual(Context(self.b).cursor.id, before)
 
 
+class TestCrossLinkJumpVoiceRace(unittest.TestCase):
+    """#1243: a cross-link jump must not lose the race to the expand-time
+    jump-to-latest-voice.
+
+    ``_jump_to_link`` reveals its target by expanding the ancestor chain
+    and then ``cursor_to``-ing the target. Those programmatic expands fire
+    the ``on_expand`` lifecycle hook like any other; with the ancestors'
+    children UNCACHED the hook parks each id in ``_AWAITING_VOICE_JUMP``
+    and ``_on_children_loaded`` posts the deferred jump-to-latest-voice
+    AFTER the chain's cursor_to — dragging the cursor off the target onto
+    whatever voice is newest under the last ancestor. The fix:
+    ``_chain_expand_then_cursor`` claims each collapsed ancestor in
+    ``_VOICE_JUMP_SUPPRESSED`` before expanding it, and ``_on_expand``
+    skips (and consumes) the claim.
+
+    Unlike ``TestCrossLinkMenu``'s jump tests, the headless Browser here
+    registers the recipe's REAL ``on_expand`` / ``on_children_loaded``
+    hooks — without them the race under test doesn't exist. And because
+    ``run_until_idle`` never fires the post-drain lifecycle hooks (only
+    the real main loop does), the pump replicates the loop's tick order:
+    drain → apply children results → fire expand/collapse → fire
+    children-loaded.
+
+    Fixture: the ``TestCrossLinkMenu`` master/teammate pair, plus one
+    assistant text voice appended to the AGENT transcript. The forward
+    jump (teammate-reply row → the agent's SendMessage record) then has
+    ancestor chain ``[('agent', …), ('span', ap, 1)]`` where the span's
+    latest voice is the appended record — NEWER than the jump target and
+    exactly what the unsuppressed deferred jump used to land on.
+    """
+
+    def setUp(self):
+        self.r = _load_recipe()
+        self._tmp = tempfile.TemporaryDirectory()
+        self.sess, self.ap = TestCrossLinkMenu._build(self, self._tmp.name)
+        # A voice NEWER than the jump target, in the same span of the
+        # agent transcript: the last ancestor's latest voice ≠ target.
+        import json as _json
+        with open(self.ap, 'a') as f:
+            f.write(_json.dumps(
+                {'type': 'assistant', 'uuid': 'wa2',
+                 'message': {'role': 'assistant', 'content': [
+                     {'type': 'text', 'text': 'AGENT_NEWEST'}]}}) + '\n')
+        self.r._DETAIL_LEVEL = 6
+        self.target = ('msg', self.ap, 1)
+        self.last_ancestor = ('span', self.ap, 1)
+
+    def tearDown(self):
+        b = getattr(self, 'b', None)
+        if b is not None:
+            b.stop_workers()
+        self._tmp.cleanup()
+
+    def _hooked_browser(self):
+        """Headless Browser with the recipe's lifecycle hooks REGISTERED."""
+        sess_item = Item(id=('session', self.sess), title='s',
+                         has_children=True)
+
+        def kids(item_id, *, reload=False):
+            if item_id is None:
+                return [sess_item]
+            return [Item(id=c.id, title=getattr(c, 'title', ''),
+                         has_children=bool(getattr(c, 'has_children',
+                                                   False)),
+                         hidden=bool(getattr(c, 'hidden', False)),
+                         meta=bool(getattr(c, 'meta', False)),
+                         boundary=bool(getattr(c, 'boundary', False)))
+                    for c in self.r.get_children(item_id)]
+
+        self.b = make_browser(get_children=kids,
+                              on_expand=self.r._on_expand,
+                              on_children_loaded=self.r._on_children_loaded)
+        return self.b
+
+    def _pump(self, b, timeout=5.0):
+        """One real-main-loop tick at a time, until fully settled."""
+        import time as _time
+        deadline = _time.monotonic() + timeout
+        while _time.monotonic() < deadline:
+            b.drain_main_queue()
+            b.apply_children_results()
+            b._fire_expand_collapse_if_pending()
+            b._fire_children_loaded_if_pending()
+            if (b._main_queue.empty() and not b._children_queue
+                    and not b._children_results
+                    and not b._children_in_flight
+                    and not b._state._children_pending
+                    and not self.r._AWAITING_VOICE_JUMP):
+                return
+            _time.sleep(0.005)
+        self.fail('pump: browser did not settle')
+
+    def _cursor_on_reply_row(self, b):
+        """Expand down to and land on the teammate-reply master row."""
+        b.refresh()
+        self._pump(b)
+        b.expand(('session', self.sess))
+        self._pump(b)
+        b.expand(('prompt', self.sess, 0))
+        self._pump(b)
+        b.cursor_to(('msg', self.sess, 3))
+        self._pump(b)
+        self.assertEqual(Context(b).cursor.id, ('msg', self.sess, 3))
+
+    def test_jump_wins_over_newer_voice_in_uncached_ancestors(self):
+        # Preconditions: single forward link into the agent transcript,
+        # and the last ancestor's latest voice is the NEWER appended
+        # record — the row the unsuppressed race used to land on.
+        self.assertEqual(self.r._links_for_id(('msg', self.sess, 3)),
+                         [self.target])
+        self.assertEqual(
+            self.r._latest_voice_among_children(self.last_ancestor),
+            ('msg', self.ap, 2))
+
+        b = self._hooked_browser()
+        self._cursor_on_reply_row(b)
+        self.r._on_enter_jump(Context(b))
+        self._pump(b)
+        self.assertEqual(
+            Context(b).cursor.id, self.target,
+            'the jump target must win — not the newer voice the '
+            'expand-time jump-to-latest-voice would land on')
+
+    def test_manual_reexpand_after_jump_still_drills_to_latest_voice(self):
+        b = self._hooked_browser()
+        self._cursor_on_reply_row(b)
+        self.r._on_enter_jump(Context(b))
+        self._pump(b)
+        self.assertEqual(Context(b).cursor.id, self.target)
+        # Every claim was consumed by the suppressed expands.
+        self.assertEqual(self.r._VOICE_JUMP_SUPPRESSED, set())
+        # A MANUAL collapse + re-expand of the same ancestor must drill
+        # in to the latest voice normally (one-shot suppression).
+        b.collapse(self.last_ancestor)
+        self._pump(b)
+        b.expand(self.last_ancestor)
+        self._pump(b)
+        self.assertEqual(Context(b).cursor.id, ('msg', self.ap, 2),
+                         'a manual re-expand must jump to the latest '
+                         'voice — the claim is consume-on-fire')
+
+
 if __name__ == '__main__':
     unittest.main()

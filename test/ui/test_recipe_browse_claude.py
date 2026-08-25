@@ -2014,6 +2014,126 @@ class TestBrowseClaude(unittest.TestCase):
                     time.sleep(0.05)
                 t.send('q')
 
+    def _make_forward_jump_fixture(self, tmp):
+        """Master spawning teammate w1, plus w1's transcript with a voice
+        NEWER than the SendMessage record the master's reply row links to.
+
+        The reply row (``← w1``) forward-links to the agent's SendMessage
+        (``→ team-lead``). The trailing PROBE_AGENT_NEWEST voice is the
+        row the unsuppressed expand-time jump-to-latest-voice used to
+        drag the cursor onto after the jump landed (#1243).
+        """
+        import json as _json
+        root = os.path.join(tmp, '.claude', 'projects')
+        proj = os.path.join(root, '-home-test-fwd')
+        os.makedirs(proj)
+        sess = os.path.join(proj, 'fwd-sess.jsonl')
+        tm = ('<teammate-message teammate_id="w1" '
+              'summary="PROBE_DONE_SUMMARY">\nPROBE_AGENT_ANSWER\n'
+              '</teammate-message>')
+        records = [
+            {'type': 'user', 'uuid': 'u1', 'parentUuid': None,
+             'message': {'role': 'user', 'content': 'PROBE_FWD_KICKOFF'}},
+            {'type': 'assistant', 'uuid': 'a1', 'parentUuid': 'u1',
+             'message': {'role': 'assistant', 'content': [
+                 {'type': 'tool_use', 'id': 'toolu_F', 'name': 'Agent',
+                  'input': {'name': 'w1',
+                            'subagent_type': 'general-purpose',
+                            'prompt': 'PROBE_FWD_DISPATCH'}}]}},
+            {'type': 'user', 'uuid': 'u2', 'parentUuid': 'a1',
+             'message': {'role': 'user', 'content': [
+                 {'type': 'tool_result', 'tool_use_id': 'toolu_F',
+                  'content': 'spawned'}]},
+             'toolUseResult': {'agentId': 'W1',
+                               'agentType': 'general-purpose',
+                               'status': 'completed'}},
+            {'type': 'user', 'uuid': 'u3', 'parentUuid': 'u2',
+             'message': {'role': 'user', 'content': tm}},
+        ]
+        with open(sess, 'w') as f:
+            for rec in records:
+                f.write(_json.dumps(rec) + '\n')
+        sub_dir = os.path.join(proj, 'fwd-sess', 'subagents')
+        os.makedirs(sub_dir)
+        ap = os.path.join(sub_dir, 'agent-W1.jsonl')
+        # No uuids on the agent records: uuid-less assistant records
+        # group under a <span> umbrella (not a per-tool_use <tool>
+        # node), so the SendMessage target and the newer voice share
+        # ONE direct parent — the shape whose deferred voice jump
+        # lands strictly after the chain's cursor_to and steals it.
+        wrecs = [
+            {'type': 'user',
+             'message': {'role': 'user', 'content': (
+                 '<teammate-message teammate_id="team-lead">\n'
+                 'PROBE_FWD_TASK\n</teammate-message>')}},
+            {'type': 'assistant',
+             'message': {'role': 'assistant', 'content': [
+                 {'type': 'tool_use', 'id': 'toolu_WS',
+                  'name': 'SendMessage',
+                  'input': {'to': 'team-lead',
+                            'summary': 'PROBE_DONE_SUMMARY',
+                            'message': 'PROBE_AGENT_ANSWER'}}]}},
+            {'type': 'assistant',
+             'message': {'role': 'assistant', 'content': [
+                 {'type': 'text', 'text': 'PROBE_AGENT_NEWEST'}]}},
+        ]
+        with open(ap, 'w') as f:
+            for rec in wrecs:
+                f.write(_json.dumps(rec) + '\n')
+        with open(os.path.join(sub_dir, 'agent-W1.meta.json'), 'w') as f:
+            _json.dump({'agentType': 'general-purpose',
+                        'description': 'PROBE_FWD_DESC'}, f)
+        return sess
+
+    def test_enter_forward_jump_into_subagent_beats_voice_jump(self):
+        """Enter on the reply row jumps INTO the subagent transcript and
+        STAYS on the linked SendMessage (#1243).
+
+        The jump expands the agent group + the target's span, whose
+        children are uncached and carry a voice NEWER than the target —
+        the expand-time jump-to-latest-voice used to fire after the
+        jump's cursor_to and drag the cursor onto PROBE_AGENT_NEWEST.
+        """
+        import tempfile
+        with tempfile.TemporaryDirectory() as tmp:
+            sess = self._make_forward_jump_fixture(tmp)
+            with TmuxFixture(cols=160, rows=30, env=self._launch_env(tmp)) as t:
+                t.launch(_BIN, '--run-py', _RECIPE, '--detail', 'all',
+                         '--tree', '--file', sess)
+                # Startup focus lands on the latest voice — the inbound
+                # reply row, which is exactly the jump's launch point.
+                t.wait_for('← w1', timeout=4.0)
+                deadline = time.time() + 4.0
+                while True:
+                    cur = self._cursor_line(t.capture(colors=True))
+                    if cur and '← w1' in cur:
+                        break
+                    if time.time() > deadline:
+                        self.fail(f'cursor never settled on the reply '
+                                  f'row; on: {cur!r}')
+                    time.sleep(0.05)
+                t.send('Enter')
+                deadline = time.time() + 4.0
+                while True:
+                    cur = self._cursor_line(t.capture(colors=True))
+                    if cur and '→ team-lead' in cur:
+                        break
+                    if time.time() > deadline:
+                        self.fail(f'cursor never reached the SendMessage '
+                                  f'target; on: {cur!r}')
+                    time.sleep(0.05)
+                # And it must STAY there: the racing deferred voice jump
+                # landed shortly AFTER the target pre-fix.
+                time.sleep(0.5)
+                cur = self._cursor_line(t.capture(colors=True))
+                self.assertIn('→ team-lead', cur or '',
+                              'cursor must stay on the jump target; on: '
+                              + repr(cur))
+                self.assertNotIn('PROBE_AGENT_NEWEST', cur or '',
+                                 'the newer voice must not steal the '
+                                 'cursor after the jump')
+                t.send('q')
+
     def test_tree_no_dividers_without_subagents(self):
         """A session with NO subagents shows no dividers."""
         import tempfile

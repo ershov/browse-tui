@@ -8096,16 +8096,32 @@ def _chain_expand_then_cursor(b, ancestor_ids, target_id):
     is exactly when the next ``expand`` can read them. Without this
     chaining the expands fire in parallel, the cursor_to runs before
     any of them populate the visible list, and cursor_to no-ops
-    (leaving the cursor on the scope_root). Used for cursor-on-open
-    and the t-toggle's walk-up-and-expand path.
+    (leaving the cursor on the scope_root). Used for cursor-on-open,
+    the t-toggle's walk-up-and-expand path, and cross-link jumps.
+
+    Every expand issued here belongs to a targeted navigation whose
+    destination is the final ``cursor_to`` — so each one claims its
+    landing in ``_VOICE_JUMP_SUPPRESSED`` before firing (#1243).
+    Otherwise ``_on_expand``'s jump-to-latest-voice (deferred via
+    ``_AWAITING_VOICE_JUMP`` when children aren't cached yet, and then
+    posted from the children-loaded hook AFTER this chain's cursor_to)
+    would drag the cursor off the target. Only a still-collapsed id is
+    claimed: an already-expanded one never re-fires ``on_expand``, so
+    its claim would go stale and eat a later manual re-expand's jump.
+
+    ``b`` is a Browser or a Context — both expose ``expand`` /
+    ``cursor_to``; the expanded-set read handles either shape.
     """
     if not ancestor_ids:
         b.cursor_to(target_id)
         return
+    state = b._state if hasattr(b, '_state') else b.state
     def _step(i):
         if i >= len(ancestor_ids):
             b.cursor_to(target_id)
             return
+        if ancestor_ids[i] not in state.expanded:
+            _VOICE_JUMP_SUPPRESSED.add(ancestor_ids[i])
         b.expand(ancestor_ids[i], autoscroll=True).then(lambda: _step(i + 1))
     _step(0)
 
@@ -8162,7 +8178,7 @@ def _focus_latest_voice_when_ready(b, target_jsonl):
     # Claim the scope_root's cursor-on-open landing so the generic
     # ``on_expand`` jump steps aside for the deeper focus below (#720).
     # Registered before the owning ``expand`` fires its hook.
-    _DEFERRED_FOCUS_SCOPE_ROOT.add(scope_id)
+    _VOICE_JUMP_SUPPRESSED.add(scope_id)
     b.expand(scope_id).then(_fire)
 
 
@@ -8258,15 +8274,23 @@ def _on_scope_change(ctx, scope_id, prev_scope_id, direction):
 # composition.
 _AWAITING_VOICE_JUMP = set()
 
-# Session scope_root ids whose cursor-on-open landing is owned by
-# ``_focus_latest_voice_when_ready`` (the no-``--item`` deferred focus).
-# ``_on_expand`` skips its single-level jump-to-latest-voice for these so
-# it doesn't race the focus's deeper landing and strand the cursor on a
-# not-yet-streamed umbrella (#720). Populated before the owning expand
-# fires; only the startup scope_root is ever added. Consumed (discarded)
-# by ``_on_expand`` on that first expand so a later manual collapse +
-# re-expand of the scope_root still drills in normally.
-_DEFERRED_FOCUS_SCOPE_ROOT = set()
+# Ids whose next expand's jump-to-latest-voice is suppressed because a
+# targeted navigation owns the landing. ``_on_expand`` skips its
+# single-level jump for these (immediate AND deferred — a suppressed id
+# is never parked in ``_AWAITING_VOICE_JUMP``) so the owner's deeper
+# ``cursor_to`` isn't dragged off-target. Two producers, both
+# registering BEFORE the owning expand fires its hook:
+#
+#   * ``_focus_latest_voice_when_ready`` claims the startup session
+#     scope_root (the no-``--item`` deferred focus, #720);
+#   * ``_chain_expand_then_cursor`` claims each collapsed ancestor it is
+#     about to expand (#1243 — the chain's final cursor_to is the
+#     destination; cross-link jumps and the t-toggle cursor restore
+#     must not lose it to a per-ancestor voice jump).
+#
+# Consumed (discarded) by ``_on_expand`` as it skips, so a later manual
+# collapse + re-expand of the same row still drills in normally.
+_VOICE_JUMP_SUPPRESSED = set()
 
 
 def _jump_to_latest_voice(ctx, item_id):
@@ -8323,37 +8347,45 @@ def _on_expand(ctx, ids):
     chain, which only fired for an expand the recipe itself issued —
     the hook composition fires for user-driven keyboard expansion too.
 
-    Exception — the scope_root the deferred startup focus owns (#720):
-    when launched without ``--item``, ``_focus_latest_voice_when_ready``
-    drives its own cursor-on-open jump for the session scope_root,
-    landing on the *deepest* latest message (walking the ancestor
-    umbrellas). That same scope_root expand also fires this hook, whose
-    single-level ``_jump_to_latest_voice`` targets the top-level umbrella
-    instead — so two jumps race through the post queue, and when the
-    umbrella jump wins last the cursor strands on a ``<prompt>`` umbrella
-    whose heavy streaming preview hasn't composed yet (a blank pane until
-    the cascade lands). ``_focus_latest_voice_when_ready`` records the
-    scope_root it owns in ``_DEFERRED_FOCUS_SCOPE_ROOT``; we skip the
-    jump for that id and let the deep-landing focus win. The cross-file
-    preview upgrade above still applies (the scope_root must go heavy).
-    With ``--item`` (no deferred focus) the set is empty, so the
-    scope_root keeps its latest-voice landing as before.
+    Exception — ids whose landing another owner drives
+    (``_VOICE_JUMP_SUPPRESSED``): a targeted navigation ends with its
+    own ``cursor_to``, and this hook's single-level jump would race it
+    through the post queue and win last, dragging the cursor off the
+    intended target. Two owners register their expands there before
+    firing them:
+
+      * ``_focus_latest_voice_when_ready`` (#720): the no-``--item``
+        startup focus lands the session scope_root on the *deepest*
+        latest message; the hook's jump would strand the cursor on a
+        top-level ``<prompt>`` umbrella whose heavy streaming preview
+        hasn't composed yet (a blank pane until the cascade lands).
+      * ``_chain_expand_then_cursor`` (#1243): cross-link jumps and the
+        t-toggle cursor restore expand ancestor chains whose children
+        are usually uncached — without the claim each ancestor would be
+        parked in ``_AWAITING_VOICE_JUMP`` and the deferred jump would
+        fire AFTER the chain's final cursor_to (e.g. yanking a backlink
+        jump onto whatever voice is newest under the spawn turn).
+
+    We skip the jump for a claimed id — parking included, so the
+    deferred ``_on_children_loaded`` jump is suppressed too. The
+    cross-file preview upgrade above still applies (an expanding
+    boundary row must go heavy). With no owner in flight the set is
+    empty and every row keeps its latest-voice landing as before.
 
     The claim is **consumed once**: we discard the id as we skip it, so
-    only the FIRST (startup) expand of that scope_root is suppressed. A
-    later *manual* collapse + re-expand of the scope_root row (``nav-left``
-    drops it from ``expanded``, ``nav-right`` → ``ctx.expand`` fires this
-    hook again) must drill in to the latest voice like any other row — a
-    persistent claim would suppress that legitimate jump forever. Add-
-    before-the-owning-expand ordering guarantees the id is present when
-    the startup ``_on_expand`` runs, so the startup jump is still
-    suppressed; consuming here is robust whether ``_fire`` proceeds or
-    cancels (both ride the same ``b.expand(target_jsonl)`` resolution).
+    only the owner's expand is suppressed. A later *manual* collapse +
+    re-expand of the same row (``nav-left`` drops it from ``expanded``,
+    ``nav-right`` → ``ctx.expand`` fires this hook again) must drill in
+    to the latest voice like any other row — a persistent claim would
+    suppress that legitimate jump forever. Add-before-the-owning-expand
+    ordering guarantees the id is present when the owner's ``_on_expand``
+    runs; consuming here is robust whether the owner's continuation
+    proceeds or cancels (both ride the same expand resolution).
     """
     for id in ids:
         _invalidate_if_cross_file(id)
-        if id in _DEFERRED_FOCUS_SCOPE_ROOT:
-            _DEFERRED_FOCUS_SCOPE_ROOT.discard(id)
+        if id in _VOICE_JUMP_SUPPRESSED:
+            _VOICE_JUMP_SUPPRESSED.discard(id)
             continue
         if ctx.cached_children(id) is not None:
             _jump_to_latest_voice(ctx, id)
