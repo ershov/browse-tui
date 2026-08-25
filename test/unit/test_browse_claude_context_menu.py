@@ -976,5 +976,165 @@ class TestDetailLevelBindings(unittest.TestCase):
                          "the old toggle handler should be gone")
 
 
+class TestCrossLinkMenu(unittest.TestCase):
+    """#1247: cross-link jump rows in the menu + the Enter jump path.
+
+    The link map needs REAL .jsonl files (master + one teammate
+    transcript), so the fixture writes a co-located pair. The jump test
+    drives the recipe's real ``get_children`` through a headless
+    Browser, so ``_chain_expand_then_cursor`` exercises the same
+    expand/cursor_to path the binary runs.
+    """
+
+    def setUp(self):
+        self.r = _load_recipe()
+        import tempfile
+        self._tmp = tempfile.TemporaryDirectory()
+        self.sess, self.ap = self._build(self._tmp.name)
+
+    def tearDown(self):
+        b = getattr(self, 'b', None)
+        if b is not None:
+            b.stop_workers()
+        self._tmp.cleanup()
+
+    def _build(self, tmp):
+        """Master with teammate w1: spawn @1, reply @3, SendMessage @4."""
+        import json as _json
+        sess = os.path.join(tmp, 'parent.jsonl')
+        tm = ('<teammate-message teammate_id="w1" summary="done 1">\n'
+              'first result\n</teammate-message>')
+        recs = [
+            {'type': 'user', 'uuid': 'u1',
+             'message': {'role': 'user', 'content': 'kick off'}},
+            {'type': 'assistant', 'uuid': 'a1',
+             'message': {'role': 'assistant', 'content': [
+                 {'type': 'tool_use', 'id': 'toolu_A', 'name': 'Agent',
+                  'input': {'name': 'w1',
+                            'subagent_type': 'general-purpose',
+                            'prompt': 'do the thing'}},
+             ]}},
+            {'type': 'user', 'uuid': 'u2',
+             'message': {'role': 'user', 'content': [
+                 {'type': 'tool_result', 'tool_use_id': 'toolu_A',
+                  'content': 'spawned'},
+             ]},
+             'toolUseResult': {'agentId': 'W1',
+                               'agentType': 'general-purpose',
+                               'status': 'completed'}},
+            {'type': 'user', 'message': {'role': 'user', 'content': tm}},
+            {'type': 'assistant', 'uuid': 'a2',
+             'message': {'role': 'assistant', 'content': [
+                 {'type': 'tool_use', 'id': 'toolu_S1',
+                  'name': 'SendMessage',
+                  'input': {'to': 'w1', 'summary': 'go again',
+                            'message': 'more'}},
+             ]}},
+        ]
+        with open(sess, 'w') as f:
+            for rec in recs:
+                f.write(_json.dumps(rec) + '\n')
+        sub_dir = os.path.join(tmp, 'parent', 'subagents')
+        os.makedirs(sub_dir)
+        ap = os.path.join(sub_dir, 'agent-W1.jsonl')
+        wrecs = [
+            {'type': 'user', 'message': {'role': 'user', 'content': (
+                '<teammate-message teammate_id="team-lead">\n'
+                'do the thing\n</teammate-message>')}},
+            {'type': 'assistant', 'uuid': 'wa1',
+             'message': {'role': 'assistant', 'content': [
+                 {'type': 'tool_use', 'id': 'toolu_W1',
+                  'name': 'SendMessage',
+                  'input': {'to': 'team-lead', 'summary': 'done 1',
+                            'message': 'first result'}},
+             ]}},
+        ]
+        with open(ap, 'w') as f:
+            for rec in wrecs:
+                f.write(_json.dumps(rec) + '\n')
+        return sess, ap
+
+    def _ctx(self, item, extra=()):
+        self.b = _browser_with_item(item, extra=extra)
+        return Context(self.b)
+
+    def test_link_rows_prepended_for_linked_msg_row(self):
+        ctx = self._ctx(Item(id=('msg', self.sess, 3), title='reply'))
+        rows = self.r.context_menu_options(ctx)
+        label, token = rows[0]
+        self.assertEqual(token, ('link.jump', ('msg', self.ap, 1)))
+        self.assertTrue(label.startswith('↗ W1:2'), label)
+        # The regular per-kind rows still follow.
+        self.assertIn('msg.edit', _tokens(rows))
+
+    def test_backlink_row_on_agent_group(self):
+        ctx = self._ctx(Item(id=('agent', self.sess, 'W1'), title='w1'))
+        rows = self.r.context_menu_options(ctx)
+        self.assertEqual(rows[0][1], ('link.jump', ('msg', self.sess, 1)))
+        self.assertIn('agent.view', _tokens(rows))
+
+    def test_no_link_rows_on_plain_row(self):
+        ctx = self._ctx(Item(id=('msg', self.sess, 0), title='m'))
+        rows = self.r.context_menu_options(ctx)
+        self.assertFalse([t for t in _tokens(rows) if isinstance(t, tuple)])
+
+    def _live_browser(self):
+        """Headless Browser driving the recipe's real ``get_children``."""
+        sess_item = Item(id=('session', self.sess), title='s',
+                         has_children=True)
+
+        def kids(item_id, *, reload=False):
+            if item_id is None:
+                return [sess_item]
+            # The recipe under test builds STUB Items (browse_tui is
+            # stubbed at load) — re-wrap them as real framework Items so
+            # the Browser can index/expand them.
+            return [Item(id=c.id, title=getattr(c, 'title', ''),
+                         has_children=bool(getattr(c, 'has_children',
+                                                   False)),
+                         hidden=bool(getattr(c, 'hidden', False)),
+                         meta=bool(getattr(c, 'meta', False)),
+                         boundary=bool(getattr(c, 'boundary', False)))
+                    for c in self.r.get_children(item_id)]
+
+        self.b = make_browser(get_children=kids)
+        b = self.b
+        b.refresh()
+        b.run_until_idle()
+        b.expand(('session', self.sess))
+        b.run_until_idle()
+        b.cursor_to(('agent', self.sess, 'W1'))
+        b.run_until_idle()
+        return b
+
+    def test_enter_jump_moves_cursor_across_files(self):
+        # Enter on the subagent group row follows the backlink: the
+        # spawn site's <prompt>/<tool> umbrellas expand, the cursor
+        # lands on the spawn leaf. Real recipe get_children throughout.
+        # Detail 'all' so the tool_use leaf itself is visible.
+        self.r._DETAIL_LEVEL = 6
+        b = self._live_browser()
+        ctx = Context(b)
+        self.assertEqual(ctx.cursor.id, ('agent', self.sess, 'W1'))
+        self.r._on_enter_jump(ctx)
+        b.run_until_idle()
+        self.assertEqual(Context(b).cursor.id, ('msg', self.sess, 1))
+
+    def test_enter_jump_falls_back_to_visible_ancestor(self):
+        # At detail level 1 the spawn tool_use leaf is hidden — the jump
+        # lands on the nearest filter-visible ancestor (the <prompt>).
+        self.r._DETAIL_LEVEL = 1
+        b = self._live_browser()
+        self.r._on_enter_jump(Context(b))
+        b.run_until_idle()
+        self.assertEqual(Context(b).cursor.id, ('prompt', self.sess, 0))
+
+    def test_enter_noop_without_links(self):
+        ctx = self._ctx(Item(id=('msg', self.sess, 0), title='m'))
+        before = ctx.cursor.id
+        self.r._on_enter_jump(ctx)     # must not raise nor move
+        self.assertEqual(Context(self.b).cursor.id, before)
+
+
 if __name__ == '__main__':
     unittest.main()

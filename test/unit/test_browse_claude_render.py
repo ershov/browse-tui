@@ -6050,6 +6050,320 @@ class TestTreeSubagentBlock(unittest.TestCase):
                              [getattr(it, 'kind', None) for it in kids])
 
 
+class TestCrossLinks(unittest.TestCase):
+    """#1247: the cross-link map, ``[↗]`` markers and jump targets."""
+
+    @classmethod
+    def setUpClass(cls):
+        cls.r = _load_recipe()
+
+    def setUp(self):
+        self.r._TREE_CACHE.clear()
+        self.r._TAIL_STATE.clear()
+
+    def _tm(self, sender, body, summary=None):
+        """One inbound teammate-message user record (string content)."""
+        attrs = f' teammate_id="{sender}"'
+        if summary is not None:
+            attrs += f' summary="{summary}"'
+        return {'type': 'user',
+                'message': {'role': 'user', 'content': (
+                    f'<teammate-message{attrs}>\n{body}\n'
+                    '</teammate-message>')}}
+
+    def _send(self, uid, tu_id, to, summary):
+        return {'type': 'assistant', 'uuid': uid,
+                'message': {'role': 'assistant', 'content': [
+                    {'type': 'tool_use', 'id': tu_id, 'name': 'SendMessage',
+                     'input': {'to': to, 'summary': summary,
+                               'message': f'msg for {to}'}},
+                ]}}
+
+    def _build(self, tmp):
+        """Master with teammate ``w1`` exchanging 2 sends / 2 replies.
+
+        Master lines: 0 user turn root, 1 Agent spawn (input.name=w1),
+        2 spawn tool_result (agentId=W1), 3 reply#1, 4 SendMessage#1,
+        5 its ack, 6 reply#2, 7 idle notification (no link),
+        8 SendMessage#2 (no matching worker inbound → group fallback),
+        9 its ack.
+        Worker lines: 0 spawn prompt (inbound#1, turn root),
+        1 assistant text, 2 SendMessage→team-lead #1,
+        3 inbound#2 (← master send#1), 4 SendMessage→team-lead #2.
+        """
+        import json as _json
+        sess = os.path.join(tmp, 'parent.jsonl')
+        recs = [
+            {'type': 'user', 'uuid': 'u1',
+             'message': {'role': 'user', 'content': 'kick off'}},
+            {'type': 'assistant', 'uuid': 'a1',
+             'message': {'role': 'assistant', 'content': [
+                 {'type': 'tool_use', 'id': 'toolu_A', 'name': 'Agent',
+                  'input': {'name': 'w1',
+                            'subagent_type': 'general-purpose',
+                            'prompt': 'do the thing'}},
+             ]}},
+            {'type': 'user', 'uuid': 'u2',
+             'message': {'role': 'user', 'content': [
+                 {'type': 'tool_result', 'tool_use_id': 'toolu_A',
+                  'content': 'spawned'},
+             ]},
+             'toolUseResult': {'agentId': 'W1',
+                               'agentType': 'general-purpose',
+                               'status': 'completed'}},
+            self._tm('w1', 'first result', summary='done 1'),
+            self._send('a2', 'toolu_S1', 'w1', 'go again'),
+            {'type': 'user', 'uuid': 'u3',
+             'message': {'role': 'user', 'content': [
+                 {'type': 'tool_result', 'tool_use_id': 'toolu_S1',
+                  'content': 'delivered'},
+             ]},
+             'toolUseResult': {'success': True, 'message': 'ok'}},
+            self._tm('w1', 'second result', summary='done 2'),
+            self._tm('w1', '{"type":"idle_notification","from":"w1"}'),
+            self._send('a3', 'toolu_S2', 'w1', 'one more'),
+            {'type': 'user', 'uuid': 'u4',
+             'message': {'role': 'user', 'content': [
+                 {'type': 'tool_result', 'tool_use_id': 'toolu_S2',
+                  'content': 'delivered'},
+             ]},
+             'toolUseResult': {'success': True, 'message': 'ok'}},
+        ]
+        with open(sess, 'w') as f:
+            for rec in recs:
+                f.write(_json.dumps(rec) + '\n')
+        sub_dir = os.path.join(tmp, 'parent', 'subagents')
+        os.makedirs(sub_dir)
+        ap = os.path.join(sub_dir, 'agent-W1.jsonl')
+        wrecs = [
+            self._tm('team-lead', 'do the thing', summary='kick off'),
+            {'type': 'assistant', 'uuid': 'wa1',
+             'message': {'role': 'assistant', 'content': [
+                 {'type': 'text', 'text': 'working'},
+             ]}},
+            self._send('wa2', 'toolu_W1', 'team-lead', 'done 1'),
+            self._tm('team-lead', 'go again'),
+            self._send('wa3', 'toolu_W2', 'team-lead', 'done 2'),
+        ]
+        with open(ap, 'w') as f:
+            for rec in wrecs:
+                f.write(_json.dumps(rec) + '\n')
+        return sess, ap
+
+    def test_link_map_targets(self):
+        import tempfile
+        with tempfile.TemporaryDirectory() as tmp:
+            sess, ap = self._build(tmp)
+            lm = self.r._link_map(sess)
+            lines, agents = lm['lines'], lm['agents']
+            group = ('agent', sess, 'W1')
+            self.assertEqual(lines[1], [('msg', ap, 0)])   # spawn → 1st root
+            self.assertEqual(lines[4], [('msg', ap, 3)])   # send#1 → inbound#2
+            self.assertEqual(lines[8], [group])            # send#2 → fallback
+            self.assertEqual(lines[3], [('msg', ap, 2)])   # reply#1 → wsend#1
+            self.assertEqual(lines[6], [('msg', ap, 4)])   # reply#2 → wsend#2
+            self.assertNotIn(7, lines)                     # idle notice
+            self.assertEqual(sorted(lines), [1, 3, 4, 6, 8])
+            self.assertEqual(agents, {'W1': ('msg', sess, 1)})
+
+    def test_links_for_id_row_shapes(self):
+        # A leaf and its wrapping umbrella share the line → same links;
+        # the agent group row resolves the one backlink.
+        import tempfile
+        with tempfile.TemporaryDirectory() as tmp:
+            sess, ap = self._build(tmp)
+            want = [('msg', ap, 3)]
+            self.assertEqual(self.r._links_for_id(('msg', sess, 4)), want)
+            self.assertEqual(self.r._links_for_id(('tool', sess, 4)), want)
+            self.assertEqual(self.r._links_for_id(('prompt', sess, 3)),
+                             [('msg', ap, 2)])
+            self.assertEqual(self.r._links_for_id(('agent', sess, 'W1')),
+                             [('msg', sess, 1)])
+            # Rows without links, foreign shapes, missing files.
+            self.assertEqual(self.r._links_for_id(('msg', sess, 0)), [])
+            self.assertEqual(self.r._links_for_id(('span', sess, 0)), [])
+            self.assertEqual(self.r._links_for_id(('msg', '/nope', 1)), [])
+            # No backlinks from inside the worker transcript.
+            self.assertEqual(self.r._links_for_id(('msg', ap, 2)), [])
+
+    def test_link_marker_in_titles(self):
+        import tempfile
+        with tempfile.TemporaryDirectory() as tmp:
+            sess, ap = self._build(tmp)
+            td = self.r._scan_tree(sess)
+            # Leaf rows: reply#1 and the SendMessage leaf carry the marker.
+            self.assertTrue(self.r._tree_item(
+                sess, td.records[3], td).title.startswith('[↗] '))
+            self.assertTrue(self.r._tree_item(
+                sess, td.records[4], td).title.startswith('[↗] '))
+            # Umbrellas wrapping those lines carry it too.
+            tool = self.r._tool_umbrella_item(sess, 4, td.records[4], td)
+            self.assertTrue(tool.title.startswith('[↗] <tool:SendMessage>'))
+            prompt = self.r._prompt_umbrella_item(sess, 3, td.records[3], td)
+            self.assertTrue(prompt.title.startswith('[↗] '))
+            # The subagent group row (backlink) carries it.
+            rows = self.r._tree_subagents_for_session(sess, td)
+            self.assertTrue(rows[0].title.startswith('[↗] '))
+            # Link-less rows do not.
+            self.assertFalse(self.r._tree_item(
+                sess, td.records[0], td).title.startswith('[↗]'))
+            self.assertFalse(self.r._tree_item(
+                sess, td.records[7], td).title.startswith('[↗]'))
+            # Flat mode rows share the marker.
+            flat = self.r._list_messages(sess)
+            by_line = {it.line_no: it for it in flat}
+            self.assertTrue(by_line[3].title.startswith('[↗] '))
+            self.assertFalse(by_line[0].title.startswith('[↗]'))
+
+    def test_link_menu_rows_tokens(self):
+        import tempfile
+        with tempfile.TemporaryDirectory() as tmp:
+            sess, ap = self._build(tmp)
+            rows = self.r._link_menu_rows(('msg', sess, 1))
+            self.assertEqual(len(rows), 1)
+            label, token = rows[0]
+            self.assertEqual(token, ('link.jump', ('msg', ap, 0)))
+            self.assertTrue(label.startswith('↗ W1:1'), label)
+            self.assertLessEqual(len(label), 80)
+            # Group-row fallback label names the subagent.
+            rows = self.r._link_menu_rows(('msg', sess, 8))
+            self.assertEqual(rows[0][1], ('link.jump', ('agent', sess, 'W1')))
+            self.assertIn('W1', rows[0][0])
+
+    def test_link_map_rebuilds_on_tail_append(self):
+        # A reply arriving via the live tail gets its link on the next
+        # lookup (the map rebuilds when the record count changes).
+        import json as _json
+        import tempfile
+        with tempfile.TemporaryDirectory() as tmp:
+            sess, ap = self._build(tmp)
+            self.assertNotIn(10, self.r._link_map(sess)['lines'])
+            with open(sess, 'a') as f:
+                f.write(_json.dumps(self._tm('w1', 'third result',
+                                             summary='done 3')) + '\n')
+            self.r._read_new_records(sess)
+            lm = self.r._link_map(sess)
+            # reply#3 has no matching worker send → group-row fallback.
+            self.assertEqual(lm['lines'][10], [('agent', sess, 'W1')])
+
+    def test_respawn_joins_only_post_spawn_traffic(self):
+        # A reused teammate name: the latest spawn owns the order join,
+        # and traffic exchanged with the EARLIER incarnation carries no
+        # link (it must not be walked into the new transcript).
+        import json as _json
+        import tempfile
+
+        def spawn(uid, tu_id):
+            return {'type': 'assistant', 'uuid': uid,
+                    'message': {'role': 'assistant', 'content': [
+                        {'type': 'tool_use', 'id': tu_id, 'name': 'Agent',
+                         'input': {'name': 'w1',
+                                   'subagent_type': 'general-purpose',
+                                   'prompt': 'p'}},
+                    ]}}
+
+        def result(uid, tu_id, aid):
+            return {'type': 'user', 'uuid': uid,
+                    'message': {'role': 'user', 'content': [
+                        {'type': 'tool_result', 'tool_use_id': tu_id,
+                         'content': 'spawned'},
+                    ]},
+                    'toolUseResult': {'agentId': aid,
+                                      'agentType': 'general-purpose',
+                                      'status': 'completed'}}
+
+        with tempfile.TemporaryDirectory() as tmp:
+            sess = os.path.join(tmp, 'parent.jsonl')
+            recs = [
+                {'type': 'user', 'uuid': 'u1',
+                 'message': {'role': 'user', 'content': 'go'}},
+                spawn('a1', 't_old'),                       # line 1
+                result('u2', 't_old', 'OLD'),
+                self._send('a2', 't_s1', 'w1', 'to old'),   # line 3
+                spawn('a3', 't_new'),                       # line 4
+                result('u3', 't_new', 'NEW'),
+                self._send('a4', 't_s2', 'w1', 'to new'),   # line 6
+            ]
+            with open(sess, 'w') as f:
+                for rec in recs:
+                    f.write(_json.dumps(rec) + '\n')
+            sub_dir = os.path.join(tmp, 'parent', 'subagents')
+            os.makedirs(sub_dir)
+            paths = {}
+            for aid in ('OLD', 'NEW'):
+                p = os.path.join(sub_dir, f'agent-{aid}.jsonl')
+                paths[aid] = p
+                wrecs = [
+                    self._tm('team-lead', 'spawn prompt'),
+                    self._tm('team-lead', 'a follow-up'),
+                ]
+                with open(p, 'w') as f:
+                    for rec in wrecs:
+                        f.write(_json.dumps(rec) + '\n')
+            lm = self.r._link_map(sess)
+            lines = lm['lines']
+            # Both incarnations keep their spawn link + backlink.
+            self.assertEqual(lines[1], [('msg', paths['OLD'], 0)])
+            self.assertEqual(lines[4], [('msg', paths['NEW'], 0)])
+            self.assertEqual(lm['agents'],
+                             {'OLD': ('msg', sess, 1),
+                              'NEW': ('msg', sess, 4)})
+            # The pre-respawn send (delivered to OLD) carries NO link —
+            # in particular it must not point into NEW's transcript.
+            self.assertNotIn(3, lines)
+            # The post-respawn send joins as NEW's send#1 → inbound#2.
+            self.assertEqual(lines[6], [('msg', paths['NEW'], 1)])
+
+    def test_multi_link_row_collects_all_targets(self):
+        # One assistant record spawning TWO agents → two links on its line.
+        import json as _json
+        import tempfile
+        with tempfile.TemporaryDirectory() as tmp:
+            sess = os.path.join(tmp, 'parent.jsonl')
+            recs = [
+                {'type': 'user', 'uuid': 'u1',
+                 'message': {'role': 'user', 'content': 'go'}},
+                {'type': 'assistant', 'uuid': 'a1',
+                 'message': {'role': 'assistant', 'content': [
+                     {'type': 'tool_use', 'id': 't1', 'name': 'Agent',
+                      'input': {'prompt': 'x', 'subagent_type': 'Explore'}},
+                     {'type': 'tool_use', 'id': 't2', 'name': 'Agent',
+                      'input': {'prompt': 'y', 'subagent_type': 'Explore'}},
+                 ]}},
+                {'type': 'user', 'uuid': 'u2',
+                 'message': {'role': 'user', 'content': [
+                     {'type': 'tool_result', 'tool_use_id': 't1',
+                      'content': 'ok'},
+                 ]},
+                 'toolUseResult': {'agentId': 'A1', 'agentType': 'Explore',
+                                   'status': 'completed'}},
+                {'type': 'user', 'uuid': 'u3',
+                 'message': {'role': 'user', 'content': [
+                     {'type': 'tool_result', 'tool_use_id': 't2',
+                      'content': 'ok'},
+                 ]},
+                 'toolUseResult': {'agentId': 'A2', 'agentType': 'Explore',
+                                   'status': 'completed'}},
+            ]
+            with open(sess, 'w') as f:
+                for rec in recs:
+                    f.write(_json.dumps(rec) + '\n')
+            sub_dir = os.path.join(tmp, 'parent', 'subagents')
+            os.makedirs(sub_dir)
+            for aid in ('A1', 'A2'):
+                with open(os.path.join(sub_dir,
+                                       f'agent-{aid}.jsonl'), 'w') as f:
+                    f.write(_json.dumps({
+                        'type': 'user',
+                        'message': {'role': 'user', 'content': 'inside'},
+                    }) + '\n')
+            links = self.r._links_for_id(('msg', sess, 1))
+            self.assertEqual(len(links), 2)
+            self.assertEqual({t[1] for t in links},
+                             {os.path.join(sub_dir, 'agent-A1.jsonl'),
+                              os.path.join(sub_dir, 'agent-A2.jsonl')})
+
+
 class TestRowBgForKind(unittest.TestCase):
     """User/assistant message rows get a row-bg highlight."""
 

@@ -1465,7 +1465,8 @@ def _list_subagents_for_session(session_jsonl_path):
             title = description or f'agent {agent_id}'
             item = Item(
                 id=('agent', session_jsonl_path, agent_id),
-                title=title,
+                title=_link_marker(
+                    ('agent', session_jsonl_path, agent_id)) + title,
                 tag=f'{agent_type} · {count} msg · {_human_time(st.st_mtime)}',
                 tag_style='magenta',
                 has_children=count > 0,
@@ -1520,7 +1521,8 @@ def _list_subagents_for_session(session_jsonl_path):
         live = 'live · ' if member is not None else ''
         item = Item(
             id=('agent', session_jsonl_path, agent_name),
-            title=agent_name,
+            title=_link_marker(
+                ('agent', session_jsonl_path, agent_name)) + agent_name,
             tag=f'{agent_type} · {live}{count} msg · '
                 f'{_human_time(st.st_mtime)}',
             tag_style=('green' if member is not None else 'magenta'),
@@ -1685,7 +1687,7 @@ def _list_messages(jsonl_path, limit=None):
         item_id = ('msg', jsonl_path, n)
         item = Item(
             id=item_id,
-            title=_oneline(_summarise_message(obj)),
+            title=_link_marker(item_id) + _oneline(_summarise_message(obj)),
             tag=_row_tag(kind, obj),
             tag_style=_TAG_STYLE_FOR_KIND.get(kind, ''),
             # Optimistic markdown-subtree detection — see ``_tree_item``. The
@@ -5491,7 +5493,7 @@ class _TreeData:
                  'assistant_has_tool_use', 'tool_to_turn_root_line',
                  'agent_to_assistant_line', 'tool_use_name_of',
                  'line_offsets', 'voice_count', 'latest_voice_line',
-                 'ai_title', 'custom_title')
+                 'ai_title', 'custom_title', 'link_map')
 
     def __init__(self):
         self.records = []
@@ -5545,6 +5547,9 @@ class _TreeData:
         # keep them current.
         self.ai_title = None
         self.custom_title = None
+        # Lazy cross-link map (built by ``_link_map`` on first use,
+        # invalidated by record growth — see its docstring).
+        self.link_map = None
 
 
 def _is_inbound_agent_voice(rec):
@@ -6633,7 +6638,7 @@ def _tree_item(jsonl_path, rec, td):
     item_id = ('msg', jsonl_path, n)
     item = Item(
         id=item_id,
-        title=_oneline(_summarise_message(rec)),
+        title=_link_marker(item_id) + _oneline(_summarise_message(rec)),
         tag=_row_tag(kind, rec),
         tag_style=_TAG_STYLE_FOR_KIND.get(kind, ''),
         # Optimistic markdown-subtree detection (no-op when md_doc absent):
@@ -6679,7 +6684,7 @@ def _prompt_umbrella_item(jsonl_path, turn_root_line, rec, td):
               'agent-peer': '<peer>'}.get(kind, '<prompt>')
     item = Item(
         id=item_id,
-        title=f'{prefix}  {summary}',
+        title=f'{_link_marker(item_id)}{prefix}  {summary}',
         tag=f'{n_replies} replies' if n_replies else 'no reply yet',
         tag_style='dim',
         has_children=True,
@@ -6719,7 +6724,7 @@ def _tool_umbrella_item(jsonl_path, assistant_line, rec, td):
     item_id = ('tool', jsonl_path, assistant_line)
     item = Item(
         id=item_id,
-        title=f'<tool:{tool_name}>  {summary}',
+        title=f'{_link_marker(item_id)}<tool:{tool_name}>  {summary}',
         tag='tool_use',
         tag_style=_TAG_STYLE_FOR_KIND.get('tool_use', ''),
         has_children=True,
@@ -7785,6 +7790,257 @@ def _ancestor_ids_for(item_id):
     return []
 
 
+# ---- cross-link jumps (#1247) ---------------------------------------------
+#
+# Navigation between a session's main thread and its subagent transcripts.
+# Rows that participate in a leader↔teammate interaction carry ``[↗]`` in
+# their title; Enter jumps across (a menu chooses when a row carries several
+# links, e.g. one assistant record spawning multiple agents). The map is:
+#
+#   * spawn site (Agent/Task tool_use)      → the subagent's first turn root
+#   * n-th SendMessage to a teammate        → the teammate's (n+1)-th inbound
+#     teammate-message turn root (its 1st IS the spawn prompt)
+#   * n-th inbound teammate-message reply   → the teammate's n-th
+#     SendMessage-to-leader tool_use line
+#   * subagent group row                    → back to its spawn site
+#     (the only backlink)
+#
+# Both directions of the order join skip auto-generated idle notifications
+# (they aren't sent via SendMessage, so they'd shift the join); a join that
+# runs past the end falls back to the subagent group row.
+
+
+def _is_idle_notification(body):
+    """True for a teammate's auto-generated idle notice (not a real reply)."""
+    body = body.lstrip()
+    if not body.startswith('{'):
+        return False
+    try:
+        return json.loads(body).get('type') == 'idle_notification'
+    except Exception:
+        return False
+
+
+def _spawn_use_name(rec, tu_id):
+    """``input.name`` of the Agent/Task tool_use part ``tu_id`` in ``rec``."""
+    msg = rec.get('message') if isinstance(rec, dict) else None
+    content = msg.get('content') if isinstance(msg, dict) else None
+    if not isinstance(content, list):
+        return None
+    for p in content:
+        if (isinstance(p, dict) and p.get('type') == 'tool_use'
+                and p.get('id') == tu_id):
+            return (p.get('input') or {}).get('name')
+    return None
+
+
+def _link_map(path):
+    """Lazy cross-link map for one session (see the section comment).
+
+    Returns ``{'lines': {master_line: [target_id, …]},
+    'agents': {agent_id: spawn_site_id}}`` cached on
+    ``td.link_map``; rebuilt when the record count changed (a tail
+    append can add spawn/send/reply rows). Target ids are ordinary row
+    ids — ``('msg', jsonl, n)`` or the ``('agent', …)`` group row for
+    an unresolvable join — so the jump path reuses the existing
+    ancestor/expand machinery.
+    """
+    td = _scan_tree(path)
+    lm = td.link_map
+    if lm is not None and lm['nrecords'] == len(td.records):
+        return lm
+    lines = {}
+    agents = {}
+
+    # One master pass: SendMessage dispatch lines per recipient and
+    # inbound teammate-message reply lines per sender (idle notices and
+    # queue-operation echoes excluded — only delivered ``user`` records
+    # join).
+    sends_to = {}
+    replies_from = {}
+    for n, rec in enumerate(td.records):
+        if not isinstance(rec, dict):
+            continue
+        rtype = rec.get('type')
+        if rtype == 'assistant':
+            msg = rec.get('message') or {}
+            content = msg.get('content') if isinstance(msg, dict) else None
+            if isinstance(content, list):
+                for p in content:
+                    if (isinstance(p, dict) and p.get('type') == 'tool_use'
+                            and p.get('name') == 'SendMessage'):
+                        recipient, _s, _m = _send_message_fields(
+                            p.get('input'))
+                        sends_to.setdefault(recipient, []).append(n)
+        elif rtype == 'user' and _is_agent_message(rec):
+            sender, body = _parse_agent_message(rec)
+            if sender and not _is_idle_notification(body):
+                replies_from.setdefault(sender, []).append(n)
+
+    # Spawn sites + teammate name join. A respawn reuses the name; the
+    # latest spawn (by line) owns the send/reply order joins.
+    by_name = {}
+    for tu_id, info in sorted(
+            td.agent_link.items(),
+            key=lambda kv: td.agent_to_assistant_line.get(
+                kv[1].get('agent_id'), -1)):
+        aid = info.get('agent_id')
+        agent_path = info.get('agent_path')
+        spawn_line = td.agent_to_assistant_line.get(aid)
+        if spawn_line is None or not agent_path:
+            continue
+        if not os.path.isfile(agent_path):
+            continue
+        std = _scan_tree(agent_path)
+        first = next((e['line'] for e in std.roots_in_order
+                      if e['kind'] == 'turn'), 0)
+        lines.setdefault(spawn_line, []).append(('msg', agent_path, first))
+        agents[aid] = ('msg', path, spawn_line)
+        rec = td.records[spawn_line]
+        name = _spawn_use_name(rec, tu_id)
+        if name:
+            by_name[name] = (aid, agent_path, std, spawn_line)
+
+    for name, (aid, agent_path, std, spawn_line) in by_name.items():
+        group_id = ('agent', path, aid)
+        # Teammate-side lists: inbound teammate-messages (the 1st is
+        # the spawn prompt itself) and SendMessage-to-leader lines. The
+        # leader's name is the sender of that first inbound message.
+        inbound = []
+        for wn, wrec in enumerate(std.records):
+            if (isinstance(wrec, dict) and wrec.get('type') == 'user'
+                    and _is_agent_message(wrec)
+                    and not _is_idle_notification(
+                        _parse_agent_message(wrec)[1])):
+                inbound.append(wn)
+        leader = (_parse_agent_message(std.records[inbound[0]])[0]
+                  if inbound else '')
+        wsends = []
+        for wn, wrec in enumerate(std.records):
+            if not (isinstance(wrec, dict)
+                    and wrec.get('type') == 'assistant'):
+                continue
+            msg = wrec.get('message') or {}
+            content = msg.get('content') if isinstance(msg, dict) else None
+            if not isinstance(content, list):
+                continue
+            for p in content:
+                if (isinstance(p, dict) and p.get('type') == 'tool_use'
+                        and p.get('name') == 'SendMessage'):
+                    recipient, _s, _m = _send_message_fields(p.get('input'))
+                    if not leader or recipient == leader:
+                        wsends.append(wn)
+        # Only traffic AFTER the owning spawn joins — an earlier
+        # incarnation of a reused name exchanged its own messages, and
+        # walking those into this transcript would link them to the
+        # wrong records. They carry no link instead.
+        for k, mline in enumerate(
+                [n for n in sends_to.get(name, []) if n > spawn_line]):
+            tgt = (('msg', agent_path, inbound[k + 1])
+                   if k + 1 < len(inbound) else group_id)
+            lines.setdefault(mline, []).append(tgt)
+        for k, mline in enumerate(
+                [n for n in replies_from.get(name, []) if n > spawn_line]):
+            tgt = (('msg', agent_path, wsends[k])
+                   if k < len(wsends) else group_id)
+            lines.setdefault(mline, []).append(tgt)
+
+    lm = {'nrecords': len(td.records), 'lines': lines, 'agents': agents}
+    td.link_map = lm
+    return lm
+
+
+def _links_for_id(item_id):
+    """Cross-link targets for a row; ``[]`` when it carries none.
+
+    A leaf and the umbrella wrapping it share the record line, so both
+    resolve the same links (``('msg'|'tool'|'prompt', jsonl, line)``).
+    The ``('agent', …)`` group row resolves its one backlink.
+    """
+    if not isinstance(item_id, tuple) or len(item_id) != 3:
+        return []
+    tag, path, key = item_id
+    if not isinstance(path, str) or not os.path.isfile(path):
+        return []
+    if tag == 'agent':
+        tgt = _link_map(path)['agents'].get(key)
+        return [tgt] if tgt else []
+    if tag in ('msg', 'tool', 'prompt') and isinstance(key, int):
+        return list(_link_map(path)['lines'].get(key, ()))
+    return []
+
+
+def _link_marker(item_id):
+    """``'[↗] '`` title prefix for rows that carry cross-links."""
+    return '[↗] ' if _links_for_id(item_id) else ''
+
+
+def _link_label(target_id):
+    """Human menu label for one jump target."""
+    if target_id[0] == 'agent':
+        return f'↗ subagent {target_id[2]}'
+    path, n = target_id[1], target_id[2]
+    name = os.path.basename(path)
+    if name.startswith('agent-') and name.endswith('.jsonl'):
+        name = name[len('agent-'):-len('.jsonl')]
+    td = _scan_tree(path)
+    rec = td.records[n] if 0 <= n < len(td.records) else None
+    what = _oneline(_summarise_message(rec)) if rec else f'line {n + 1}'
+    if len(what) > 60:
+        what = what[:59] + '…'
+    return f'↗ {name}:{n + 1}  {what}'
+
+
+def _link_menu_rows(item_id):
+    """``(label, ('link.jump', target_id))`` menu rows for a row's links."""
+    return [(_link_label(t), ('link.jump', t))
+            for t in _links_for_id(item_id)]
+
+
+def _jump_to_link(ctx, target_id):
+    """Reveal + move: expand the target's ancestors, then ``cursor_to``.
+
+    Tree mode walks the full umbrella chain (crossing into a subagent's
+    group row when the target lives in its .jsonl); flat mode only needs
+    the group row expanded for a cross-file target. A target the active
+    detail level hides can't take the cursor — land on its nearest
+    filter-visible ancestor instead (e.g. the wrapping ``<prompt>``).
+    """
+    if _TREE_MODE:
+        ancestors = _ancestor_ids_for(target_id)
+    else:
+        outer = (_outer_subagent_group_id(target_id[1])
+                 if target_id[0] == 'msg' else None)
+        ancestors = [outer] if outer else []
+    chain = ancestors + [target_id]
+    last = len(chain) - 1
+    while last > 0 and not _passes_filter(chain[last]):
+        last -= 1
+    _chain_expand_then_cursor(ctx, chain[:last], chain[last])
+
+
+def _on_enter_jump(ctx):
+    """Enter: follow the cursor row's cross-link.
+
+    One link jumps straight there; several open a menu (an assistant
+    record can spawn/message multiple teammates). Rows without links
+    keep the silent no-op.
+    """
+    item = ctx.cursor
+    if item is None:
+        return
+    links = _links_for_id(item.id)
+    if not links:
+        return
+    if len(links) == 1:
+        _jump_to_link(ctx, links[0])
+        return
+    choice = ctx.menu(_link_menu_rows(item.id))
+    if (isinstance(choice, tuple) and len(choice) == 2
+            and choice[0] == 'link.jump'):
+        _jump_to_link(ctx, choice[1])
+
+
 def _seed_scope_root_item(b, target_jsonl):
     """Register a REAL session Item for the initial scope_root (#730).
 
@@ -8320,7 +8576,7 @@ def _set_detail_level(ctx, level):
 
 # ---- context menu --------------------------------------------------------
 #
-# A right-click / `` ` ``-F1 menu over the cursor's row, branching on its KIND
+# A right-click / backslash-F1 menu over the cursor's row, branching on its KIND
 # (``id[0]``) — message / session / subagent / project, plus the tree-mode
 # ``prompt`` / ``tool`` / ``span`` umbrellas (whose rows act on the umbrella's
 # own grouped source). Following the committed convention (browse-ps the
@@ -8775,15 +9031,16 @@ def context_menu_options(ctx):
         rows = context_menu_umbrella(ctx, item_id)
     else:
         return []
-    # Append the shared directory cluster (project / cwd / worktree), deduped.
+    # Cross-link jump rows first (they're the row-specific action), then
+    # the per-kind rows, then the shared directory cluster, deduped.
     dirs = _dedup_dirs(_cursor_context_dirs(item_id))
-    return list(rows) + _dir_action_rows(dirs)
+    return _link_menu_rows(item_id) + list(rows) + _dir_action_rows(dirs)
 
 
 def on_context_menu(ctx):
     """Open the browse-claude context menu and dispatch the chosen entry.
 
-    The hook the framework fires on right-click / `` ` ``-F1: build the (pure)
+    The hook the framework fires on right-click / backslash-F1: build the (pure)
     per-kind option list, open it with ``ctx.menu``, and route the chosen token
     through ``_MENU_ACTIONS`` (passing the cursor's id so each handler reads its
     own fields). A cancel (``None``) or an empty list is a no-op. The cursor id
@@ -8791,6 +9048,12 @@ def on_context_menu(ctx):
     from.
     """
     token = ctx.menu(context_menu_options(ctx))
+    # Cross-link jump rows carry their target in the token (they're
+    # per-row values, not fixed actions — see ``_link_menu_rows``).
+    if (isinstance(token, tuple) and len(token) == 2
+            and token[0] == 'link.jump'):
+        _jump_to_link(ctx, token[1])
+        return
     handler = _MENU_ACTIONS.get(token)
     if handler is None:
         return
@@ -8840,6 +9103,9 @@ a transcript with Right/Alt-Down; preview shows the rendered turn.
   t       toggle flat / tree view.
   1-6     detail level: 1 summary, 2 voice, 3 edits, 4 tools,
           5 detailed, 6 all.
+  Enter   follow a row's [↗] cross-link (spawn site <-> subagent,
+          SendMessage <-> inbound reply); a row with several links
+          opens a menu of targets.
 
 Right-click a row (or the backslash / F1 keys) for a menu: message and
 turn / tool / span umbrella rows offer the source actions above
@@ -8998,7 +9264,10 @@ def main():
         get_preview=get_preview,
         root_id=None,
         initial_scope=initial_scope,
-        on_enter='noop',
+        # Enter follows a row's cross-link ([↗] rows — spawn sites,
+        # SendMessage dispatches, teammate replies, subagent group
+        # rows); everything else stays a silent no-op.
+        on_enter=_on_enter_jump,
         actions=[
             # v / e are the framework defaults (page / edit the preview text).
             # V / E open the underlying source file instead.

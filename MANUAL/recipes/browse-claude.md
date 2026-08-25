@@ -51,8 +51,30 @@ Set the boot level with `--detail LEVEL` (a number `1`-`6` or the word
 `summary` / `voice` / `edits` / `tools` / `detailed` / `all`); change it
 live with the `1`-`6` keys.
 
-Keys: `1`-`6` set the detail level, `e` / `o` open in `$EDITOR`, `y` show
-id (debugging).
+**Subagents.** In tree mode (the default) every subagent the session
+dispatched — Agent/Task subagents and in-process teammates alike — lists
+in one top block above the turn umbrellas, bracketed by `--- Subagents:` /
+`--- Session:` dividers, ordered by dispatch position; a transcript with
+no dispatch site in the main thread sorts last, tagged `orphan` and
+dimmed. Expand a subagent row to browse its own transcript as a nested
+tree.
+
+**Cross-link jumps.** Rows that participate in a leader↔teammate
+interaction carry a `[↗]` marker in their title: the spawn site
+(`Agent`/`Task` call), each `SendMessage` the leader sent a teammate, each
+inbound teammate reply, and the subagent group row itself. `Enter` on a
+marked row jumps across the link — a spawn site jumps to the subagent's
+first prompt, the n-th `SendMessage` to the teammate's matching inbound
+message, an inbound reply to the teammate's `SendMessage` that produced
+it, and the subagent group row jumps back to its spawn site. When one row
+carries several links (an assistant record spawning or messaging several
+teammates at once), `Enter` opens a menu of targets; the same jump rows
+also lead the row's context menu (`\` / F1 / right-click). A target
+hidden by the active detail level lands on its nearest visible row
+instead. `Enter` on an unmarked row does nothing.
+
+Keys: `Enter` follow a `[↗]` cross-link, `1`-`6` set the detail level,
+`e` / `o` open in `$EDITOR`, `y` show id (debugging).
 
 **Source:** [`recipes/browse-claude`](../../recipes/browse-claude)
 

@@ -1978,6 +1978,42 @@ class TestBrowseClaude(unittest.TestCase):
                                      'divider')
                 t.send('q')
 
+    def test_enter_follows_backlink_from_subagent_row(self):
+        """Enter on the subagent group row jumps to its spawn site.
+
+        End-to-end over the real key binding (on_enter=_on_enter_jump):
+        cursor on the [↗]-marked agent row in the top block, Enter, and
+        the cursor lands on the dispatching <tool:Task> umbrella (the
+        tool_use leaf itself is hidden at detail 'voice', so the jump
+        falls back to the nearest visible ancestor).
+        """
+        import tempfile
+        with tempfile.TemporaryDirectory() as tmp:
+            sess = self._make_tree_fixture(tmp)
+            with TmuxFixture(cols=160, rows=30, env=self._launch_env(tmp)) as t:
+                t.launch(_BIN, '--run-py', _RECIPE, '--detail', 'voice',
+                         '--tree', '--file', sess)
+                t.wait_for('PROBE_TURN2_REPLY', timeout=3.0)
+                t.wait_for('[↗]', timeout=3.0)
+                t.send('Home')
+                t.wait_stable(timeout=3.0)
+                t.send('Down')
+                t.wait_stable(timeout=3.0)
+                cur = self._cursor_line(t.capture(colors=True))
+                self.assertIn('PROBE_SUBAGENT_DESC', cur or '')
+                self.assertIn('[↗]', cur or '')
+                t.send('Enter')
+                deadline = time.time() + 3.0
+                while True:
+                    cur = self._cursor_line(t.capture(colors=True))
+                    if cur and '<tool:Task>' in cur:
+                        break
+                    if time.time() > deadline:
+                        self.fail(f'cursor never reached the spawn site; '
+                                  f'on: {cur!r}')
+                    time.sleep(0.05)
+                t.send('q')
+
     def test_tree_no_dividers_without_subagents(self):
         """A session with NO subagents shows no dividers."""
         import tempfile
