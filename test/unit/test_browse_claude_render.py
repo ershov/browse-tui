@@ -6073,12 +6073,13 @@ class TestCrossLinks(unittest.TestCase):
                     f'<teammate-message{attrs}>\n{body}\n'
                     '</teammate-message>')}}
 
-    def _send(self, uid, tu_id, to, summary):
+    def _send(self, uid, tu_id, to, summary, message=None):
         return {'type': 'assistant', 'uuid': uid,
                 'message': {'role': 'assistant', 'content': [
                     {'type': 'tool_use', 'id': tu_id, 'name': 'SendMessage',
                      'input': {'to': to, 'summary': summary,
-                               'message': f'msg for {to}'}},
+                               'message': (message if message is not None
+                                           else f'msg for {to}')}},
                 ]}}
 
     def _build(self, tmp):
@@ -6090,8 +6091,11 @@ class TestCrossLinks(unittest.TestCase):
         8 SendMessage#2 (no matching worker inbound → group fallback),
         9 its ack.
         Worker lines: 0 spawn prompt (inbound#1, turn root),
-        1 assistant text, 2 SendMessage→team-lead #1,
-        3 inbound#2 (← master send#1), 4 SendMessage→team-lead #2.
+        1 assistant text, 2 SendMessage #1 (its text IS reply#1),
+        3 inbound#2 (← master send#1), 4 SendMessage #2 (text IS
+        reply#2). The worker addresses "main" while the spawn prompt's
+        sender is "team-lead" — the reply join is by message content,
+        so the recipient spelling must not matter (#1243).
         """
         import json as _json
         sess = os.path.join(tmp, 'parent.jsonl')
@@ -6143,9 +6147,11 @@ class TestCrossLinks(unittest.TestCase):
              'message': {'role': 'assistant', 'content': [
                  {'type': 'text', 'text': 'working'},
              ]}},
-            self._send('wa2', 'toolu_W1', 'team-lead', 'done 1'),
+            self._send('wa2', 'toolu_W1', 'main', 'done 1',
+                       message='first result'),
             self._tm('team-lead', 'go again'),
-            self._send('wa3', 'toolu_W2', 'team-lead', 'done 2'),
+            self._send('wa3', 'toolu_W2', 'main', 'done 2',
+                       message='second result'),
         ]
         with open(ap, 'w') as f:
             for rec in wrecs:
@@ -6177,6 +6183,63 @@ class TestCrossLinks(unittest.TestCase):
                 (ap, 4): [('msg', sess, 6)],   # wsend#2 → reply#2
             })
             self.assertEqual(lm['agent_counts'], {ap: 5})
+
+    def test_reply_content_join_duplicates_and_fallback(self):
+        # Duplicate reply texts consume matching worker sends in order;
+        # a peer-addressed send with different text never matches a
+        # reply body; a reply matching no send falls back to the group
+        # row with no reverse half.
+        import json as _json
+        import tempfile
+        with tempfile.TemporaryDirectory() as tmp:
+            sess, ap = self._build(tmp)
+            recs = [
+                {'type': 'user', 'uuid': 'u1',
+                 'message': {'role': 'user', 'content': 'kick off'}},
+                {'type': 'assistant', 'uuid': 'a1',
+                 'message': {'role': 'assistant', 'content': [
+                     {'type': 'tool_use', 'id': 'toolu_A', 'name': 'Agent',
+                      'input': {'name': 'w1',
+                                'subagent_type': 'general-purpose',
+                                'prompt': 'do the thing'}},
+                 ]}},
+                {'type': 'user', 'uuid': 'u2',
+                 'message': {'role': 'user', 'content': [
+                     {'type': 'tool_result', 'tool_use_id': 'toolu_A',
+                      'content': 'spawned'},
+                 ]},
+                 'toolUseResult': {'agentId': 'W1',
+                                   'agentType': 'general-purpose',
+                                   'status': 'completed'}},
+                self._tm('w1', 'same text'),        # line 3 → wsend line 2
+                self._tm('w1', 'same text'),        # line 4 → wsend line 3
+                self._tm('w1', 'never sent'),       # line 5 → group fallback
+            ]
+            with open(sess, 'w') as f:
+                for rec in recs:
+                    f.write(_json.dumps(rec) + '\n')
+            wrecs = [
+                self._tm('team-lead', 'do the thing'),
+                self._send('wa1', 'toolu_P', 'reviewer', 'ping',
+                           message='peer ping'),
+                self._send('wa2', 'toolu_W1', 'main', 'done',
+                           message='same text'),
+                self._send('wa3', 'toolu_W2', 'main', 'done',
+                           message='same text'),
+            ]
+            with open(ap, 'w') as f:
+                for rec in wrecs:
+                    f.write(_json.dumps(rec) + '\n')
+            lm = self.r._link_map(sess)
+            lines, rev = lm['lines'], lm['rev']
+            self.assertEqual(lines[3], [('msg', ap, 2)])
+            self.assertEqual(lines[4], [('msg', ap, 3)])
+            self.assertEqual(lines[5], [('agent', sess, 'W1')])
+            self.assertEqual(rev[(ap, 2)], [('msg', sess, 3)])
+            self.assertEqual(rev[(ap, 3)], [('msg', sess, 4)])
+            self.assertNotIn((ap, 1), rev)      # peer send: no backlink
+            self.assertNotIn(('msg', sess, 5),  # fallback: no reverse half
+                             [t for v in rev.values() for t in v])
 
     def test_links_for_id_row_shapes(self):
         # A leaf and its wrapping umbrella share the line → same links;
@@ -6228,7 +6291,7 @@ class TestCrossLinks(unittest.TestCase):
             rows = self.r._tree_subagents_for_session(sess, td)
             self.assertTrue(rows[0].title.startswith('[↗] '))
             # Worker-side rows carry it too: the spawn prompt delivery,
-            # an inbound message and a SendMessage-to-leader — but not
+            # an inbound message and a delivered SendMessage — but not
             # a plain assistant voice.
             std = self.r._scan_tree(ap)
             for wn in (0, 2, 3, 4):

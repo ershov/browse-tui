@@ -7804,19 +7804,23 @@ def _ancestor_ids_for(item_id):
 #       n-th SendMessage to a teammate    ↔ the teammate's (n+1)-th inbound
 #                                           teammate-message line (its 1st
 #                                           IS the spawn prompt);
-#       n-th inbound teammate-message
-#       reply                             ↔ the teammate's n-th
-#                                           SendMessage-to-leader line;
+#       inbound teammate-message reply    ↔ the teammate's SendMessage line
+#                                           whose message text the reply
+#                                           delivered (a content join —
+#                                           duplicate texts consumed in
+#                                           order; the recipient name the
+#                                           worker used is irrelevant);
 #       teammate's FIRST inbound line
 #       (the spawn prompt delivery)       → the spawn record (its
 #                                           message-level counterpart — the
 #                                           spawn row itself keeps its one
 #                                           forward link, the group row).
 #
-# Both directions of the order join skip auto-generated idle notifications
-# (they aren't sent via SendMessage, so they'd shift the join); a join that
-# runs past the end falls back to the subagent group row (no reverse half —
-# the group row's backlink is the session-level pair).
+# The send-direction order join skips auto-generated idle notifications
+# (they aren't sent via SendMessage, so they'd shift the join); an order
+# join that runs past the end — or a reply whose text matches no send —
+# falls back to the subagent group row (no reverse half — the group row's
+# backlink is the session-level pair).
 
 
 def _is_idle_notification(body):
@@ -7888,9 +7892,9 @@ def _link_map(path):
     agent_counts = {}
 
     # One master pass: SendMessage dispatch lines per recipient and
-    # inbound teammate-message reply lines per sender (idle notices and
-    # queue-operation echoes excluded — only delivered ``user`` records
-    # join).
+    # inbound teammate-message reply ``(line, body)`` per sender (idle
+    # notices and queue-operation echoes excluded — only delivered
+    # ``user`` records join).
     sends_to = {}
     replies_from = {}
     for n, rec in enumerate(td.records):
@@ -7910,7 +7914,7 @@ def _link_map(path):
         elif rtype == 'user' and _is_agent_message(rec):
             sender, body = _parse_agent_message(rec)
             if sender and not _is_idle_notification(body):
-                replies_from.setdefault(sender, []).append(n)
+                replies_from.setdefault(sender, []).append((n, body))
 
     # Spawn sites + teammate name join. A respawn reuses the name; the
     # latest spawn (by line) owns the send/reply order joins.
@@ -7945,10 +7949,12 @@ def _link_map(path):
 
     for name, (aid, agent_path, std, spawn_line, inbound) in by_name.items():
         group_id = ('agent', path, aid)
-        # Teammate-side SendMessage-to-leader lines; the leader's name
-        # is the sender of the first inbound message (the spawn prompt).
-        leader = (_parse_agent_message(std.records[inbound[0]])[0]
-                  if inbound else '')
+        # Teammate-side SendMessage lines with their message text. A
+        # reply joins the send whose text it delivered — stripped, as
+        # ``_parse_agent_message`` strips the body. No recipient filter:
+        # the name a worker addresses ("main", "team-lead", …) need not
+        # match the name the leader goes by, and sends to OTHER peers
+        # simply never match a leader-side reply body.
         wsends = []
         for wn, wrec in enumerate(std.records):
             if not (isinstance(wrec, dict)
@@ -7961,9 +7967,9 @@ def _link_map(path):
             for p in content:
                 if (isinstance(p, dict) and p.get('type') == 'tool_use'
                         and p.get('name') == 'SendMessage'):
-                    recipient, _s, _m = _send_message_fields(p.get('input'))
-                    if not leader or recipient == leader:
-                        wsends.append(wn)
+                    _r, _s, wmsg = _send_message_fields(p.get('input'))
+                    wsends.append(
+                        (wn, wmsg.strip() if isinstance(wmsg, str) else ''))
         # Only traffic AFTER the owning spawn joins — an earlier
         # incarnation of a reused name exchanged its own messages, and
         # walking those into this transcript would link them to the
@@ -7977,10 +7983,14 @@ def _link_map(path):
             else:
                 tgt = group_id
             lines.setdefault(mline, []).append(tgt)
-        for k, mline in enumerate(
-                [n for n in replies_from.get(name, []) if n > spawn_line]):
-            if k < len(wsends):
-                tgt = ('msg', agent_path, wsends[k])
+        used = set()
+        for mline, body in [nb for nb in replies_from.get(name, [])
+                            if nb[0] > spawn_line]:
+            hit = next((i for i, (_wn, wmsg) in enumerate(wsends)
+                        if i not in used and wmsg == body), None)
+            if hit is not None:
+                used.add(hit)
+                tgt = ('msg', agent_path, wsends[hit][0])
                 rev.setdefault(tgt[1:], []).append(('msg', path, mline))
             else:
                 tgt = group_id
@@ -9356,8 +9366,8 @@ def main():
         # Enter follows a row's cross-link ([↗] rows on both sides of a
         # leader↔teammate interaction — spawn sites, SendMessage
         # dispatches, teammate replies, subagent group rows, and the
-        # worker-side inbound / send-to-leader rows); everything else
-        # stays a silent no-op.
+        # worker-side inbound / send rows); everything else stays a
+        # silent no-op.
         on_enter=_on_enter_jump,
         actions=[
             # v / e are the framework defaults (page / edit the preview text).
