@@ -5822,7 +5822,7 @@ class TestToolResultFallback(unittest.TestCase):
 
 
 class TestTreeSubagentBlock(unittest.TestCase):
-    """Tree mode lists ALL subagents in a top block, in dispatch order."""
+    """Tree mode lists ALL subagents in a top block, newest-first."""
 
     @classmethod
     def setUpClass(cls):
@@ -5902,19 +5902,18 @@ class TestTreeSubagentBlock(unittest.TestCase):
             td = self.r._scan_tree(sess)
             rows = self.r._tree_subagents_for_session(sess, td)
             self.assertEqual([r.agent_id for r in rows],
-                             ['A1', 'A2', 'A3'])
-            for wired in rows[:2]:
+                             ['A3', 'A2', 'A1'])
+            self.assertIn('orphan', rows[0].tag)
+            self.assertEqual(rows[0].tag_style, 'dim')
+            self.assertTrue(getattr(rows[0], 'is_orphan', False))
+            for wired in rows[1:]:
                 self.assertNotIn('orphan', wired.tag)
                 self.assertEqual(wired.tag_style, 'magenta')
                 self.assertFalse(getattr(wired, 'is_orphan', False))
-            self.assertIn('orphan', rows[2].tag)
-            self.assertEqual(rows[2].tag_style, 'dim')
-            self.assertTrue(getattr(rows[2], 'is_orphan', False))
 
     def test_flat_mode_still_lists_all_subs(self):
         # _list_session_children (flat-mode path) returns the full
-        # subagent set unchanged — dispatch ordering and orphan
-        # tagging are tree-mode only.
+        # subagent set unchanged — orphan tagging is tree-mode only.
         import tempfile
         with tempfile.TemporaryDirectory() as tmp:
             sess = self._build_fixture(tmp, [
@@ -5935,7 +5934,7 @@ class TestTreeSubagentBlock(unittest.TestCase):
     def test_tree_roots_all_subagents_in_top_block(self):
         # ALL subagents — wired and orphaned — surface in the top block,
         # bracketed by the two meta dividers: ``--- Subagents:`` →
-        # subagent rows (dispatch order, orphans last) → ``--- Session:``
+        # subagent rows (newest-first) → ``--- Session:``
         # → the turn/span umbrellas.
         import tempfile
         with tempfile.TemporaryDirectory() as tmp:
@@ -5954,7 +5953,7 @@ class TestTreeSubagentBlock(unittest.TestCase):
                 [getattr(r, 'kind', None) for r in roots[1:4]],
                 ['subagent'] * 3)
             self.assertEqual([r.agent_id for r in roots[1:4]],
-                             ['A1', 'A2', 'A3'])
+                             ['A3', 'A2', 'A1'])
             self.assertTrue(getattr(roots[4], 'meta', False))
             self.assertEqual(roots[4].id, ('sep', sess, 'session'))
             self.assertEqual(roots[4].title, '--- Session:')
@@ -5966,40 +5965,44 @@ class TestTreeSubagentBlock(unittest.TestCase):
             self.assertFalse(any(getattr(r, 'meta', False)
                                  for r in roots[5:]))
 
-    def test_linked_order_follows_dispatch_not_mtime(self):
-        # Two wired agents whose file mtimes are REVERSED relative to
-        # their dispatch order still list in dispatch order.
+    def test_linked_order_follows_mtime_not_dispatch(self):
+        # Two wired agents dispatched A1-then-A2, but A2's file is
+        # newer: the block lists newest-first, not in dispatch order.
         import tempfile
         with tempfile.TemporaryDirectory() as tmp:
             sess = self._build_fixture(tmp, [
                 ('A1', 'general-purpose', 'wired one',  True),
                 ('A2', 'general-purpose', 'wired two',  True),
             ])
-            sub_dir = os.path.join(tmp, '-x', 'parent-sid', 'subagents')
-            os.utime(os.path.join(sub_dir, 'agent-A1.jsonl'),
-                     (2000000, 2000000))   # newest file, first dispatch
             self.r._TREE_CACHE.clear()
             td = self.r._scan_tree(sess)
             rows = self.r._tree_subagents_for_session(sess, td)
-            self.assertEqual([r.agent_id for r in rows], ['A1', 'A2'])
+            self.assertEqual([r.agent_id for r in rows], ['A2', 'A1'])
 
-    def test_orphans_sort_by_mtime_after_linked(self):
+    def test_tree_order_matches_flat_view(self):
+        # Interleaved linked + orphan mtimes: the tree block yields the
+        # exact same agent sequence as the flat listing — one
+        # newest-first ordering, orphans interleaved by the same rule.
         import tempfile
         with tempfile.TemporaryDirectory() as tmp:
             sess = self._build_fixture(tmp, [
                 ('A1', 'general-purpose', 'orphan late',   False),
                 ('A2', 'general-purpose', 'orphan early',  False),
                 ('A3', 'general-purpose', 'wired one',     True),
+                ('A4', 'general-purpose', 'wired two',     True),
             ])
             sub_dir = os.path.join(tmp, '-x', 'parent-sid', 'subagents')
             os.utime(os.path.join(sub_dir, 'agent-A1.jsonl'),
-                     (2000000, 2000000))
+                     (2000000, 2000000))   # orphan is the newest file
             self.r._TREE_CACHE.clear()
+            flat = self.r._list_subagents_for_session(sess)
             td = self.r._scan_tree(sess)
             rows = self.r._tree_subagents_for_session(sess, td)
-            # Linked first, then orphans in mtime order.
             self.assertEqual([r.agent_id for r in rows],
-                             ['A3', 'A2', 'A1'])
+                             [r.agent_id for r in flat])
+            # mtimes: A1=2000000, A4=1000003, A3=1000002, A2=1000001.
+            self.assertEqual([r.agent_id for r in rows],
+                             ['A1', 'A4', 'A3', 'A2'])
 
     def test_tree_roots_dividers_unconditional_with_subagents(self):
         # A session whose subagents are all wired still gets the top
@@ -6014,7 +6017,7 @@ class TestTreeSubagentBlock(unittest.TestCase):
             roots = self.r._list_tree_roots(sess)
             self.assertEqual(roots[0].title, '--- Subagents:')
             self.assertEqual([r.agent_id for r in roots[1:3]],
-                             ['A1', 'A2'])
+                             ['A2', 'A1'])
             self.assertEqual(roots[3].title, '--- Session:')
 
     def test_tree_roots_no_dividers_without_subagents(self):

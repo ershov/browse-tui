@@ -6468,11 +6468,9 @@ def _list_tree_roots(jsonl_path):
     records. The first message is no longer also the expandable node —
     that's the umbrella's job.
 
-    ALL the session's subagent files surface here in a top block, in
-    dispatch order (the line of the dispatching assistant, via
-    ``td.agent_to_assistant_line``); agents with no dispatch site in
-    the main thread sort after the linked ones and come back tagged
-    ``orphan`` and dimmed.
+    ALL the session's subagent files surface here in a top block,
+    newest-first like the flat view; agents with no dispatch site in
+    the main thread come back tagged ``orphan`` and dimmed.
     """
     td = _scan_tree(jsonl_path)
     out = []
@@ -6506,12 +6504,13 @@ def _list_tree_roots(jsonl_path):
 
 
 def _tree_subagents_for_session(jsonl_path, td):
-    """Subagent rows for the tree-mode top block, in dispatch order.
+    """Subagent rows for the tree-mode top block, newest-first.
 
-    Agents whose dispatch is wired to the main thread (an
+    Keeps the flat-view ordering from ``_list_subagents_for_session``
+    (newest mtime first) so both views show the same row sequence.
+    Agents with no dispatch site in the main thread (no
     ``td.agent_to_assistant_line`` entry, built by
-    ``_maybe_link_subagent`` during scan) sort by their dispatching
-    assistant's line; the rest follow in mtime order, tagged
+    ``_maybe_link_subagent`` during scan) come back tagged
     ``orphan · …`` and dimmed so the user can see they aren't wired
     into the session's turn graph.
     """
@@ -6523,10 +6522,7 @@ def _tree_subagents_for_session(jsonl_path, td):
                     f'{_human_time(item.mtime)}')
         item.tag_style = 'dim'
         item.is_orphan = True
-    return sorted(subs, key=lambda it: (
-        (0, td.agent_to_assistant_line[it.agent_id])
-        if it.agent_id in td.agent_to_assistant_line
-        else (1, it.mtime)))
+    return subs
 
 
 def _list_prompt_children(jsonl_path, turn_root_line):
@@ -9172,7 +9168,7 @@ Usage: browse-claude [OPTIONS] [PROJECT]
   --item N        After --session/--pid/--file, position the cursor on
                   line N (1-based) of the resolved transcript.
   --tree          Show sessions as a tree, grouped by turn (default).
-                  Subagents list in a top block, in dispatch order.
+                  Subagents list in a top block, newest first.
   --no-tree       Show sessions as a flat reverse-time list.
   --detail LEVEL  Detail level (default: 1). LEVEL is 1-6 or a word:
                   1=summary (user prompts + end_turn responses),
