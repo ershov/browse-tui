@@ -9715,6 +9715,200 @@ class TestInProcessTeammates(unittest.TestCase):
         self.assertEqual(td.agent_link['t1']['agent_path'], p)
 
 
+class TestPostTurnContinuations(unittest.TestCase):
+    """Leaders keep working after ``system/turn_duration`` (autonomous
+    continuations marked by ``atis-latch``; the close can even land
+    between a tool_use and its tool_result). ``_fold_record`` re-opens
+    the last turn for such activity — assistant records and tool_result
+    user records — so it folds under the prompt that owns it, while
+    pure metadata runs still form spans. Subagent linking is
+    turn-independent: a spawn tool_result outside any turn (no prior
+    turn to re-open) still links via ``sourceToolAssistantUUID``."""
+
+    LEAD_SID = 'cccc1111-2222-3333-4444-555566667777'
+    TEAM = 'session-cccc1111'
+
+    @classmethod
+    def setUpClass(cls):
+        cls.r = _load_recipe()
+
+    def setUp(self):
+        import tempfile
+        self._tmp = tempfile.TemporaryDirectory()
+        self._saved_home = os.environ.get('HOME')
+        self._saved_root = self.r.CLAUDE_ROOT
+        os.environ['HOME'] = self._tmp.name
+        self.r.CLAUDE_ROOT = os.path.join(
+            self._tmp.name, '.claude', 'projects')
+        self.proj = os.path.join(self.r.CLAUDE_ROOT, '-home-test-cont')
+        os.makedirs(self.proj)
+        self.r._TEAMS_INDEX.clear()
+        self.r._WORKER_META_CACHE.clear()
+        self.r._DIR_WORKERS_CACHE.clear()
+        self.r._TREE_CACHE.clear()
+
+    def tearDown(self):
+        if self._saved_home is None:
+            os.environ.pop('HOME', None)
+        else:
+            os.environ['HOME'] = self._saved_home
+        self.r.CLAUDE_ROOT = self._saved_root
+        self.r._WORKER_META_CACHE.clear()
+        self.r._DIR_WORKERS_CACHE.clear()
+        self._tmp.cleanup()
+
+    ROOT = {'type': 'user', 'uuid': 'u1',
+            'message': {'role': 'user', 'content': 'do some work'}}
+    CLOSE = {'type': 'system', 'subtype': 'turn_duration',
+             'durationMs': 1000}
+
+    def _agent_use(self, name='w-worker'):
+        return {'type': 'assistant', 'uuid': 'a1',
+                'message': {'role': 'assistant', 'content': [
+                    {'type': 'tool_use', 'id': 't1', 'name': 'Agent',
+                     'input': {'name': name,
+                               'subagent_type': 'general-purpose',
+                               'prompt': 'do the thing'}},
+                ]}}
+
+    def _spawn_result(self, name='w-worker'):
+        return {'type': 'user', 'uuid': 'u2',
+                'sourceToolAssistantUUID': 'a1',
+                'message': {'role': 'user', 'content': [
+                    {'type': 'tool_result', 'tool_use_id': 't1',
+                     'content': 'Spawned successfully.'},
+                ]},
+                'toolUseResult': {'status': 'teammate_spawned',
+                                  'prompt': 'do the thing',
+                                  'name': name,
+                                  'agent_id': f'{name}@{self.TEAM}',
+                                  'team_name': self.TEAM}}
+
+    def _write_lead(self, recs):
+        import json as _json
+        path = os.path.join(self.proj, f'{self.LEAD_SID}.jsonl')
+        with open(path, 'w') as f:
+            for rec in recs:
+                f.write(_json.dumps(rec) + '\n')
+        return path
+
+    def _write_agent(self, agent_id, name='w-worker'):
+        import json as _json
+        sub = os.path.join(self.proj, self.LEAD_SID, 'subagents')
+        os.makedirs(sub, exist_ok=True)
+        p = os.path.join(sub, f'agent-{agent_id}.jsonl')
+        with open(p, 'w') as f:
+            f.write(_json.dumps({
+                'type': 'user', 'agentId': agent_id, 'isSidechain': True,
+                'message': {'role': 'user', 'content': 'work work'},
+            }) + '\n')
+        with open(os.path.join(
+                sub, f'agent-{agent_id}.meta.json'), 'w') as f:
+            _json.dump({'name': name, 'teamName': self.TEAM,
+                        'agentType': 'general-purpose',
+                        'taskKind': 'in_process_teammate',
+                        'description': 'do the thing'}, f)
+        return p
+
+    def test_spawn_after_turn_duration_links_under_prompt(self):
+        # Whole spawn (tool_use + result) after the close: the
+        # assistant re-opens the turn, the result links and both fold
+        # under the prompt umbrella, not a span.
+        lead = self._write_lead([
+            self.ROOT, self.CLOSE,
+            self._agent_use(), self._spawn_result(),
+        ])
+        self._write_agent('aw-worker-0123abcd')
+        td = self.r._scan_tree(lead)
+        self.assertIn('t1', td.agent_link)
+        self.assertEqual(self.r._orphan_subagents_for_session(lead, td), [])
+        self.assertEqual(td.parent_id_of[2], ('tool', lead, 2))
+        self.assertEqual(td.parent_id_of[3], ('tool', lead, 2))
+        self.assertEqual(td.tool_to_turn_root_line[2], 0)
+        self.assertEqual([it['kind'] for it in td.roots_in_order],
+                         ['turn'])
+
+    def test_close_between_tool_use_and_result_links(self):
+        # turn_duration lands BETWEEN the Agent tool_use and its
+        # result: the result re-opens the turn and links via the
+        # sourceToolAssistantUUID back-pointer (per-turn tool_owner
+        # state was cleared at close).
+        lead = self._write_lead([
+            self.ROOT, self._agent_use(), self.CLOSE,
+            self._spawn_result(),
+        ])
+        self._write_agent('aw-worker-0123abcd')
+        td = self.r._scan_tree(lead)
+        self.assertIn('t1', td.agent_link)
+        self.assertEqual(self.r._orphan_subagents_for_session(lead, td), [])
+        self.assertEqual(td.parent_id_of[3], ('tool', lead, 1))
+        self.assertEqual([it['kind'] for it in td.roots_in_order],
+                         ['turn'])
+
+    def test_no_prior_turn_activity_spans_and_still_links(self):
+        # Truncated transcript starting mid-continuation: with no turn
+        # to re-open the records stay span members (visible), but the
+        # spawn result still links — linking is turn-independent.
+        lead = self._write_lead([
+            self._agent_use(), self._spawn_result(),
+        ])
+        self._write_agent('aw-worker-0123abcd')
+        td = self.r._scan_tree(lead)
+        self.assertIn('t1', td.agent_link)
+        self.assertEqual(self.r._orphan_subagents_for_session(lead, td), [])
+        self.assertEqual(td.parent_id_of[0], ('span', lead, 0))
+        self.assertEqual(td.parent_id_of[1], ('span', lead, 0))
+        self.assertEqual([it['kind'] for it in td.roots_in_order],
+                         ['span'])
+
+    def test_assistant_text_after_close_folds_under_prompt(self):
+        rec = {'type': 'assistant', 'uuid': 'a2',
+               'message': {'role': 'assistant', 'content': [
+                   {'type': 'text', 'text': 'continuing the work'}]}}
+        lead = self._write_lead([self.ROOT, self.CLOSE, rec])
+        td = self.r._scan_tree(lead)
+        self.assertEqual(td.parent_id_of[2], ('prompt', lead, 0))
+        self.assertIn(rec['uuid'],
+                      [r.get('uuid') for r in td.turn_direct['u1']])
+        self.assertEqual([it['kind'] for it in td.roots_in_order],
+                         ['turn'])
+
+    def test_metadata_run_between_turns_still_spans(self):
+        lead = self._write_lead([
+            self.ROOT, self.CLOSE,
+            {'type': 'mode', 'mode': 'default'},
+            {'type': 'last-prompt', 'prompt': 'do some work'},
+            {'type': 'atis-latch', 'atis': ''},
+            {'type': 'ai-title', 'aiTitle': 'Some work'},
+        ])
+        td = self.r._scan_tree(lead)
+        for n in (2, 3, 4, 5):
+            self.assertEqual(td.parent_id_of[n], ('span', lead, 2))
+        self.assertEqual([it['kind'] for it in td.roots_in_order],
+                         ['turn', 'span'])
+
+    def test_metadata_span_then_activity_reopens(self):
+        # The atis-latch trio precedes the continuation in real files:
+        # the metadata forms a span, then the assistant re-opens the
+        # turn; a second close ends it and later metadata spans again.
+        rec = {'type': 'assistant', 'uuid': 'a2',
+               'message': {'role': 'assistant', 'content': [
+                   {'type': 'text', 'text': 'continuing'}]}}
+        lead = self._write_lead([
+            self.ROOT, self.CLOSE,
+            {'type': 'atis-latch', 'atis': ''},
+            rec, self.CLOSE,
+            {'type': 'mode', 'mode': 'default'},
+        ])
+        td = self.r._scan_tree(lead)
+        self.assertEqual(td.parent_id_of[2], ('span', lead, 2))
+        self.assertEqual(td.parent_id_of[3], ('prompt', lead, 0))
+        self.assertEqual(td.parent_id_of[4], ('prompt', lead, 0))
+        self.assertEqual(td.parent_id_of[5], ('span', lead, 5))
+        self.assertEqual([it['kind'] for it in td.roots_in_order],
+                         ['turn', 'span', 'span'])
+
+
 def _load_recipe_with_md_doc():
     """Reload the recipe with ``recipes/`` on ``sys.path`` so ``md_doc`` resolves.
 

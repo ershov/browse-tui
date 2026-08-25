@@ -5582,6 +5582,32 @@ def _is_turn_close(rec):
             and rec.get('subtype') == 'turn_duration')
 
 
+def _is_continuation_activity(rec):
+    """Leader activity that can follow a ``turn_duration`` close.
+
+    Newer leaders keep working after the turn closes (autonomous
+    continuations, marked by ``atis-latch`` records) with no new user
+    prompt; ``turn_duration`` can even land between a tool_use and its
+    tool_result. Such activity — an assistant record, or a user record
+    carrying tool_result parts — belongs to the request that started
+    it, so ``_fold_record`` re-opens the last turn for it. Pure
+    metadata records (mode, last-prompt, atis-latch, ai-title,
+    file-history-snapshot, ...) are not activity and keep folding into
+    between-turn spans.
+    """
+    t = rec.get('type')
+    if t == 'assistant':
+        return True
+    if t != 'user' or rec.get('isMeta'):
+        return False
+    msg = rec.get('message')
+    content = msg.get('content') if isinstance(msg, dict) else None
+    if not isinstance(content, list):
+        return False
+    return any(isinstance(p, dict) and p.get('type') == 'tool_result'
+               for p in content)
+
+
 class _ScanCursor:
     """Mutable per-file state-machine cursor for the bulk + tail fold.
 
@@ -5605,7 +5631,8 @@ class _ScanCursor:
         # or None when not inside a span.
         self.span_start = None
         # uuid of the most recent turn root — survives turn close so
-        # inbound agent voice arriving between turns can re-open it.
+        # inbound agent voice or continuation activity arriving between
+        # turns can re-open it.
         self.last_turn_uuid = None
 
 
@@ -5641,11 +5668,14 @@ def _fold_record(td, cur, rec, n, path):
     # --- inbound agent voice with no open turn: the reply belongs to
     # the human request that spawned it, so re-open the last turn — the
     # reply AND the leader's handling of it (until the next
-    # turn_duration) fold under that prompt. A file with no prior turn
-    # (resumed/truncated transcript) falls back to rooting it, keeping
-    # the <reply>/<peer> umbrella.
+    # turn_duration) fold under that prompt. Post-``turn_duration``
+    # continuation activity (``_is_continuation_activity``) re-opens
+    # the same way. A file with no prior turn (resumed/truncated
+    # transcript) falls back: voice roots itself, keeping the
+    # <reply>/<peer> umbrella; activity falls through to the span path.
     if (not is_root and cur.turn_open_uuid is None
-            and _is_inbound_agent_voice(rec)):
+            and (_is_inbound_agent_voice(rec)
+                 or _is_continuation_activity(rec))):
         if (cur.last_turn_uuid is not None
                 and cur.last_turn_uuid in td.turn_direct):
             # Close any open between-turns span (mirrors the turn-root
@@ -5654,7 +5684,7 @@ def _fold_record(td, cur, rec, n, path):
             cur.span_start = None
             cur.turn_open_uuid = cur.last_turn_uuid
             cur.tool_owner = {}
-        else:
+        elif _is_inbound_agent_voice(rec):
             is_root = True
 
     # --- turn root: opens a new <prompt> umbrella, closes any open span.
@@ -5733,7 +5763,14 @@ def _fold_record(td, cur, rec, n, path):
             cur.tool_owner = {}
         return dirty
 
-    # --- outside any turn: span member.
+    # --- outside any turn: span member. Subagent linking is
+    # turn-independent — a spawn tool_result landing here (no prior
+    # turn to re-open, e.g. a truncated transcript) still links via
+    # its ``sourceToolAssistantUUID`` back-pointer. Placement stays
+    # span.
+    owner = _resolve_tool_owner(rec, cur.tool_owner)
+    if owner is not None:
+        _maybe_link_subagent(td, rec, owner, path)
     if cur.span_start is None:
         cur.span_start = n
         # Initialise a live-shared span records list so further
