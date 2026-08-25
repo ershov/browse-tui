@@ -949,11 +949,11 @@ class TestBrowseClaude(unittest.TestCase):
                 # than a fixed sleep, so the assertion never races a
                 # mid-toggle repaint (or the async child-load that backs
                 # the tree rebuild) under load. Each toggle:
-                #   1. wait for a MODE-SPECIFIC marker that is absent in
-                #      the other mode — proves the toggle was processed
-                #      (not a stale pre-toggle frame). Tree mode shows
-                #      ``<prompt>`` turn-root markers; flat mode replaces
-                #      them with collapsed subagent rows (``[Explore``).
+                #   1. wait for a MODE-SPECIFIC marker — proves the
+                #      toggle was processed (not a stale pre-toggle
+                #      frame). Tree mode shows ``<prompt>`` turn-root
+                #      markers; flat mode has none, so tree→flat waits
+                #      for the marker to disappear.
                 #   2. wait for PROBE_TURN2_REPLY — proves the cursor's
                 #      message re-rendered (the tree expand briefly shows
                 #      a ``⧗ loading…`` placeholder before children land).
@@ -961,7 +961,11 @@ class TestBrowseClaude(unittest.TestCase):
                 # Flip to flat — preview should still target the same
                 # message (PROBE_TURN2_REPLY).
                 t.send('t')
-                t.wait_for('[Explore', timeout=3.0)
+                deadline = time.time() + 3.0
+                while '<prompt>' in t.capture():
+                    if time.time() > deadline:
+                        self.fail('tree→flat toggle never processed')
+                    time.sleep(0.03)
                 cap_flat = t.wait_for('PROBE_TURN2_REPLY', timeout=3.0)
                 self.assertIn('PROBE_TURN2_REPLY', cap_flat,
                               f'cursor lost on tree→flat: {cap_flat[:400]!r}')
@@ -1005,13 +1009,14 @@ class TestBrowseClaude(unittest.TestCase):
                 t.wait_for('PROBE_TURN2_REPLY', timeout=3.0)
                 t.send('q')
 
-    def test_tree_expand_assistant_shows_subagent(self):
-        """Expanding the Agent-calling assistant row reveals the subagent.
+    def test_tree_subagent_in_top_block(self):
+        """The dispatched subagent lists in the session's top block.
 
-        The fixture has two turns: turn 1 dispatched the subagent;
-        turn 2 is just text. Auto-cursor-on-open lands inside turn 2,
-        so we use ``K`` to walk back to turn 1's user voice, expand
-        turn 1, then drill into the Task-calling assistant row.
+        The fixture wires AGENT01 via ``toolUseResult.agentId``, so the
+        subagent row (``PROBE_SUBAGENT_DESC``) renders between the
+        ``--- Subagents:`` / ``--- Session:`` dividers — not nested
+        under the Task-calling assistant — and Right on it drills into
+        its transcript.
         """
         import tempfile
         with tempfile.TemporaryDirectory() as tmp:
@@ -1020,41 +1025,37 @@ class TestBrowseClaude(unittest.TestCase):
                 t.launch(_BIN, '--run-py', _RECIPE, '--detail', 'voice',
                          '--tree', '--file', sess)
                 t.wait_for('PROBE_TURN2_REPLY', timeout=3.0)
-                # K walks UP through visible voices. From PROBE_TURN2_REPLY,
-                # the voice rows above (in order) are:
-                #   • u3 leaf      (PROBE_TURN2_USER)
-                #   • <prompt:5>   (umbrella for turn 2; same content)
-                #   • <prompt:1>   (turn 1 root, collapsed at top level)
-                # Three K's land cursor on the <prompt:1> umbrella row,
-                # ready to be expanded with Right.
-                t.send('K')
-                t.send('K')
-                t.send('K')
-                t.wait_for('PROBE_TURN1_USER', timeout=3.0)
-                # Right in tree mode expands the row AND auto-jumps the
-                # cursor to the latest voice inside the subtree. After
-                # expanding turn 1, cursor lands on PROBE_TURN1_REPLY
-                # (the final assistant text leaf). Up two rows lands
-                # on the Task-calling <tool:Task> umbrella (one row up
-                # for the tool umbrella, since the assistant leaf
-                # sits a level inside).
+                cap = t.wait_for('--- Subagents:', timeout=3.0)
+                self.assertIn('PROBE_SUBAGENT_DESC', cap)
+                i_sub = cap.index('--- Subagents:')
+                i_agent = cap.index('PROBE_SUBAGENT_DESC')
+                i_sess = cap.index('--- Session:')
+                self.assertLess(i_sub, i_agent)
+                self.assertLess(i_agent, i_sess)
+                # The linked agent is NOT orphan-tagged.
+                self.assertNotIn('orphan', cap)
+                # Home → session scope row; Down skips the meta divider
+                # onto the subagent row; Right drills into its own
+                # transcript.
+                t.send('Home')
+                t.wait_stable(timeout=3.0)
+                t.send('Down')
+                t.wait_stable(timeout=3.0)
+                cur = self._cursor_line(t.capture(colors=True))
+                self.assertIn('PROBE_SUBAGENT_DESC', cur or '')
                 t.send('Right')
-                t.wait_for('PROBE_TURN1_REPLY', timeout=3.0)
-                t.send('Up')
-                t.send('Right')                  # expand Task umbrella
-                t.wait_for('PROBE_SUBAGENT_DESC', timeout=3.0)
+                t.wait_for('PROBE_SUBAGENT_PROMPT', timeout=3.0)
                 t.send('q')
 
-    def test_tree_expand_assistant_shows_relocated_subagent(self):
-        """Tree mode reveals a worktree-relocated subagent inline.
+    def test_tree_relocated_subagent_in_top_block(self):
+        """Tree mode surfaces a worktree-relocated subagent in the top block.
 
-        Same flow as ``test_tree_expand_assistant_shows_subagent`` but
-        the subagent transcript lives under the cwd-derived worktree
-        project dir, not co-located with the session ``.jsonl``. The
-        Task-calling assistant row must still surface the subagent
-        (``PROBE_SUBAGENT_DESC``), and drilling into it must reveal its
-        transcript line — proving the tree-mode resolution sites route
-        through ``_resolve_agent_jsonl``.
+        Same flow as ``test_tree_subagent_in_top_block`` but the subagent
+        transcript lives under the cwd-derived worktree project dir, not
+        co-located with the session ``.jsonl``. The row must still list
+        as linked (no orphan tag — proving ``agent_link`` resolved via
+        ``_resolve_agent_jsonl``), and drilling in must reveal its
+        transcript line.
         """
         import tempfile
         with tempfile.TemporaryDirectory() as tmp:
@@ -1063,24 +1064,21 @@ class TestBrowseClaude(unittest.TestCase):
                 t.launch(_BIN, '--run-py', _RECIPE, '--detail', 'voice',
                          '--tree', '--file', sess)
                 t.wait_for('PROBE_TURN2_REPLY', timeout=3.0)
-                # Walk back to turn 1's root umbrella (see the co-located
-                # variant for the row-by-row reasoning behind the 3 K's).
-                t.send('K')
-                t.send('K')
-                t.send('K')
-                t.wait_for('PROBE_TURN1_USER', timeout=3.0)
-                t.send('Right')                  # expand turn 1
-                t.wait_for('PROBE_TURN1_REPLY', timeout=3.0)
-                t.send('Up')
-                t.send('Right')                  # expand Task umbrella
-                # The relocated subagent must surface inline under the
-                # dispatching assistant — fails before routing through
-                # the resolver (the agent_link is never built because
-                # the co-located subagents dir is empty).
-                t.wait_for('PROBE_SUBAGENT_DESC', timeout=3.0)
-                # Drill into the subagent row: its transcript line must
-                # render, proving get_children resolves the relocated
-                # agent jsonl too.
+                cap = t.wait_for('PROBE_SUBAGENT_DESC', timeout=3.0)
+                self.assertIn('--- Subagents:', cap)
+                # Linked despite relocation — the resolver found the
+                # transcript, so no orphan tag.
+                self.assertNotIn('orphan', cap)
+                # Drill into the subagent row (Home → scope row, Down →
+                # the agent row past the divider): its transcript line
+                # must render, proving get_children resolves the
+                # relocated agent jsonl too.
+                t.send('Home')
+                t.wait_stable(timeout=3.0)
+                t.send('Down')
+                t.wait_stable(timeout=3.0)
+                cur = self._cursor_line(t.capture(colors=True))
+                self.assertIn('PROBE_SUBAGENT_DESC', cur or '')
                 t.send('Right')
                 t.wait_for('PROBE_SUBAGENT_PROMPT', timeout=3.0)
                 t.send('q')
@@ -1870,9 +1868,10 @@ class TestBrowseClaude(unittest.TestCase):
 
         The subagent ``agent-ORPH01.jsonl`` exists on disk but the main
         thread carries NO ``Agent`` / ``Task`` dispatch wiring it, so
-        ``_orphan_subagents_for_session`` surfaces it at the top of the
-        tree listing. The lone user/assistant turn becomes a ``<prompt>``
-        umbrella that lands after the ``--- Session:`` divider.
+        ``_tree_subagents_for_session`` surfaces it orphan-tagged at the
+        top of the tree listing. The lone user/assistant turn becomes a
+        ``<prompt>`` umbrella that lands after the ``--- Session:``
+        divider.
         """
         import json as _json
         root = os.path.join(tmp, '.claude', 'projects')
@@ -1979,22 +1978,20 @@ class TestBrowseClaude(unittest.TestCase):
                                      'divider')
                 t.send('q')
 
-    def test_tree_no_dividers_without_orphan(self):
-        """A session with NO orphaned subagents shows no dividers."""
+    def test_tree_no_dividers_without_subagents(self):
+        """A session with NO subagents shows no dividers."""
         import tempfile
         with tempfile.TemporaryDirectory() as tmp:
-            # _make_tree_fixture wires AGENT01 via toolUseResult.agentId,
-            # so there is no orphan and no divider should appear.
-            sess = self._make_tree_fixture(tmp)
+            sess = self._make_sendmessage_fixture(tmp)
             with TmuxFixture(cols=160, rows=30, env=self._launch_env(tmp)) as t:
                 t.launch(_BIN, '--run-py', _RECIPE,
                          '--tree', '--detail', '4', '--file', sess)
-                cap = t.wait_for('PROBE_TURN2_REPLY', timeout=4.0)
+                cap = t.wait_for('PROBE_HUMAN_PROMPT', timeout=4.0)
                 self.assertNotIn('--- Subagents:', cap,
-                                 'no orphan → no Subagents divider; got: '
-                                 + cap[-1400:])
+                                 'no subagents → no Subagents divider; '
+                                 'got: ' + cap[-1400:])
                 self.assertNotIn('--- Session:', cap,
-                                 'no orphan → no Session divider; got: '
+                                 'no subagents → no Session divider; got: '
                                  + cap[-1400:])
                 t.send('q')
 

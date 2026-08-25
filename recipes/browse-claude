@@ -909,8 +909,8 @@ def get_children(item_id, *, reload=False):
         if not os.path.isfile(jsonl_path):
             return []
         if _TREE_MODE:
-            # Tree mode: subagents live inline under their assistant rows,
-            # not as a separate prelude at the session level.
+            # Tree mode: subagents surface in a top block above the
+            # turn/span umbrellas — all handled by the roots listing.
             return _list_tree_roots(jsonl_path)
         return _list_session_children(jsonl_path)
     if tag == 'project':
@@ -1785,8 +1785,7 @@ _ROW_BG_FOR_KIND = {
     # Subagent umbrella rows: the dispatching assistant ``Agent`` /
     # ``Task`` call IS voice (it's how the assistant tells the
     # subagent what to do), so the umbrella inherits the assistant
-    # stripe. Applies both to inline-wired umbrellas and to orphans
-    # surfaced at the top of tree view.
+    # stripe.
     'subagent':        235,
     # Outbound leader→worker SendMessage: agent-to-agent traffic shares
     # the assistant stripe — the whole point is to keep it off the human
@@ -2065,12 +2064,13 @@ def _passes_filter(item_id, td=None):
             rec = td.records[n]
             if isinstance(rec, dict):
                 # A ``<tool:Agent>`` umbrella that dispatches a
-                # resolvable subagent reads as voice-tier (level 2) — the
-                # subagent's voice marker propagates up through the
-                # umbrella, same rule that gives it its row stripe in
-                # ``_tool_umbrella_item``. Otherwise it carries its
-                # assistant record's own min level (a bare tool_use is
-                # level 4; an edit/write tool is level 3).
+                # resolvable subagent reads as voice-tier (level 2) —
+                # dispatch sites keep the same tier as the subagent
+                # rows in the top block, same rule that gives them
+                # their row stripe in ``_tool_umbrella_item``.
+                # Otherwise it carries its assistant record's own min
+                # level (a bare tool_use is level 4; an edit/write
+                # tool is level 3).
                 if _tool_umbrella_wraps_subagent(rec, td):
                     return _DETAIL_LEVEL >= 2
                 return _record_min_level(rec) <= _DETAIL_LEVEL
@@ -5425,16 +5425,13 @@ class _TreeData:
         so the top level doesn't blow up with one row per metadata
         record.
 
-    Inside a turn, only two semantic relationships are nested:
+    Inside a turn, one semantic relationship is nested:
 
       * tool execution group: an assistant record with a ``tool_use``
         content part becomes the parent of (a) the matching user
-        tool_result (paired via ``tool_use_id``), (b) any attachment
+        tool_result (paired via ``tool_use_id``) and (b) any attachment
         records carrying a matching ``toolUseID`` (PreToolUse/
-        PostToolUse hook outputs), and (c) for Agent/Task tool_uses,
-        the subagent pseudo-row.
-      * subagent inline: the subagent's own ``.jsonl`` becomes a
-        recursive subtree under the assistant's tool_use row.
+        PostToolUse hook outputs).
 
     Fields:
 
@@ -5469,8 +5466,8 @@ class _TreeData:
                             containing ``<prompt>`` umbrella.
     * ``agent_to_assistant_line`` — ``{agent_id: assistant_line}`` —
                             maps a ``<subagent>`` group to its
-                            dispatching assistant's line (i.e. the
-                            ``<tool:Task>`` umbrella wrapping it).
+                            dispatch site (the dispatching
+                            assistant's line).
     * ``tool_use_name_of`` — ``{assistant_uuid: tool_name}`` — first
                             tool_use part's name (for the umbrella
                             title prefix).
@@ -5520,8 +5517,8 @@ class _TreeData:
         self.assistant_has_tool_use = set()
         # ``<tool:>`` → its containing ``<prompt>`` umbrella.
         self.tool_to_turn_root_line = {}
-        # ``<subagent>`` → its dispatching assistant (which becomes
-        # the ``<tool:Task>`` umbrella).
+        # ``<subagent>`` → its dispatching assistant's line (the
+        # dispatch site; drives top-block ordering).
         self.agent_to_assistant_line = {}
         # assistant_uuid → name of first tool_use content part, for the
         # ``<tool:Name>`` umbrella's title prefix.
@@ -5751,7 +5748,10 @@ def _fold_record(td, cur, rec, n, path):
                 dirty.add(('tool', path, owner_line))
             # Subagent-link check: a tool_result whose
             # toolUseResult.agentId resolves an agent jsonl on disk.
-            _maybe_link_subagent(td, rec, owner, path)
+            # A new link means a new row in the session's top block —
+            # dirty the root so it gets re-listed.
+            if _maybe_link_subagent(td, rec, owner, path):
+                dirty.add(('session', path))
         else:
             td.turn_direct[turn_uuid].append(rec)
             if turn_root_line is not None:
@@ -5769,8 +5769,8 @@ def _fold_record(td, cur, rec, n, path):
     # its ``sourceToolAssistantUUID`` back-pointer. Placement stays
     # span.
     owner = _resolve_tool_owner(rec, cur.tool_owner)
-    if owner is not None:
-        _maybe_link_subagent(td, rec, owner, path)
+    if owner is not None and _maybe_link_subagent(td, rec, owner, path):
+        dirty.add(('session', path))   # new row in the subagents block
     if cur.span_start is None:
         cur.span_start = n
         # Initialise a live-shared span records list so further
@@ -5827,23 +5827,26 @@ def _maybe_link_subagent(td, rec, owner_uuid, path):
 
     Inspects the owner assistant's tool_use parts to find the matching
     Agent/Task call and records the join via ``td.agent_link`` plus the
-    ``agent_to_assistant_line`` shortcut. No-op if anything mismatches.
+    ``agent_to_assistant_line`` shortcut. Returns True when a link was
+    recorded (so a live-tail fold can dirty the session's top block);
+    no-op returning False if anything mismatches.
     """
+    linked = False
     msg = rec.get('message')
     if not isinstance(msg, dict):
-        return
+        return linked
     content = msg.get('content')
     if not isinstance(content, list):
-        return
+        return linked
     asst = td.by_uuid.get(owner_uuid)
     if asst is None:
-        return
+        return linked
     amsg = asst.get('message') or {}
     if not isinstance(amsg, dict):
-        return
+        return linked
     acontent = amsg.get('content') or []
     if not isinstance(acontent, list):
-        return
+        return linked
     for cp in content:
         if not (isinstance(cp, dict) and cp.get('type') == 'tool_result'):
             continue
@@ -5900,9 +5903,11 @@ def _maybe_link_subagent(td, rec, owner_uuid, path):
                 'agent_path': agent_path,
                 'assistant_uuid': owner_uuid,
             }
+            linked = True
             asst_line = td.line_of.get(owner_uuid)
             if asst_line is not None:
                 td.agent_to_assistant_line[agent_id] = asst_line
+    return linked
 
 
 def _resolve_path_for_bust(item_id):
@@ -6458,30 +6463,29 @@ def _list_tree_roots(jsonl_path):
     records. The first message is no longer also the expandable node —
     that's the umbrella's job.
 
-    Subagent files whose dispatch site lives in this session's main
-    thread render inline under their dispatching assistant turn (via
-    ``td.agent_link`` / ``agent_to_assistant_line``). Orphan subagent
-    files — those with no matching ``Agent`` / ``Task`` ``tool_use.id``
-    in the main thread — would otherwise vanish, so we surface them
-    here at the top, mirroring flat-view placement.
+    ALL the session's subagent files surface here in a top block, in
+    dispatch order (the line of the dispatching assistant, via
+    ``td.agent_to_assistant_line``); agents with no dispatch site in
+    the main thread sort after the linked ones and come back tagged
+    ``orphan`` and dimmed.
     """
     td = _scan_tree(jsonl_path)
     out = []
-    orphans = _orphan_subagents_for_session(jsonl_path, td)
-    # When the session has orphaned subagents, bracket the orphan block
-    # with two ``meta`` dividers so the user sees where the unwired
-    # subagents end and the turn/span umbrellas begin. Emit ONLY when
-    # orphans are present — a session without them renders exactly as
-    # before. Ids are session-namespaced (``('sep', jsonl, which)``) so they
-    # stay unique across cached sessions AND stable, doubling as insertion
-    # sentinels for the ``update_data`` positioning API (meta-rows design
-    # sec Migrations → browse-claude). The framework skips the cursor over
-    # them, never selects them, and (with ``meta_filter_mode='show'``)
-    # keeps them visible under an active filter.
-    if orphans:
+    subs = _tree_subagents_for_session(jsonl_path, td)
+    # When the session has subagents, bracket their block with two
+    # ``meta`` dividers so the user sees where the subagents end and
+    # the turn/span umbrellas begin. A session without any renders
+    # exactly as before. Ids are session-namespaced
+    # (``('sep', jsonl, which)``) so they stay unique across cached
+    # sessions AND stable, doubling as insertion sentinels for the
+    # ``update_data`` positioning API (meta-rows design sec Migrations
+    # → browse-claude). The framework skips the cursor over them, never
+    # selects them, and (with ``meta_filter_mode='show'``) keeps them
+    # visible under an active filter.
+    if subs:
         out.append(Item(id=('sep', jsonl_path, 'subagents'),
                         title='--- Subagents:', meta=True))
-        out.extend(orphans)
+        out.extend(subs)
         out.append(Item(id=('sep', jsonl_path, 'session'),
                         title='--- Session:', meta=True))
     for entry in td.roots_in_order:
@@ -6496,28 +6500,28 @@ def _list_tree_roots(jsonl_path):
     return out
 
 
-def _orphan_subagents_for_session(jsonl_path, td):
-    """Return subagent items whose dispatch isn't wired to the main thread.
+def _tree_subagents_for_session(jsonl_path, td):
+    """Subagent rows for the tree-mode top block, in dispatch order.
 
-    Diffs the on-disk subagent set against ``td.agent_link`` (built by
-    ``_maybe_link_subagent`` during scan). Unmatched files come back
-    tagged ``orphan · …`` and dimmed so the user can see they aren't
-    wired into the session's turn graph.
+    Agents whose dispatch is wired to the main thread (an
+    ``td.agent_to_assistant_line`` entry, built by
+    ``_maybe_link_subagent`` during scan) sort by their dispatching
+    assistant's line; the rest follow in mtime order, tagged
+    ``orphan · …`` and dimmed so the user can see they aren't wired
+    into the session's turn graph.
     """
     subs = _list_subagents_for_session(jsonl_path)
-    if not subs:
-        return []
-    linked = {info.get('agent_id') for info in td.agent_link.values()}
-    out = []
     for item in subs:
-        if item.agent_id in linked:
+        if item.agent_id in td.agent_to_assistant_line:
             continue
         item.tag = (f'{item.agent_type} · {item.line_count} msg · orphan · '
                     f'{_human_time(item.mtime)}')
         item.tag_style = 'dim'
         item.is_orphan = True
-        out.append(item)
-    return out
+    return sorted(subs, key=lambda it: (
+        (0, td.agent_to_assistant_line[it.agent_id])
+        if it.agent_id in td.agent_to_assistant_line
+        else (1, it.mtime)))
 
 
 def _list_prompt_children(jsonl_path, turn_root_line):
@@ -6566,10 +6570,10 @@ def _list_tool_children(jsonl_path, assistant_line):
     """Children of a ``<tool>`` umbrella.
 
     Returns the assistant tool_use record as a leaf, then every paired
-    tool_result / hook attachment in file order, and finally a
-    ``<subagent>`` umbrella for each resolvable Agent/Task dispatch. The
-    umbrella exists even when no tool_result has arrived yet so the
-    shape is stable across in-flight transcripts.
+    tool_result / hook attachment in file order. The umbrella exists
+    even when no tool_result has arrived yet so the shape is stable
+    across in-flight transcripts. Subagent transcripts are NOT nested
+    here — they live in the session's top block (``_list_tree_roots``).
     """
     td = _scan_tree(jsonl_path)
     if not (0 <= assistant_line < len(td.records)):
@@ -6591,22 +6595,6 @@ def _list_tool_children(jsonl_path, assistant_line):
         it = _tree_item(jsonl_path, child, td)
         if it is not None:
             out.append(it)
-    # 3) Subagent pseudo-rows for Agent/Task tool_uses with a
-    # resolvable transcript.
-    msg = rec.get('message') or {}
-    if isinstance(msg, dict):
-        content = msg.get('content') or []
-        if isinstance(content, list):
-            for p in content:
-                if (isinstance(p, dict)
-                        and p.get('type') == 'tool_use'
-                        and p.get('name') in ('Agent', 'Task')):
-                    link = td.agent_link.get(p.get('id'))
-                    if link:
-                        out.append(_subagent_pseudo_item(
-                            jsonl_path,
-                            link['agent_id'], link['agent_path'],
-                        ))
     return out
 
 
@@ -6715,17 +6703,15 @@ def _tool_umbrella_item(jsonl_path, assistant_line, rec, td):
     """``<tool:Name>`` umbrella wrapping one tool-execution group.
 
     Id shape: ``('tool', jsonl, assistant_line)``. Children are the
-    dispatching assistant itself (leaf), the paired ``tool_result`` +
-    hook attachments, and a ``<subagent>`` umbrella for Agent/Task
-    dispatches with a resolvable subagent transcript on disk. The tool
-    name in the prefix is the **first** ``tool_use`` part's name.
+    dispatching assistant itself (leaf) and the paired ``tool_result``
+    + hook attachments. The tool name in the prefix is the **first**
+    ``tool_use`` part's name.
 
     Voice stripe: inherited from the underlying assistant record when
     it qualifies as voice (mixed text + tool_use), OR from the subagent
-    kind when this umbrella wraps a resolvable Agent/Task dispatch.
-    The latter mirrors how the subagent pseudo-row is striped so the
-    voice marker propagates the whole way up from the subagent leaf
-    through its ``<tool:Agent>`` umbrella.
+    kind when this umbrella wraps a resolvable Agent/Task dispatch —
+    dispatch sites keep the same stripe as the subagent rows in the
+    session's top block.
     """
     summary = _oneline(_summarise_message(rec))
     uuid = rec.get('uuid')
@@ -6827,68 +6813,6 @@ def _span_umbrella_item(jsonl_path, start_line, records):
     item.span_start = start_line
     item.span_count = len(records)
     item.session_path = jsonl_path
-    return item
-
-
-def _subagent_pseudo_item(parent_jsonl, agent_id, agent_path):
-    """Single-row Item representing a subagent under an assistant row.
-
-    Same fields as the rows produced by ``_list_subagents_for_session``
-    so the existing preview/edit handlers Just Work — only the parent
-    in the tree changes.
-    """
-    meta = _read_subagent_meta(
-        os.path.join(os.path.dirname(agent_path),
-                     f'agent-{agent_id}.meta.json'),
-    )
-    agent_type = meta.get('agentType') or 'agent'
-    description = meta.get('description') or ''
-    live = ''
-    if not meta:
-        # Team worker (no meta file): type + liveness from the roster.
-        wmeta = _worker_meta(agent_path)
-        if wmeta:
-            roster = _TEAMS_INDEX.get(wmeta[0]) or {}
-            m = roster.get('members', {}).get(wmeta[1]) or {}
-            agent_type = m.get('agentType') or agent_type
-            if _worker_running_member(agent_path) is not None:
-                live = 'live · '
-    body = description or f'agent {agent_id}'
-    title = f'<subagent>  {body}'
-    try:
-        st = os.stat(agent_path)
-        mtime = st.st_mtime
-    except OSError:
-        mtime = 0
-    try:
-        with open(agent_path, 'rb') as f:
-            count = sum(1 for _ in f)
-    except OSError:
-        count = 0
-    item = Item(
-        id=('agent', parent_jsonl, agent_id),
-        title=title,
-        tag=f'{agent_type} · {live}{count} msg · {_human_time(mtime)}',
-        tag_style=('green' if live else 'magenta'),
-        has_children=count > 0,
-        hidden=False,   # subagent umbrellas are always visible
-        # Foreign subtree (the agent's own .jsonl): same boundary
-        # semantics as the rows from ``_list_subagents_for_session``.
-        boundary=True,
-    )
-    item.kind = 'subagent'
-    item.agent_id = agent_id
-    item.agent_type = agent_type
-    item.agent_description = description
-    item.session_path = parent_jsonl
-    item.subagent_path = agent_path
-    item.line_count = count
-    item.mtime = mtime
-    # Voice stripe: same colour as top-of-list and orphan subagent rows
-    # so the inline tree-mode placement reads as voice too.
-    bg = _ROW_BG_FOR_KIND.get('subagent')
-    if bg is not None:
-        item.row_bg = bg
     return item
 
 
@@ -7798,10 +7722,9 @@ def _ancestor_ids_for(item_id):
 
       * Records inside a subagent's ``.jsonl`` walk up through their
         in-file umbrellas, then across to the
-        ``('agent', parent_session_path, aid)`` subagent group row, then
-        further into that group's own ancestors (its dispatching
-        ``<tool:Task>`` umbrella and that umbrella's containing
-        ``<prompt>``).
+        ``('agent', parent_session_path, aid)`` subagent group row —
+        itself a top-level row in the parent session (the subagents
+        block), so the chain ends there.
       * Top-level umbrellas inside a subagent jsonl still nest under
         the outer subagent group — same prepend rule.
 
@@ -7814,19 +7737,10 @@ def _ancestor_ids_for(item_id):
         return []
     tag = item_id[0]
 
-    # Subagent group: parent is the ``<tool:Task>`` umbrella in the
-    # outer session (the assistant that dispatched is wrapped in its
-    # own tool umbrella in the new model).
+    # Subagent group: a top-level row in the parent session's tree
+    # (the subagents block above the turn umbrellas) — no ancestors.
     if tag == 'agent':
-        parent_session_path, aid = item_id[1], item_id[2]
-        if not os.path.isfile(parent_session_path):
-            return []
-        ptd = _scan_tree(parent_session_path)
-        asst_line = ptd.agent_to_assistant_line.get(aid)
-        if asst_line is None:
-            return []
-        parent_id = ('tool', parent_session_path, asst_line)
-        return _ancestor_ids_for(parent_id) + [parent_id]
+        return []
 
     # ``tool`` umbrella: parent is the containing ``prompt``.
     if tag == 'tool':
@@ -8897,7 +8811,7 @@ Usage: browse-claude [OPTIONS] [PROJECT]
   --item N        After --session/--pid/--file, position the cursor on
                   line N (1-based) of the resolved transcript.
   --tree          Show sessions as a tree, grouped by turn (default).
-                  Subagents nest inline under their assistant rows.
+                  Subagents list in a top block, in dispatch order.
   --no-tree       Show sessions as a flat reverse-time list.
   --detail LEVEL  Detail level (default: 1). LEVEL is 1-6 or a word:
                   1=summary (user prompts + end_turn responses),

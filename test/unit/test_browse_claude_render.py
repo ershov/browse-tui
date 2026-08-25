@@ -2197,9 +2197,8 @@ class TestAncestorIdsForSubagent(unittest.TestCase):
         # Parent session: u1 (turn root) → a1 (Task tool_use) → u2 (tool_result).
         # Subagent: su1 (turn root) → sa1 (assistant text).
         # Ancestors of sa1 (deepest, line 1 in subagent) should walk:
-        #   parent: <prompt> umbrella @ line 0 (wraps u1)
-        #          → <tool:Task> umbrella @ line 1 (wraps a1)
-        #          → <subagent> group (('agent', sess, 'AGENT01'))
+        #   <subagent> group (('agent', sess, 'AGENT01')) — a top-level
+        #     row in the parent session's subagents block
         #          → <prompt> umbrella @ line 0 of subagent (wraps su1)
         #   → sa1 itself (target, not included)
         import json as _json
@@ -2247,13 +2246,9 @@ class TestAncestorIdsForSubagent(unittest.TestCase):
 
             chain = self.r._ancestor_ids_for(('msg', agent_path, 1))
             # Expect (root → leaf), all umbrella ids:
-            #   parent's <prompt> umbrella (line 0, wraps u1)
-            #   parent's <tool:Task> umbrella (line 1, wraps a1)
-            #   subagent group ('agent', sess, 'AGENT01')
+            #   subagent group ('agent', sess, 'AGENT01') — top-level
             #   subagent's <prompt> umbrella (line 0, wraps su1)
             self.assertEqual(chain, [
-                ('prompt', sess_path, 0),
-                ('tool', sess_path, 1),
                 ('agent', sess_path, 'AGENT01'),
                 ('prompt', agent_path, 0),
             ])
@@ -3104,10 +3099,10 @@ class TestTreeListings(unittest.TestCase):
         finally:
             os.unlink(path)
 
-    def test_subagent_attaches_to_assistant_row(self):
+    def test_subagent_lists_in_top_block_not_under_tool(self):
         # Assistant with Task tool_use; tool_result resolves to a real
-        # subagent file. Children of the assistant row include both
-        # the tool_result AND the subagent pseudo-row.
+        # subagent file. The subagent row surfaces in the session's top
+        # block; the <tool:Task> umbrella keeps only the dispatch pair.
         import json as _json
         import tempfile
         tmp = tempfile.mkdtemp(prefix='sa-tree-')
@@ -3150,17 +3145,20 @@ class TestTreeListings(unittest.TestCase):
                             'description': 'probe stuff'}, f)
 
             # ``<tool:1>`` umbrella children = [a1 leaf, u2 tool_result
-            # leaf, <subagent> umbrella].
+            # leaf] — no nested subagent row.
             kids = self.r._list_tool_children(sess_path, 1)
-            self.assertEqual(len(kids), 3)
+            self.assertEqual(len(kids), 2)
             self.assertEqual(kids[0].id, ('msg', sess_path, 1))
             self.assertEqual(kids[0].kind, 'message')
             self.assertEqual(kids[1].id, ('msg', sess_path, 2))
             self.assertEqual(kids[1].kind, 'message')   # tool_result
-            self.assertEqual(kids[2].kind, 'subagent')
-            self.assertEqual(kids[2].agent_id, 'AGENT01')
-            self.assertEqual(kids[2].id,
-                             ('agent', sess_path, 'AGENT01'))
+            # The subagent row lands in the session's top block instead.
+            roots = self.r._list_tree_roots(sess_path)
+            agent_rows = [r for r in roots
+                          if getattr(r, 'kind', None) == 'subagent']
+            self.assertEqual([r.id for r in agent_rows],
+                             [('agent', sess_path, 'AGENT01')])
+            self.assertNotIn('orphan', agent_rows[0].tag)
             # The assistant record itself is a leaf in tree mode now.
             td = self.r._scan_tree(sess_path)
             asst_item = self.r._tree_item(sess_path,
@@ -3220,7 +3218,7 @@ class TestTreeListings(unittest.TestCase):
 
 
 class TestUmbrellaShapes(unittest.TestCase):
-    """``<prompt>``, ``<tool>``, ``<subagent>``, ``<system>`` umbrellas."""
+    """``<prompt>``, ``<tool>``, ``<system>`` umbrellas."""
 
     @classmethod
     def setUpClass(cls):
@@ -3272,32 +3270,6 @@ class TestUmbrellaShapes(unittest.TestCase):
             self.assertTrue(tool.title.startswith('<tool:Bash>'))
         finally:
             os.unlink(path)
-
-    def test_subagent_umbrella_title_prefix(self):
-        # Subagent pseudo-item carries the ``<subagent>`` prefix.
-        import json as _json
-        import tempfile
-        tmp = tempfile.mkdtemp(prefix='sa-umb-')
-        try:
-            sess = os.path.join(tmp, 'parent.jsonl')
-            with open(sess, 'w') as f:
-                f.write('{}\n')
-            sub_dir = os.path.join(tmp, 'parent', 'subagents')
-            os.makedirs(sub_dir)
-            agent = os.path.join(sub_dir, 'agent-A1.jsonl')
-            with open(agent, 'w') as f:
-                f.write('{}\n')
-            with open(os.path.join(sub_dir,
-                                   'agent-A1.meta.json'), 'w') as f:
-                _json.dump({'agentType': 'Explore',
-                            'description': 'do stuff'}, f)
-            item = self.r._subagent_pseudo_item(sess, 'A1', agent)
-            self.assertTrue(item.title.startswith('<subagent>'))
-            self.assertIn('do stuff', item.title)
-            self.assertEqual(item.id, ('agent', sess, 'A1'))
-        finally:
-            import shutil
-            shutil.rmtree(tmp, ignore_errors=True)
 
     def test_singleton_turn_still_gets_prompt_umbrella(self):
         # A user-only turn with no assistant reply still wraps in
@@ -3602,6 +3574,58 @@ class TestLiveTail(unittest.TestCase):
             )
         finally:
             os.unlink(path)
+
+    def test_tailed_spawn_result_dirties_session_root(self):
+        # A tool_result arriving via the live tail that links a new
+        # subagent must dirty ('session', path): the agent's row lives
+        # in the top block, so the session root needs a re-list (the
+        # tool umbrella alone no longer surfaces it).
+        import json as _json
+        import tempfile
+        tmp = tempfile.mkdtemp(prefix='tail-spawn-')
+        try:
+            sess = os.path.join(tmp, 'parent.jsonl')
+            with open(sess, 'w') as f:
+                for rec in [
+                    {'type': 'user', 'uuid': 'u1',
+                     'message': {'role': 'user', 'content': 'go'}},
+                    {'type': 'assistant', 'uuid': 'a1',
+                     'message': {'role': 'assistant', 'content': [
+                         {'type': 'tool_use', 'id': 'toolu_x',
+                          'name': 'Task',
+                          'input': {'prompt': 'p',
+                                    'subagent_type': 'Explore'}},
+                     ]}},
+                ]:
+                    f.write(_json.dumps(rec) + '\n')
+            sub_dir = os.path.join(tmp, 'parent', 'subagents')
+            os.makedirs(sub_dir)
+            with open(os.path.join(sub_dir, 'agent-AGENT01.jsonl'),
+                      'w') as f:
+                f.write('{}\n')
+            td = self.r._scan_tree(sess)
+            self.assertNotIn('toolu_x', td.agent_link)
+            self._append(sess, [
+                {'type': 'user', 'uuid': 'u2',
+                 'message': {'role': 'user', 'content': [
+                     {'type': 'tool_result', 'tool_use_id': 'toolu_x',
+                      'content': 'done'},
+                 ]},
+                 'toolUseResult': {'agentId': 'AGENT01',
+                                   'agentType': 'Explore',
+                                   'status': 'completed'}},
+            ])
+            records, dirty = self.r._read_new_records(sess)
+            self.assertEqual(len(records), 1)
+            self.assertIn('toolu_x', td.agent_link)
+            self.assertIn(('session', sess), dirty)
+            # The re-list now carries the newly linked agent.
+            rows = self.r._tree_subagents_for_session(sess, td)
+            self.assertEqual([it.agent_id for it in rows], ['AGENT01'])
+            self.assertFalse(getattr(rows[0], 'is_orphan', False))
+        finally:
+            import shutil
+            shutil.rmtree(tmp, ignore_errors=True)
 
     def test_read_incomplete_trailing_line_holds_offset(self):
         # Append a partial line (no trailing newline). The tail must NOT
@@ -4481,16 +4505,18 @@ class TestSubagentUmbrellaVoice(unittest.TestCase):
             self.assertEqual(len(rows), 1)
             self.assertEqual(rows[0].row_bg, 235)  # assistant stripe
 
-    def test_inline_subagent_pseudo_item_has_voice_bg(self):
-        # Tree-mode placement uses _subagent_pseudo_item, not the
-        # session-level lister. It must carry the same stripe.
+    def test_tree_top_block_subagent_row_has_voice_bg(self):
+        # Tree-mode top-block placement reuses the session-level row
+        # shape, linked agents keep the normal (non-orphan) tag.
         import tempfile
         with tempfile.TemporaryDirectory() as tmp:
             sess = self._build(tmp)
-            sub_dir = self.r._subagents_dir(sess)
-            agent_path = os.path.join(sub_dir, 'agent-A1.jsonl')
-            item = self.r._subagent_pseudo_item(sess, 'A1', agent_path)
-            self.assertEqual(item.row_bg, 235)
+            self.r._TREE_CACHE.clear()
+            td = self.r._scan_tree(sess)
+            rows = self.r._tree_subagents_for_session(sess, td)
+            self.assertEqual(len(rows), 1)
+            self.assertEqual(rows[0].row_bg, 235)
+            self.assertNotIn('orphan', rows[0].tag)
 
     def test_orphan_subagent_row_keeps_voice_bg(self):
         import tempfile
@@ -4498,10 +4524,10 @@ class TestSubagentUmbrellaVoice(unittest.TestCase):
             sess = self._build(tmp, with_dispatch=False)
             self.r._TREE_CACHE.clear()
             td = self.r._scan_tree(sess)
-            orphans = self.r._orphan_subagents_for_session(sess, td)
-            self.assertEqual(len(orphans), 1)
-            self.assertEqual(orphans[0].row_bg, 235)
-            self.assertIn('orphan', orphans[0].tag)
+            rows = self.r._tree_subagents_for_session(sess, td)
+            self.assertEqual(len(rows), 1)
+            self.assertEqual(rows[0].row_bg, 235)
+            self.assertIn('orphan', rows[0].tag)
 
     def test_parent_preview_does_not_inline_subagent_content(self):
         import tempfile
@@ -5793,8 +5819,8 @@ class TestToolResultFallback(unittest.TestCase):
         self.assertIn('bash output line', out)
 
 
-class TestOrphanSubagents(unittest.TestCase):
-    """Tree-mode surfaces subagent files whose dispatch isn't wired."""
+class TestTreeSubagentBlock(unittest.TestCase):
+    """Tree mode lists ALL subagents in a top block, in dispatch order."""
 
     @classmethod
     def setUpClass(cls):
@@ -5806,7 +5832,9 @@ class TestOrphanSubagents(unittest.TestCase):
         ``agents`` is a list of ``(agent_id, agent_type, description,
         with_dispatch)`` — when ``with_dispatch`` is True, a paired
         assistant tool_use + user tool_result are emitted in the main
-        thread so ``_maybe_link_subagent`` wires the file.
+        thread so ``_maybe_link_subagent`` wires the file. Agent-file
+        mtimes increase in list order so mtime-based assertions are
+        deterministic.
         """
         import json as _json
         proj = os.path.join(tmp, '-x')
@@ -5815,10 +5843,12 @@ class TestOrphanSubagents(unittest.TestCase):
         sub_dir = os.path.join(proj, 'parent-sid', 'subagents')
         os.makedirs(sub_dir)
         records = []
-        for agent_id, agent_type, desc, with_dispatch in agents:
+        for i, (agent_id, agent_type, desc, with_dispatch) \
+                in enumerate(agents):
             ap = os.path.join(sub_dir, f'agent-{agent_id}.jsonl')
             with open(ap, 'w') as f:
                 f.write('{}\n')
+            os.utime(ap, (1000000 + i, 1000000 + i))
             with open(os.path.join(sub_dir, f'agent-{agent_id}.meta.json'),
                       'w') as fm:
                 _json.dump({'agentType': agent_type,
@@ -5858,7 +5888,7 @@ class TestOrphanSubagents(unittest.TestCase):
                 f.write(_json.dumps(r) + '\n')
         return sess_path
 
-    def test_orphans_returned_separately(self):
+    def test_orphan_tag_only_on_unlinked(self):
         import tempfile
         with tempfile.TemporaryDirectory() as tmp:
             sess = self._build_fixture(tmp, [
@@ -5868,16 +5898,21 @@ class TestOrphanSubagents(unittest.TestCase):
             ])
             self.r._TREE_CACHE.clear()
             td = self.r._scan_tree(sess)
-            orphans = self.r._orphan_subagents_for_session(sess, td)
-            self.assertEqual(len(orphans), 1)
-            self.assertEqual(orphans[0].agent_id, 'A3')
-            self.assertIn('orphan', orphans[0].tag)
-            self.assertEqual(orphans[0].tag_style, 'dim')
-            self.assertTrue(getattr(orphans[0], 'is_orphan', False))
+            rows = self.r._tree_subagents_for_session(sess, td)
+            self.assertEqual([r.agent_id for r in rows],
+                             ['A1', 'A2', 'A3'])
+            for wired in rows[:2]:
+                self.assertNotIn('orphan', wired.tag)
+                self.assertEqual(wired.tag_style, 'magenta')
+                self.assertFalse(getattr(wired, 'is_orphan', False))
+            self.assertIn('orphan', rows[2].tag)
+            self.assertEqual(rows[2].tag_style, 'dim')
+            self.assertTrue(getattr(rows[2], 'is_orphan', False))
 
     def test_flat_mode_still_lists_all_subs(self):
         # _list_session_children (flat-mode path) returns the full
-        # subagent set unchanged — orphan surfacing is tree-mode only.
+        # subagent set unchanged — dispatch ordering and orphan
+        # tagging are tree-mode only.
         import tempfile
         with tempfile.TemporaryDirectory() as tmp:
             sess = self._build_fixture(tmp, [
@@ -5895,62 +5930,78 @@ class TestOrphanSubagents(unittest.TestCase):
                 {'A1', 'A2', 'A3'},
             )
 
-    def test_tree_roots_includes_orphans_at_top(self):
+    def test_tree_roots_all_subagents_in_top_block(self):
+        # ALL subagents — wired and orphaned — surface in the top block,
+        # bracketed by the two meta dividers: ``--- Subagents:`` →
+        # subagent rows (dispatch order, orphans last) → ``--- Session:``
+        # → the turn/span umbrellas.
         import tempfile
         with tempfile.TemporaryDirectory() as tmp:
             sess = self._build_fixture(tmp, [
                 ('A1', 'general-purpose', 'wired one',   True),
-                ('A2', 'general-purpose', 'orphan one',  False),
+                ('A2', 'general-purpose', 'wired two',   True),
+                ('A3', 'general-purpose', 'orphan one',  False),
             ])
             self.r._TREE_CACHE.clear()
             roots = self.r._list_tree_roots(sess)
-            # ``--- Subagents:`` divider, then the orphan subagent; A1
-            # (wired) is not at the top — it renders inline under its
-            # dispatching turn.
+            # [subagents-sep, A1, A2, A3, session-sep, <umbrellas...>].
             self.assertTrue(getattr(roots[0], 'meta', False))
             self.assertEqual(roots[0].id, ('sep', sess, 'subagents'))
             self.assertEqual(roots[0].title, '--- Subagents:')
-            self.assertEqual(getattr(roots[1], 'kind', None), 'subagent')
-            self.assertEqual(roots[1].agent_id, 'A2')
-            kinds = [getattr(r, 'kind', None) for r in roots]
-            self.assertNotIn('subagent', kinds[2:])
-
-    def test_tree_roots_brackets_orphan_block_with_meta_dividers(self):
-        # A session WITH orphaned subagents brackets the orphan block:
-        # ``--- Subagents:`` (meta) → orphan rows → ``--- Session:``
-        # (meta) → the turn/span umbrellas. Both dividers are meta rows
-        # with session-namespaced, stable ids.
-        import tempfile
-        with tempfile.TemporaryDirectory() as tmp:
-            sess = self._build_fixture(tmp, [
-                ('A1', 'general-purpose', 'wired one',   True),
-                ('A2', 'general-purpose', 'orphan one',  False),
-                ('A3', 'general-purpose', 'orphan two',  False),
-            ])
-            self.r._TREE_CACHE.clear()
-            roots = self.r._list_tree_roots(sess)
-            # [subagents-sep, A2, A3, session-sep, <umbrellas...>].
-            self.assertTrue(getattr(roots[0], 'meta', False))
-            self.assertEqual(roots[0].id, ('sep', sess, 'subagents'))
-            self.assertEqual(roots[0].title, '--- Subagents:')
-            self.assertEqual(getattr(roots[1], 'kind', None), 'subagent')
-            self.assertEqual(getattr(roots[2], 'kind', None), 'subagent')
-            self.assertEqual({roots[1].agent_id, roots[2].agent_id},
-                             {'A2', 'A3'})
-            self.assertTrue(getattr(roots[3], 'meta', False))
-            self.assertEqual(roots[3].id, ('sep', sess, 'session'))
-            self.assertEqual(roots[3].title, '--- Session:')
+            self.assertEqual(
+                [getattr(r, 'kind', None) for r in roots[1:4]],
+                ['subagent'] * 3)
+            self.assertEqual([r.agent_id for r in roots[1:4]],
+                             ['A1', 'A2', 'A3'])
+            self.assertTrue(getattr(roots[4], 'meta', False))
+            self.assertEqual(roots[4].id, ('sep', sess, 'session'))
+            self.assertEqual(roots[4].title, '--- Session:')
             # Everything after the session divider is a turn/span
             # umbrella — never a subagent or a meta divider.
-            tail_kinds = [getattr(r, 'kind', None) for r in roots[4:]]
+            tail_kinds = [getattr(r, 'kind', None) for r in roots[5:]]
             self.assertNotIn('subagent', tail_kinds)
-            self.assertTrue(roots[4:])  # at least one umbrella present
+            self.assertTrue(roots[5:])  # at least one umbrella present
             self.assertFalse(any(getattr(r, 'meta', False)
-                                 for r in roots[4:]))
+                                 for r in roots[5:]))
 
-    def test_tree_roots_no_dividers_without_orphans(self):
-        # A session whose subagents are all wired (or has none) renders
-        # exactly as before — no meta dividers at all.
+    def test_linked_order_follows_dispatch_not_mtime(self):
+        # Two wired agents whose file mtimes are REVERSED relative to
+        # their dispatch order still list in dispatch order.
+        import tempfile
+        with tempfile.TemporaryDirectory() as tmp:
+            sess = self._build_fixture(tmp, [
+                ('A1', 'general-purpose', 'wired one',  True),
+                ('A2', 'general-purpose', 'wired two',  True),
+            ])
+            sub_dir = os.path.join(tmp, '-x', 'parent-sid', 'subagents')
+            os.utime(os.path.join(sub_dir, 'agent-A1.jsonl'),
+                     (2000000, 2000000))   # newest file, first dispatch
+            self.r._TREE_CACHE.clear()
+            td = self.r._scan_tree(sess)
+            rows = self.r._tree_subagents_for_session(sess, td)
+            self.assertEqual([r.agent_id for r in rows], ['A1', 'A2'])
+
+    def test_orphans_sort_by_mtime_after_linked(self):
+        import tempfile
+        with tempfile.TemporaryDirectory() as tmp:
+            sess = self._build_fixture(tmp, [
+                ('A1', 'general-purpose', 'orphan late',   False),
+                ('A2', 'general-purpose', 'orphan early',  False),
+                ('A3', 'general-purpose', 'wired one',     True),
+            ])
+            sub_dir = os.path.join(tmp, '-x', 'parent-sid', 'subagents')
+            os.utime(os.path.join(sub_dir, 'agent-A1.jsonl'),
+                     (2000000, 2000000))
+            self.r._TREE_CACHE.clear()
+            td = self.r._scan_tree(sess)
+            rows = self.r._tree_subagents_for_session(sess, td)
+            # Linked first, then orphans in mtime order.
+            self.assertEqual([r.agent_id for r in rows],
+                             ['A3', 'A2', 'A1'])
+
+    def test_tree_roots_dividers_unconditional_with_subagents(self):
+        # A session whose subagents are all wired still gets the top
+        # block + dividers.
         import tempfile
         with tempfile.TemporaryDirectory() as tmp:
             sess = self._build_fixture(tmp, [
@@ -5959,9 +6010,44 @@ class TestOrphanSubagents(unittest.TestCase):
             ])
             self.r._TREE_CACHE.clear()
             roots = self.r._list_tree_roots(sess)
+            self.assertEqual(roots[0].title, '--- Subagents:')
+            self.assertEqual([r.agent_id for r in roots[1:3]],
+                             ['A1', 'A2'])
+            self.assertEqual(roots[3].title, '--- Session:')
+
+    def test_tree_roots_no_dividers_without_subagents(self):
+        # A session with no subagents renders exactly as before — no
+        # meta dividers at all.
+        import json as _json
+        import tempfile
+        with tempfile.TemporaryDirectory() as tmp:
+            sess = self._build_fixture(tmp, [])
+            with open(sess, 'w') as f:
+                f.write(_json.dumps({
+                    'type': 'user', 'uuid': 'u1',
+                    'message': {'role': 'user', 'content': 'go'},
+                }) + '\n')
+            self.r._TREE_CACHE.clear()
+            roots = self.r._list_tree_roots(sess)
+            self.assertTrue(roots)
             self.assertFalse(any(getattr(r, 'meta', False) for r in roots))
             self.assertFalse(any(getattr(r, 'kind', None) == 'subagent'
                                  for r in roots))
+
+    def test_tool_umbrella_has_no_nested_subagent(self):
+        # The <tool:Agent> umbrella keeps the dispatch pair (tool_use +
+        # tool_result) but no longer nests the subagent's subtree.
+        import tempfile
+        with tempfile.TemporaryDirectory() as tmp:
+            sess = self._build_fixture(tmp, [
+                ('A1', 'general-purpose', 'wired one', True),
+            ])
+            self.r._TREE_CACHE.clear()
+            kids = self.r._list_tool_children(sess, 1)
+            self.assertEqual([it.id for it in kids],
+                             [('msg', sess, 1), ('msg', sess, 2)])
+            self.assertNotIn('subagent',
+                             [getattr(it, 'kind', None) for it in kids])
 
 
 class TestRowBgForKind(unittest.TestCase):
@@ -6494,20 +6580,16 @@ class TestVoiceOnlyFilter(unittest.TestCase):
         finally:
             os.unlink(path)
 
-    def test_subagent_pseudo_item_always_visible(self):
-        # Even with the filter on, subagent umbrellas keep hidden=False.
+    def test_subagent_row_always_visible(self):
+        # Even with the filter on, subagent rows pass the filter.
         path = self._write_jsonl([
             {'type': 'user', 'uuid': 'u1',
              'message': {'role': 'user', 'content': 'hi'}},
         ])
         try:
             self.r._DETAIL_LEVEL = 1
-            # Use a fake agent path the helper will stat (file doesn't
-            # need to exist — _subagent_pseudo_item catches OSError).
-            item = self.r._subagent_pseudo_item(
-                path, 'AID-1', '/nonexistent/agent.jsonl',
-            )
-            self.assertFalse(item.hidden)
+            self.assertTrue(
+                self.r._passes_filter(('agent', path, 'AID-1')))
         finally:
             os.unlink(path)
 
@@ -9624,10 +9706,12 @@ class TestInProcessTeammates(unittest.TestCase):
         self.assertEqual(td.agent_link['t1']['agent_id'],
                          'aw-worker-0123abcd')
         self.assertEqual(td.agent_link['t1']['agent_path'], p)
-        # The filename-derived key makes the orphan diff match the row
-        # listing and places the agent inline in tree mode.
-        self.assertEqual(
-            self.r._orphan_subagents_for_session(lead, td), [])
+        # The filename-derived key makes the top-block diff match the
+        # row listing — no orphan tag on the linked agent.
+        rows = self.r._tree_subagents_for_session(lead, td)
+        self.assertEqual([it.agent_id for it in rows],
+                         ['aw-worker-0123abcd'])
+        self.assertFalse(getattr(rows[0], 'is_orphan', False))
         self.assertIn('aw-worker-0123abcd', td.agent_to_assistant_line)
 
     def test_inprocess_team_mismatch_stays_orphan(self):
@@ -9638,9 +9722,10 @@ class TestInProcessTeammates(unittest.TestCase):
                           meta=self._meta(team='session-99999999'))
         td = self.r._scan_tree(lead)
         self.assertNotIn('t1', td.agent_link)
-        orphans = self.r._orphan_subagents_for_session(lead, td)
-        self.assertEqual([it.agent_id for it in orphans],
-                         ['aw-worker-0123abcd'])
+        rows = self.r._tree_subagents_for_session(lead, td)
+        self.assertEqual(
+            [it.agent_id for it in rows if getattr(it, 'is_orphan', False)],
+            ['aw-worker-0123abcd'])
 
     def test_inprocess_name_reuse_team_disambiguates(self):
         # Two teams reused the name; the NEWER file belongs to the other
@@ -9821,7 +9906,10 @@ class TestPostTurnContinuations(unittest.TestCase):
         self._write_agent('aw-worker-0123abcd')
         td = self.r._scan_tree(lead)
         self.assertIn('t1', td.agent_link)
-        self.assertEqual(self.r._orphan_subagents_for_session(lead, td), [])
+        self.assertFalse([
+            it.agent_id
+            for it in self.r._tree_subagents_for_session(lead, td)
+            if getattr(it, 'is_orphan', False)])
         self.assertEqual(td.parent_id_of[2], ('tool', lead, 2))
         self.assertEqual(td.parent_id_of[3], ('tool', lead, 2))
         self.assertEqual(td.tool_to_turn_root_line[2], 0)
@@ -9840,7 +9928,10 @@ class TestPostTurnContinuations(unittest.TestCase):
         self._write_agent('aw-worker-0123abcd')
         td = self.r._scan_tree(lead)
         self.assertIn('t1', td.agent_link)
-        self.assertEqual(self.r._orphan_subagents_for_session(lead, td), [])
+        self.assertFalse([
+            it.agent_id
+            for it in self.r._tree_subagents_for_session(lead, td)
+            if getattr(it, 'is_orphan', False)])
         self.assertEqual(td.parent_id_of[3], ('tool', lead, 1))
         self.assertEqual([it['kind'] for it in td.roots_in_order],
                          ['turn'])
@@ -9855,7 +9946,10 @@ class TestPostTurnContinuations(unittest.TestCase):
         self._write_agent('aw-worker-0123abcd')
         td = self.r._scan_tree(lead)
         self.assertIn('t1', td.agent_link)
-        self.assertEqual(self.r._orphan_subagents_for_session(lead, td), [])
+        self.assertFalse([
+            it.agent_id
+            for it in self.r._tree_subagents_for_session(lead, td)
+            if getattr(it, 'is_orphan', False)])
         self.assertEqual(td.parent_id_of[0], ('span', lead, 0))
         self.assertEqual(td.parent_id_of[1], ('span', lead, 0))
         self.assertEqual([it['kind'] for it in td.roots_in_order],
@@ -11202,18 +11296,15 @@ class TestBoundaryMigration(unittest.TestCase):
     # ---- (a) boundary set on the migrated rows -------------------------
 
     def test_subagent_group_rows_are_boundary(self):
-        # Both ('agent', …) builders (the per-session lister and the inline
-        # pseudo-item) and orphan rows (which delegate to the lister) must
-        # set boundary=True so the migrated predicate matches them.
+        # The ('agent', …) builder — the per-session lister, which the
+        # tree-mode top block delegates to — must set boundary=True so
+        # the migrated predicate matches its rows.
         import tempfile
         with tempfile.TemporaryDirectory() as tmp:
             sess, agent_path = self._project_with_subagent(tmp)
             (sub,) = self.r._list_subagents_for_session(sess)
             self.assertTrue(sub.boundary)
             self.assertEqual(sub.id[0], 'agent')
-            pseudo = self.r._subagent_pseudo_item(sess, 'A1', agent_path)
-            self.assertTrue(pseudo.boundary)
-            self.assertEqual(pseudo.id[0], 'agent')
 
     def test_session_rows_are_boundary(self):
         # Bare .jsonl session rows in _list_sessions carry boundary=True.
