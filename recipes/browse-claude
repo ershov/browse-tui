@@ -6460,6 +6460,30 @@ def _last_voice_id(jsonl_path):
     return ('msg', jsonl_path, n)
 
 
+def _last_visible_voice_id(jsonl_path):
+    """Newest voice record VISIBLE at the current detail level, or None.
+
+    The absolute latest voice can be filtered out — a mid-turn assistant
+    text at the summary level — and ``cursor_to`` silently no-ops on
+    hidden rows, so the cursor-on-open jump must target a row the filter
+    shows. Walks back from ``td.latest_voice_line`` to the newest voice
+    that passes; when NO voice is visible, returns the absolute latest
+    so the caller's chain trim lands on its nearest visible ancestor
+    (the wrapping ``<prompt>``).
+    """
+    td = _scan_tree(jsonl_path)
+    n = td.latest_voice_line
+    if n is None:
+        return None
+    for i in range(n, -1, -1):
+        rec = td.records[i]
+        if not (isinstance(rec, dict) and _is_voice(rec)):
+            continue
+        if _passes_filter(('msg', jsonl_path, i), td):
+            return ('msg', jsonl_path, i)
+    return ('msg', jsonl_path, n)
+
+
 def _list_tree_roots(jsonl_path):
     """Tree-mode listing for a session: root-level rows in file order.
 
@@ -8206,8 +8230,10 @@ def _focus_latest_voice_when_ready(b, target_jsonl):
          off the scope_root row, leave them alone — they navigated
          while the file was loading and a surprise jump would be
          disorienting.
-      3. Otherwise, walk the ancestor chain via
-         ``_chain_expand_then_cursor`` to land on the latest voice.
+      3. Otherwise, jump (via ``_jump_to_link``) to the latest voice
+         VISIBLE at the current detail level — the absolute latest can
+         be a filter-hidden mid-turn text, on which ``cursor_to`` would
+         silently no-op and strand the cursor on the scope row.
 
     The cancel-on-user-moved check uses the live cursor instead of an
     ``on_cursor_change`` subscription: the framework places the cursor
@@ -8218,7 +8244,7 @@ def _focus_latest_voice_when_ready(b, target_jsonl):
     scope_id = ('session', target_jsonl)
 
     def _fire():
-        last_id = _last_voice_id(target_jsonl)
+        last_id = _last_visible_voice_id(target_jsonl)
         if not last_id:
             return
         # Cancel if the user has navigated since startup. Post scope-
@@ -8230,13 +8256,11 @@ def _focus_latest_voice_when_ready(b, target_jsonl):
         cur = state.cursor
         if not (0 <= cur < len(vis) and vis[cur].item.id == scope_id):
             return
-        # Tree mode: walk the ancestor chain so each prompt umbrella
-        # is expanded before the final cursor_to lands. Flat mode: the
-        # leaf is already directly visible under the scope_root, so the
-        # ancestor list is empty and the chain collapses to one
-        # cursor_to.
-        ancestors = _ancestor_ids_for(last_id) if _TREE_MODE else []
-        _chain_expand_then_cursor(b, ancestors, last_id)
+        # ``_jump_to_link`` owns the reveal: ancestor chain in tree
+        # mode (empty in flat mode, where the leaf sits under the
+        # scope_root), plus the trim to the nearest filter-visible row
+        # for the all-voices-hidden fallback.
+        _jump_to_link(b, last_id)
     # Claim the scope_root's cursor-on-open landing so the generic
     # ``on_expand`` jump steps aside for the deeper focus below (#720).
     # Registered before the owning ``expand`` fires its hook.

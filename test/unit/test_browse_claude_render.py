@@ -4802,6 +4802,94 @@ class TestSubagentUmbrellaVoice(unittest.TestCase):
             finally:
                 self.r.visible_items = saved_vi
 
+    def test_focus_targets_latest_visible_voice_when_latest_hidden(self):
+        # Startup focus on a transcript whose ABSOLUTE latest voice is
+        # a mid-turn assistant text (hidden at the summary level): the
+        # jump must target the newest VISIBLE voice — cursor_to would
+        # silently no-op on the hidden row and strand the cursor on
+        # the scope row (the 29/180 real-session bug).
+        import tempfile
+        import json as _json
+        with tempfile.TemporaryDirectory() as tmp:
+            sess = os.path.join(tmp, 's.jsonl')
+            recs = [
+                {'type': 'user', 'uuid': 'u1',
+                 'message': {'role': 'user', 'content': 'q'}},
+                {'type': 'assistant', 'uuid': 'a1', 'parentUuid': 'u1',
+                 'message': {'role': 'assistant',
+                             'stop_reason': 'end_turn',
+                             'content': [{'type': 'text', 'text': 'done'}]}},
+                {'type': 'assistant', 'uuid': 'a2', 'parentUuid': 'a1',
+                 'message': {'role': 'assistant',
+                             'stop_reason': 'tool_use',
+                             'content': [{'type': 'text', 'text': 'mid'}]}},
+            ]
+            with open(sess, 'w') as f:
+                for r in recs:
+                    f.write(_json.dumps(r) + '\n')
+            self.r._TREE_CACHE.clear()
+
+            calls = {'cursor_to': [], 'expand_chain': []}
+
+            class _ScopeRowItem:
+                def __init__(self, id_):
+                    self.id = id_
+
+            class _ScopeRowEntry:
+                kind = 'normal'
+
+                def __init__(self, id_):
+                    self.item = _ScopeRowItem(id_)
+
+            class _State:
+                cursor = 0
+                expanded = set()
+
+            class _Pending:
+                def __init__(self):
+                    self._cb = None
+
+                def then(self, cb):
+                    self._cb = cb
+                    return self
+
+                def fire(self):
+                    if self._cb:
+                        self._cb()
+
+            class _FakeBrowser:
+                def __init__(self):
+                    self._state = _State()
+                    self._pendings = []
+
+                def expand(self, _id, autoscroll=False):
+                    p = _Pending()
+                    self._pendings.append(p)
+                    calls['expand_chain'].append(_id)
+                    return p
+
+                def cursor_to(self, _id):
+                    calls['cursor_to'].append(_id)
+
+            saved_vi = self.r.visible_items
+            saved_lvl = self.r._DETAIL_LEVEL
+            self.r.visible_items = (
+                lambda state: [_ScopeRowEntry(('session', sess))])
+            try:
+                self.r._DETAIL_LEVEL = 1
+                self.assertEqual(self.r._last_voice_id(sess),
+                                 ('msg', sess, 2))   # hidden at L1
+                b = _FakeBrowser()
+                self.r._focus_latest_voice_when_ready(b, sess)
+                fired = 0
+                while fired < len(b._pendings) and not calls['cursor_to']:
+                    b._pendings[fired].fire()
+                    fired += 1
+                self.assertEqual(calls['cursor_to'], [('msg', sess, 1)])
+            finally:
+                self.r.visible_items = saved_vi
+                self.r._DETAIL_LEVEL = saved_lvl
+
     def test_focus_latest_voice_when_ready_cancels_if_cursor_moved(self):
         # If the user has navigated off scope_root before the
         # deferred fire, the jump cancels — no cursor_to.
@@ -5269,6 +5357,74 @@ class TestSubagentUmbrellaVoice(unittest.TestCase):
             td = self.r._scan_tree(sess)
             self.assertIsNone(td.latest_voice_line)
             self.assertIsNone(self.r._last_voice_id(sess))
+
+    def _visible_voice_fixture(self, tmp):
+        """user prompt (L1) / assistant end_turn (L1) / mid-turn text (L2)."""
+        import json as _json
+        sess = os.path.join(tmp, 's.jsonl')
+        recs = [
+            {'type': 'user', 'uuid': 'u1',
+             'message': {'role': 'user', 'content': 'q'}},
+            {'type': 'assistant', 'uuid': 'a1', 'parentUuid': 'u1',
+             'message': {'role': 'assistant', 'stop_reason': 'end_turn',
+                         'content': [{'type': 'text', 'text': 'done'}]}},
+            {'type': 'assistant', 'uuid': 'a2', 'parentUuid': 'a1',
+             'message': {'role': 'assistant', 'stop_reason': 'tool_use',
+                         'content': [{'type': 'text',
+                                      'text': 'running commentary'}]}},
+        ]
+        with open(sess, 'w') as f:
+            for r in recs:
+                f.write(_json.dumps(r) + '\n')
+        self.r._TREE_CACHE.clear()
+        return sess
+
+    def test_last_visible_voice_skips_filtered_latest(self):
+        # The absolute latest voice is a mid-turn text (voice tier,
+        # hidden at the summary level) — the visible-voice walk lands
+        # on the newest voice the filter shows.
+        import tempfile
+        with tempfile.TemporaryDirectory() as tmp:
+            sess = self._visible_voice_fixture(tmp)
+            saved = self.r._DETAIL_LEVEL
+            try:
+                self.r._DETAIL_LEVEL = 1
+                self.assertEqual(self.r._last_voice_id(sess),
+                                 ('msg', sess, 2))
+                self.assertEqual(self.r._last_visible_voice_id(sess),
+                                 ('msg', sess, 1))
+                # At the voice tier the mid-turn text is visible again.
+                self.r._DETAIL_LEVEL = 2
+                self.assertEqual(self.r._last_visible_voice_id(sess),
+                                 ('msg', sess, 2))
+            finally:
+                self.r._DETAIL_LEVEL = saved
+
+    def test_last_visible_voice_falls_back_to_absolute_latest(self):
+        # Every voice hidden at the current level: return the absolute
+        # latest so the jump's chain trim can land on its visible
+        # ancestor umbrella instead of nothing.
+        import tempfile
+        import json as _json
+        with tempfile.TemporaryDirectory() as tmp:
+            sess = os.path.join(tmp, 's.jsonl')
+            recs = [
+                # isMeta voice: counted by the scan's latest-voice
+                # tracking but level 6 — hidden at every lean level.
+                {'type': 'user', 'uuid': 'u1', 'isMeta': True,
+                 'message': {'role': 'user', 'content': 'injected ctx'}},
+            ]
+            with open(sess, 'w') as f:
+                for r in recs:
+                    f.write(_json.dumps(r) + '\n')
+            self.r._TREE_CACHE.clear()
+            saved = self.r._DETAIL_LEVEL
+            try:
+                self.r._DETAIL_LEVEL = 1
+                self.assertEqual(self.r._last_visible_voice_id(sess),
+                                 ('msg', sess, 0))
+            finally:
+                self.r._DETAIL_LEVEL = saved
 
     def test_flush_refreshes_hidden_against_live_filter(self):
         # #4 follow-up: the umbrella generator captures each child's
