@@ -37,19 +37,24 @@ which it shows:
 - `1` `summary` — the skeleton: user prompts (including ones you queued
   while it worked) and the agent's `end_turn` responses. The default —
   what you asked and what it concluded.
-- `2` `voice` — all speech: adds intermediate assistant text,
-  `AskUserQuestion`, and inter-agent messages.
+- `2` `voice` — all speech: adds intermediate assistant text, readable
+  thinking (running commentary, marked `🧠 thinking:`),
+  `AskUserQuestion`, inter-agent messages, and the compaction boundary.
 - `3` `edits` — adds the file-mutating tool calls (`Edit` / `Write` /
   `NotebookEdit` / `MultiEdit`): review what changed without the noise.
-- `4` `tools` — adds every other tool call / result, thinking, and the
-  inline turn-duration / api-error framing.
+- `4` `tools` — adds every other tool call / result and the inline
+  turn-duration / api-error framing.
 - `5` `detailed` — adds a curated set of useful metadata (summaries,
   prompts, PR links, worktree state, tags, local commands, attachments…).
-- `6` `all` — every record, including bookkeeping and unknown kinds.
+- `6` `all` — every record kind the recipe knows about, including
+  bookkeeping.
+- `7` `unknown` — adds records whose type / subtype / attachment type
+  the recipe does not recognise: a maintenance view for spotting new
+  record kinds.
 
-Set the boot level with `--detail LEVEL` (a number `1`-`6` or the word
-`summary` / `voice` / `edits` / `tools` / `detailed` / `all`); change it
-live with the `1`-`6` keys.
+Set the boot level with `--detail LEVEL` (a number `1`-`7` or the word
+`summary` / `voice` / `edits` / `tools` / `detailed` / `all` /
+`unknown`); change it live with the `1`-`7` keys.
 
 **Subagents.** In tree mode (the default) every subagent the session
 dispatched — Agent/Task subagents and in-process teammates alike — lists
@@ -74,7 +79,7 @@ the same jump rows also lead the row's context menu (`\` / F1 /
 right-click). A target hidden by the active detail level lands on its
 nearest visible row instead. `Enter` on an unmarked row does nothing.
 
-Keys: `Enter` follow a `[↗]` cross-link, `1`-`6` set the detail level,
+Keys: `Enter` follow a `[↗]` cross-link, `1`-`7` set the detail level,
 `e` / `o` open in `$EDITOR`, `y` show id (debugging).
 
 **Source:** [`recipes/browse-claude`](../../recipes/browse-claude)

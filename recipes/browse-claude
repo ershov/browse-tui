@@ -1821,6 +1821,10 @@ def _is_voice(obj):
     half: the assistant's tool_use *is* the message, so it counts as
     voice. Its ``{success, message}`` delivery ack is just a status
     receipt, not voice.
+
+    An assistant ``thinking`` part with readable text is running
+    commentary (mid-turn voice) and counts too; signature-only
+    (redacted) thinking does not — see ``_is_empty_thinking_only``.
     """
     t = obj.get('type')
     if t == 'queue-operation':
@@ -1837,6 +1841,9 @@ def _is_voice(obj):
                 continue
             pt = p.get('type')
             if pt == 'text' and (p.get('text') or '').strip():
+                return True
+            if (pt == 'thinking' and t == 'assistant'
+                    and (p.get('thinking') or '').strip()):
                 return True
             if pt == 'tool_use' and p.get('name') in (
                     'AskUserQuestion', 'SendMessage'):
@@ -1861,7 +1868,7 @@ _LIVE_EXTRAS = frozenset([
 # Plain strings match a record ``type`` outright; tuples match (type,
 # subtype) for the finer-grained ``system`` / ``attachment`` families.
 # Anything not listed here (and not caught by an earlier tier) falls
-# through to level 6 (all).
+# through to level 6 (recognised noise) or 7 (unknown).
 _L3_USEFUL = frozenset([
     'summary',
     'task-summary',
@@ -1872,12 +1879,61 @@ _L3_USEFUL = frozenset([
     'tag',
     'queue-operation',
     'marble-origami-commit',
+    'cost-state',
     ('system', 'local_command'),
+    ('system', 'model_refusal_fallback'),
+    ('system', 'away_summary'),
+    ('system', 'agents_killed'),
     ('attachment', 'file'),
     ('attachment', 'queued_command'),
     ('attachment', 'hook_success'),
+    ('attachment', 'hook_cancelled'),
     ('attachment', 'diagnostics'),
+    ('attachment', 'invoked_skills'),
 ])
+
+
+# Recognised-but-noise record kinds, pinned at level 6 (all). Level 7
+# (unknown) is a maintenance view: ``_record_min_level``'s fallthrough
+# returns 7 only for a type / system subtype / attachment type the
+# recipe does not recognise anywhere — neither in a tier above, nor
+# here, nor in ``_ATTACH_FORMATTERS`` / ``_METADATA_TYPES``.
+_KNOWN_SYSTEM_NOISE = frozenset([
+    'stop_hook_summary',
+    'scheduled_task_fire',
+    'informational',
+])
+_KNOWN_ATTACH_NOISE = frozenset([
+    'total_tokens_reminder',
+    'agent_listing_delta',
+    'batching_reminder_sent',
+    'bash_output_audience_note',
+    'nested_memory',
+    'read_truncation_notice',
+    'auto_mode',
+    'plan_mode',
+    'silent_turn_reminder',
+    'already_read_file',
+])
+_KNOWN_TYPE_NOISE = frozenset(['atis-latch', 'file-history-delta'])
+
+
+def _thinking_text(rec):
+    """Text of the record's first non-empty ``thinking`` part, or ``''``.
+
+    Signature-only (redacted) thinking parts carry a ``signature`` but
+    no readable text and don't count — see ``_is_empty_thinking_only``.
+    """
+    msg = rec.get('message') if isinstance(rec.get('message'), dict) else {}
+    content = msg.get('content')
+    if not isinstance(content, list):
+        return ''
+    for p in content:
+        if isinstance(p, dict) and p.get('type') == 'thinking':
+            text = (p.get('thinking') or '').strip()
+            if text:
+                return text
+    return ''
 
 
 def _is_empty_thinking_only(rec):
@@ -1889,8 +1945,8 @@ def _is_empty_thinking_only(rec):
     thinking, so it summarises as the bare ``<N parts>`` shape — so
     ``_record_min_level`` sinks it to the ``all`` (6) tier. A thinking
     part with actual text, or any other part (tool_use / tool_result /
-    text) alongside, fails the test and keeps the record at level 4
-    (or 3 for an edit/write tool).
+    text) alongside, fails the test — readable thinking is voice
+    (level 2), other machinery stays at level 4 (3 for an edit tool).
     """
     msg = rec.get('message') if isinstance(rec.get('message'), dict) else {}
     content = msg.get('content')
@@ -1923,6 +1979,25 @@ def _is_end_turn(rec):
     return isinstance(msg, dict) and msg.get('stop_reason') == 'end_turn'
 
 
+def _has_spoken_text(rec):
+    """True iff the record carries actual spoken words — a non-empty
+    string content or ``text`` part (thinking / tool parts don't count).
+    Gates the end_turn → summary promotion: a turn that concludes on a
+    thinking-only record has no final spoken response to skim.
+    """
+    msg = rec.get('message') if isinstance(rec.get('message'), dict) else {}
+    content = msg.get('content', '')
+    if isinstance(content, str):
+        return bool(content.strip())
+    if isinstance(content, list):
+        return any(
+            isinstance(p, dict) and p.get('type') == 'text'
+            and (p.get('text') or '').strip()
+            for p in content
+        )
+    return False
+
+
 def _is_edit_tool_record(rec):
     """True iff this assistant record carries a tool_use for a
     file-mutating tool (``_EDIT_TOOLS``) — drives the ``edits`` tier."""
@@ -1940,27 +2015,32 @@ def _is_edit_tool_record(rec):
 
 
 def _record_min_level(rec):
-    """Minimum detail level at which ``rec`` becomes visible (1-6).
+    """Minimum detail level at which ``rec`` becomes visible (1-7).
 
     Whitelist semantics: only records we recognise are promoted to a
-    lower (more-visible) tier; anything unmatched falls through to 6 so
-    new/unknown record kinds surface only at level 6 (all) but stay out
-    of the leaner views.
+    lower (more-visible) tier; recognised noise is pinned at 6 (all);
+    a type / subtype / attachment type the recipe does not recognise
+    at all falls through to 7 (unknown) — a maintenance view that
+    surfaces only genuinely unrecognised record kinds.
 
       * inbound agent voice (worker reply / peer message,
         delivered or queued)                              → 2
       * ``isMeta`` (injected context; never lived)        → 6
       * turn-root prompt / queued ``enqueue`` / assistant
-        ``end_turn`` response                              → 1  (summary)
-      * any other voice (``_is_voice``)                    → 2  (voice)
+        ``end_turn`` response with spoken text             → 1  (summary)
+      * any other voice (``_is_voice``: text or readable
+        thinking)                                          → 2  (voice)
       * empty (signature-only) thinking-only assistant     → 6
       * an Edit/Write/NotebookEdit/MultiEdit tool record   → 3  (edits)
       * other user / assistant machinery (tool_use,
-        tool_result, thinking-only with text)              → 4  (tools)
+        tool_result)                                       → 4  (tools)
+      * ``system/compact_boundary`` (structural marker)    → 2
       * ``_LIVE_EXTRAS`` framing (system turn_duration /
         api_error)                                         → 4
       * ``_L3_USEFUL`` curated metadata                    → 5  (detailed)
-      * otherwise                                          → 6  (all)
+      * recognised noise (``_KNOWN_*_NOISE``,
+        ``_ATTACH_FORMATTERS``, ``_METADATA_TYPES``)       → 6  (all)
+      * otherwise                                          → 7  (unknown)
     """
     if not isinstance(rec, dict):
         return 6
@@ -1977,12 +2057,16 @@ def _record_min_level(rec):
         return 6
     if _is_voice(rec):
         # The conversation skeleton — the user's prompt and the agent's
-        # final (end_turn) response — is the summary tier; intermediate
-        # voice (running commentary, AskUserQuestion, inter-agent) sits
-        # one level up. A queued ``enqueue`` is a prompt the user typed
-        # while Claude was busy, so it belongs with the prompts (its
-        # ``popAll`` consumption echo stays at voice to avoid a dupe).
-        if (_is_turn_root(rec) or _is_end_turn(rec)
+        # final (end_turn) SPOKEN response — is the summary tier;
+        # intermediate voice (running commentary incl. readable
+        # thinking, AskUserQuestion, inter-agent) sits one level up. An
+        # end_turn record that is voice only through its thinking has
+        # no final spoken words, so it stays at voice. A queued
+        # ``enqueue`` is a prompt the user typed while Claude was busy,
+        # so it belongs with the prompts (its ``popAll`` consumption
+        # echo stays at voice to avoid a dupe).
+        if (_is_turn_root(rec)
+                or (_is_end_turn(rec) and _has_spoken_text(rec))
                 or (rec.get('type') == 'queue-operation'
                     and rec.get('operation') == 'enqueue')):
             return 1
@@ -2003,20 +2087,28 @@ def _record_min_level(rec):
         return 4
     if t == 'system':
         sub = rec.get('subtype')
+        # "Conversation compacted" is a structural boundary the reader
+        # should see even when skimming voice.
+        if sub == 'compact_boundary':
+            return 2
         if (t, sub) in _LIVE_EXTRAS:
             return 4
         if (t, sub) in _L3_USEFUL:
             return 5
-        return 6
+        return 6 if sub in _KNOWN_SYSTEM_NOISE else 7
     if t == 'attachment':
         a = rec.get('attachment')
         sub = a.get('type') if isinstance(a, dict) else None
         if (t, sub) in _L3_USEFUL:
             return 5
-        return 6
+        if sub in _ATTACH_FORMATTERS or sub in _KNOWN_ATTACH_NOISE:
+            return 6
+        return 7
     if t in _L3_USEFUL:
         return 5
-    return 6
+    if t in _METADATA_TYPES or t in _KNOWN_TYPE_NOISE:
+        return 6
+    return 7
 
 
 def _passes_filter(item_id, td=None):
@@ -2045,7 +2137,7 @@ def _passes_filter(item_id, td=None):
                                     error rows and ``('trunc', …)``
                                     fillers stay visible)
     """
-    if _DETAIL_LEVEL >= 6:
+    if _DETAIL_LEVEL >= 7:
         return True
     if not isinstance(item_id, tuple) or not item_id:
         return True
@@ -2123,9 +2215,10 @@ def _row_tag(kind, rec):
 
     Adds ``· <attributionAgent>`` to assistant rows inside subagent
     transcripts so the user can see which sub-type produced the turn
-    (e.g. ``assistant · general-purpose``), and ``· end_turn`` to the
+    (e.g. ``assistant · general-purpose``), ``· end_turn`` to the
     turn-concluding responses so the final word(s) of a turn stand out
-    in the row list. Other record kinds get the bare kind label.
+    in the row list, and ``· thinking`` to running-commentary rows
+    (readable thinking). Other record kinds get the bare kind label.
     """
     tag = kind
     if kind == 'assistant' and isinstance(rec, dict):
@@ -2134,6 +2227,8 @@ def _row_tag(kind, rec):
             tag = f'{tag} · {attr}'
         if _is_end_turn(rec):
             tag = f'{tag} · end_turn'
+        elif _thinking_text(rec):
+            tag = f'{tag} · thinking'
     return tag
 
 
@@ -2283,6 +2378,12 @@ def _summarise_message(obj):
         any_text = any(isinstance(p, dict) and p.get('type') == 'text'
                        and (p.get('text') or '').strip()
                        for p in content)
+        # Readable thinking with no spoken text → running commentary;
+        # surface it under the thinking marker (spoken text wins).
+        if not any_text:
+            think = _thinking_text(obj)
+            if think:
+                return f'🧠 thinking: {_trim(think, 5000)}'
         if only_tool and not any_text:
             tu = only_tool[0]
             name = tu.get('name', '?')
@@ -5336,9 +5437,10 @@ _SCAN_LOCKS_LOCK = threading.Lock()
 _TREE_MODE = True  # default; --no-tree CLI flag or 't' action flips it.
 # Detail level: a record is visible iff its *minimum* level (see
 # ``_record_min_level``) is <= this. 1=summary, 2=voice, 3=edits,
-# 4=tools, 5=detailed, 6=all. Default 1 (summary — user prompts +
-# end_turn responses). Set by the --detail CLI flag or changed live
-# with the '1'-'6' key bindings.
+# 4=tools, 5=detailed, 6=all (every known kind), 7=unknown (adds
+# unrecognised record kinds — a maintenance view). Default 1 (summary
+# — user prompts + end_turn responses). Set by the --detail CLI flag
+# or changed live with the '1'-'7' key bindings.
 _DETAIL_LEVEL = 1
 
 
@@ -8634,25 +8736,26 @@ def _action_toggle_tree(ctx):
 
 
 _DETAIL_LEVEL_NAMES = {1: 'summary', 2: 'voice', 3: 'edits',
-                       4: 'tools', 5: 'detailed', 6: 'all'}
+                       4: 'tools', 5: 'detailed', 6: 'all',
+                       7: 'unknown'}
 # Word aliases for the ``--detail`` CLI flag, derived from the level
 # names so the two never drift (summary=1, voice=2, edits=3, tools=4,
-# detailed=5, all=6).
+# detailed=5, all=6, unknown=7).
 _DETAIL_LEVEL_ALIASES = {name: level for level, name in _DETAIL_LEVEL_NAMES.items()}
 
 
 def _parse_detail_level(raw):
-    """Convert a ``--detail`` value to a level int (1-6).
+    """Convert a ``--detail`` value to a level int (1-7).
 
-    Accepts the digits ``'1'``-``'6'`` and the word aliases
-    (``summary``/``voice``/``edits``/``tools``/``detailed``/``all``,
-    case-insensitively). Raises ``ValueError`` on anything else so
-    ``_pop_value`` surfaces the usage error to ``main``.
+    Accepts the digits ``'1'``-``'7'`` and the word aliases
+    (``summary``/``voice``/``edits``/``tools``/``detailed``/``all``/
+    ``unknown``, case-insensitively). Raises ``ValueError`` on anything
+    else so ``_pop_value`` surfaces the usage error to ``main``.
     """
     key = raw.strip().lower()
     if key in _DETAIL_LEVEL_ALIASES:
         return _DETAIL_LEVEL_ALIASES[key]
-    if key in ('1', '2', '3', '4', '5', '6'):
+    if key in ('1', '2', '3', '4', '5', '6', '7'):
         return int(key)
     raise ValueError(raw)
 
@@ -8660,7 +8763,7 @@ def _parse_detail_level(raw):
 def _set_detail_level(ctx, level):
     """Set the detail level absolutely and recompute row visibility.
 
-    Bound to the ``1``-``6`` keys (each an absolute setter, not a
+    Bound to the ``1``-``7`` keys (each an absolute setter, not a
     toggle). Sets ``_DETAIL_LEVEL``, then iterates every currently-
     loaded ``Item`` and emits a single ``mod(id, hidden=...)`` batch
     with one op per row whose target visibility differs from its
@@ -9194,11 +9297,13 @@ Usage: browse-claude [OPTIONS] [PROJECT]
   --tree          Show sessions as a tree, grouped by turn (default).
                   Subagents list in a top block, newest first.
   --no-tree       Show sessions as a flat reverse-time list.
-  --detail LEVEL  Detail level (default: 1). LEVEL is 1-6 or a word:
+  --detail LEVEL  Detail level (default: 1). LEVEL is 1-7 or a word:
                   1=summary (user prompts + end_turn responses),
                   2=voice (all speech), 3=edits (+ Edit/Write/NotebookEdit),
                   4=tools (+ all tool calls), 5=detailed (+ useful
-                  metadata), 6=all. Change it live with the '1'-'6' keys.
+                  metadata), 6=all (every known record kind),
+                  7=unknown (+ unrecognised record kinds — maintenance
+                  view). Change it live with the '1'-'7' keys.
   PROJECT         Project directory name under ~/.claude/projects/ to
                   drill into on launch. Ignored when --session / --pid /
                   --file is given.\
@@ -9219,8 +9324,8 @@ a transcript with Right/Alt-Down; preview shows the rendered turn.
   M       render the preview via $MDCAT / mdcat (external).
   J / K   jump cursor to next / previous user-or-assistant voice.
   t       toggle flat / tree view.
-  1-6     detail level: 1 summary, 2 voice, 3 edits, 4 tools,
-          5 detailed, 6 all.
+  1-7     detail level: 1 summary, 2 voice, 3 edits, 4 tools,
+          5 detailed, 6 all, 7 unknown (adds unrecognised kinds).
   Enter   follow a row's [↗] cross-link — every link is two-way: the
           spawn site pairs with the subagent row, message rows pair
           with their counterpart in the other transcript; a row with
@@ -9261,13 +9366,14 @@ def main():
         _TREE_MODE = False
 
     # Detail level: summary (level 1) by default. --detail LEVEL
-    # (or --detail=LEVEL) sets it, accepting the digits 1-6 or the word
-    # aliases summary/voice/edits/tools/detailed/all. An invalid value
-    # pops as the ``False`` sentinel — report it as a usage error.
+    # (or --detail=LEVEL) sets it, accepting the digits 1-7 or the word
+    # aliases summary/voice/edits/tools/detailed/all/unknown. An invalid
+    # value pops as the ``False`` sentinel — report it as a usage error.
     detail_arg = _pop_value('--detail', _parse_detail_level)
     if detail_arg is False:
-        print('browse-claude: --detail must be 1-6 or one of '
-              'summary/voice/edits/tools/detailed/all', file=sys.stderr)
+        print('browse-claude: --detail must be 1-7 or one of '
+              'summary/voice/edits/tools/detailed/all/unknown',
+              file=sys.stderr)
         sys.exit(2)
     if detail_arg is not None:
         _DETAIL_LEVEL = detail_arg
@@ -9407,14 +9513,16 @@ def main():
             Action('K',     'Jump to prev voice (user/asst)',  _action_prev_voice,  'none'),
             Action('t',     'Toggle flat / tree view',         _action_toggle_tree, 'none'),
             # Detail level (absolute setters): 1=summary, 2=voice,
-            # 3=edits, 4=tools, 5=detailed, 6=all. Each sets _DETAIL_LEVEL
-            # and recomputes row visibility (see _set_detail_level).
+            # 3=edits, 4=tools, 5=detailed, 6=all, 7=unknown. Each sets
+            # _DETAIL_LEVEL and recomputes row visibility (see
+            # _set_detail_level).
             Action('1',     'Detail: summary',                 lambda c: _set_detail_level(c, 1), 'none'),
             Action('2',     'Detail: voice',                   lambda c: _set_detail_level(c, 2), 'none'),
             Action('3',     'Detail: edits',                   lambda c: _set_detail_level(c, 3), 'none'),
             Action('4',     'Detail: tools',                   lambda c: _set_detail_level(c, 4), 'none'),
             Action('5',     'Detail: detailed',                lambda c: _set_detail_level(c, 5), 'none'),
             Action('6',     'Detail: all',                     lambda c: _set_detail_level(c, 6), 'none'),
+            Action('7',     'Detail: unknown',                 lambda c: _set_detail_level(c, 7), 'none'),
             # Right: the framework default expands a collapsed row; the
             # ``on_expand`` / ``on_children_loaded`` hooks then jump the
             # cursor to the latest voice (for every expansion source, not

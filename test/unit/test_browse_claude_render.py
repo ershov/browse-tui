@@ -1188,14 +1188,15 @@ class TestDetailLevelArg(unittest.TestCase):
         _sys.argv = saved
 
     def test_parse_numbers(self):
-        for raw, lvl in (('1', 1), ('2', 2), ('3', 3),
-                         ('4', 4), ('5', 5), ('6', 6)):
+        for raw, lvl in (('1', 1), ('2', 2), ('3', 3), ('4', 4),
+                         ('5', 5), ('6', 6), ('7', 7)):
             with self.subTest(raw=raw):
                 self.assertEqual(self.r._parse_detail_level(raw), lvl)
 
     def test_parse_word_aliases(self):
         for raw, lvl in (('summary', 1), ('voice', 2), ('edits', 3),
-                         ('tools', 4), ('detailed', 5), ('all', 6)):
+                         ('tools', 4), ('detailed', 5), ('all', 6),
+                         ('unknown', 7)):
             with self.subTest(raw=raw):
                 self.assertEqual(self.r._parse_detail_level(raw), lvl)
 
@@ -1204,7 +1205,7 @@ class TestDetailLevelArg(unittest.TestCase):
         self.assertEqual(self.r._parse_detail_level('  All '), 6)
 
     def test_parse_rejects_bad_values(self):
-        for bad in ('0', '7', '', 'foo', 'vo', '-1', '3.0'):
+        for bad in ('0', '8', '', 'foo', 'vo', '-1', '3.0'):
             with self.subTest(bad=bad):
                 with self.assertRaises(ValueError):
                     self.r._parse_detail_level(bad)
@@ -6753,13 +6754,28 @@ class TestRowBgForKind(unittest.TestCase):
         finally:
             os.unlink(path)
 
-    def test_assistant_thinking_only_has_no_bg(self):
-        # A thinking-only assistant step (no text yielded) isn't speech.
+    def test_assistant_readable_thinking_gets_bg(self):
+        # Readable thinking is running commentary (voice) → the
+        # assistant stripe.
         path = self._write([
             {'type': 'assistant',
              'message': {'role': 'assistant', 'content': [
                  {'type': 'thinking', 'thinking': 'pondering...',
                   'signature': 'sig'},
+             ]}},
+        ])
+        try:
+            items = self.r._list_messages(path)
+            self.assertEqual(getattr(items[0], 'row_bg', None), 235)
+        finally:
+            os.unlink(path)
+
+    def test_assistant_signature_only_thinking_has_no_bg(self):
+        # Signature-only thinking carries no readable text — not speech.
+        path = self._write([
+            {'type': 'assistant',
+             'message': {'role': 'assistant', 'content': [
+                 {'type': 'thinking', 'thinking': '', 'signature': 'sig'},
              ]}},
         ])
         try:
@@ -7535,10 +7551,10 @@ class TestVoiceOnlyFilter(unittest.TestCase):
     # ---- CLI + help -----------------------------------------------------
 
     def test_help_text_mentions_detail_level_keys(self):
-        # The in-app ``1``-``6`` detail-level keys live in the intro
+        # The in-app ``1``-``7`` detail-level keys live in the intro
         # (shown by ``?``); the old ``.`` hotkey is gone.
-        self.assertIn('1-6', self.r._HELP_INTRO,
-                      'help intro should list the 1-6 detail-level keys')
+        self.assertIn('1-7', self.r._HELP_INTRO,
+                      'help intro should list the 1-7 detail-level keys')
         self.assertNotIn(' .  ', self.r._HELP_INTRO,
                          'the . hotkey should no longer appear')
         # The CLI flag lives in the usage block (shown only by ``--help``);
@@ -7553,13 +7569,13 @@ class TestVoiceOnlyFilter(unittest.TestCase):
                          "the 'h' hotkey should no longer appear")
 
     def test_detail_level_actions_registered(self):
-        # Sanity: the recipe registers the four '1'-'4' detail-level
+        # Sanity: the recipe registers the '1'-'7' detail-level
         # actions and no longer a '.' (or 'h') one. We can't run the
         # full main() under unit test (it touches argv / stdin) —
         # inspect the source for the bindings.
         with open(_RECIPE) as f:
             source = f.read()
-        for key in ('1', '2', '3', '4'):
+        for key in ('1', '2', '3', '4', '5', '6', '7'):
             self.assertIn(f"Action('{key}',", source,
                           f"missing detail-level binding for '{key}'")
         self.assertIn('_set_detail_level', source)
@@ -7614,11 +7630,12 @@ class TestVoiceOnlyFilter(unittest.TestCase):
 
 
 class TestRecordMinLevel(unittest.TestCase):
-    """``_record_min_level`` classifies one record into a detail tier (1-6).
+    """``_record_min_level`` classifies one record into a detail tier (1-7).
 
     Whitelist semantics: turn-root prompt / end_turn → 1 (summary),
-    other voice → 2, edit/write tool → 3, other machinery → 4,
-    curated metadata → 5, everything unrecognised (and ``isMeta``) → 6.
+    other voice (incl. readable thinking) → 2, edit/write tool → 3,
+    other machinery → 4, curated metadata → 5, recognised noise (and
+    ``isMeta``) → 6, genuinely unrecognised kinds → 7 (unknown).
     """
 
     @classmethod
@@ -7677,11 +7694,25 @@ class TestRecordMinLevel(unittest.TestCase):
                             'content': 'ok'}]}}
         self.assertEqual(self.r._record_min_level(rec), 4)
 
-    def test_assistant_thinking_only_with_text_is_level_4(self):
-        # Thinking *with* readable text is lived machinery — tools (4).
+    def test_assistant_thinking_with_text_is_voice_level_2(self):
+        # Thinking *with* readable text is running commentary → voice (2).
         rec = {'type': 'assistant', 'message': {'role': 'assistant',
                'content': [{'type': 'thinking', 'thinking': 'hmm'}]}}
-        self.assertEqual(self.r._record_min_level(rec), 4)
+        self.assertTrue(self.r._is_voice(rec))
+        self.assertEqual(self.r._record_min_level(rec), 2)
+
+    def test_assistant_thinking_with_text_never_summary_tier(self):
+        # A thinking-only record has no spoken words, so it stays at
+        # voice (2) even when it concluded its turn (stop_reason
+        # end_turn — a real shape) — the end_turn → summary promotion is
+        # gated on _has_spoken_text. Mid-turn (tool_use) likewise.
+        for stop in ('tool_use', 'end_turn'):
+            with self.subTest(stop_reason=stop):
+                rec = {'type': 'assistant', 'message': {
+                    'role': 'assistant', 'stop_reason': stop,
+                    'content': [{'type': 'thinking', 'thinking': 'hmm',
+                                 'signature': 'sig'}]}}
+                self.assertEqual(self.r._record_min_level(rec), 2)
 
     def test_assistant_empty_thinking_only_is_level_6(self):
         # Signature-only (redacted) thinking has no readable text — it
@@ -7730,17 +7761,66 @@ class TestRecordMinLevel(unittest.TestCase):
                 rec = {'type': 'attachment', 'attachment': {'type': sub}}
                 self.assertEqual(self.r._record_min_level(rec), 5)
 
-    def test_unlisted_system_subtype_is_level_6(self):
-        rec = {'type': 'system', 'subtype': 'hook'}
-        self.assertEqual(self.r._record_min_level(rec), 6)
+    def test_compact_boundary_is_level_2(self):
+        # "Conversation compacted" is structural — shows when skimming
+        # voice.
+        rec = {'type': 'system', 'subtype': 'compact_boundary'}
+        self.assertEqual(self.r._record_min_level(rec), 2)
 
-    def test_unlisted_attachment_subtype_is_level_6(self):
+    def test_promoted_system_subtypes_are_level_5(self):
+        for sub in ('model_refusal_fallback', 'away_summary',
+                    'agents_killed'):
+            with self.subTest(subtype=sub):
+                rec = {'type': 'system', 'subtype': sub}
+                self.assertEqual(self.r._record_min_level(rec), 5)
+
+    def test_promoted_attachments_are_level_5(self):
+        for sub in ('hook_cancelled', 'invoked_skills'):
+            with self.subTest(attachment=sub):
+                rec = {'type': 'attachment', 'attachment': {'type': sub}}
+                self.assertEqual(self.r._record_min_level(rec), 5)
+
+    def test_cost_state_is_level_5(self):
+        self.assertEqual(self.r._record_min_level({'type': 'cost-state'}), 5)
+
+    def test_known_noise_system_subtypes_are_level_6(self):
+        for sub in ('stop_hook_summary', 'scheduled_task_fire',
+                    'informational'):
+            with self.subTest(subtype=sub):
+                rec = {'type': 'system', 'subtype': sub}
+                self.assertEqual(self.r._record_min_level(rec), 6)
+
+    def test_formatter_covered_attachment_is_level_6(self):
         rec = {'type': 'attachment', 'attachment': {'type': 'skill_listing'}}
         self.assertEqual(self.r._record_min_level(rec), 6)
 
-    def test_unknown_type_is_level_6(self):
+    def test_known_noise_attachments_are_level_6(self):
+        for sub in ('total_tokens_reminder', 'agent_listing_delta',
+                    'batching_reminder_sent', 'bash_output_audience_note',
+                    'nested_memory', 'read_truncation_notice', 'auto_mode',
+                    'plan_mode', 'silent_turn_reminder', 'already_read_file'):
+            with self.subTest(attachment=sub):
+                rec = {'type': 'attachment', 'attachment': {'type': sub}}
+                self.assertEqual(self.r._record_min_level(rec), 6)
+
+    def test_known_metadata_types_are_level_6(self):
         self.assertEqual(self.r._record_min_level({'type': 'progress'}), 6)
-        self.assertEqual(self.r._record_min_level({'type': 'totally-new'}), 6)
+        self.assertEqual(self.r._record_min_level({'type': 'atis-latch'}), 6)
+        self.assertEqual(
+            self.r._record_min_level({'type': 'file-history-delta'}), 6)
+
+    def test_unrecognised_kinds_are_level_7(self):
+        # A genuinely unknown top-level type / system subtype /
+        # attachment type surfaces only in the maintenance view (7).
+        self.assertEqual(
+            self.r._record_min_level({'type': 'totally-new'}), 7)
+        self.assertEqual(
+            self.r._record_min_level(
+                {'type': 'system', 'subtype': 'never-seen'}), 7)
+        self.assertEqual(
+            self.r._record_min_level(
+                {'type': 'attachment',
+                 'attachment': {'type': 'never-seen'}}), 7)
 
     def test_ismeta_record_is_level_6(self):
         # ``isMeta`` outranks even its own (otherwise-voice) type: an
@@ -7753,11 +7833,67 @@ class TestRecordMinLevel(unittest.TestCase):
         self.assertEqual(self.r._record_min_level(None), 6)
 
 
+class TestThinkingVoiceIdentity(unittest.TestCase):
+    """Readable thinking surfaces with a distinct 'thinking' identity.
+
+    ``_extract_text`` skips thinking parts, so without special-casing a
+    thinking-only record would summarise as ``<N parts>``. The row
+    summary carries a ``🧠 thinking:`` prefix, the row tag appends
+    ``· thinking``, and the preview renders the text under its
+    ``thinking`` rule.
+    """
+
+    @classmethod
+    def setUpClass(cls):
+        cls.r = _load_recipe()
+
+    def _thinking_rec(self, text, extra_parts=()):
+        return {'type': 'assistant', 'message': {
+            'role': 'assistant', 'stop_reason': 'tool_use',
+            'content': [{'type': 'thinking', 'thinking': text,
+                         'signature': 'sig'}] + list(extra_parts)}}
+
+    def test_summary_carries_thinking_marker(self):
+        rec = self._thinking_rec('Applying the fix now.')
+        s = self.r._summarise_message(rec)
+        self.assertIn('🧠 thinking:', s)
+        self.assertIn('Applying the fix now.', s)
+
+    def test_summary_prefers_spoken_text_over_thinking(self):
+        rec = self._thinking_rec(
+            'pondering', extra_parts=[{'type': 'text', 'text': 'Done.'}])
+        s = self.r._summarise_message(rec)
+        self.assertNotIn('🧠 thinking:', s)
+        self.assertIn('Done.', s)
+
+    def test_signature_only_summary_has_no_marker(self):
+        rec = self._thinking_rec('')
+        self.assertNotIn('🧠 thinking:', self.r._summarise_message(rec))
+
+    def test_row_tag_appends_thinking(self):
+        rec = self._thinking_rec('hmm')
+        self.assertEqual(self.r._row_tag('assistant', rec),
+                         'assistant · thinking')
+
+    def test_row_tag_plain_assistant_unchanged(self):
+        rec = {'type': 'assistant', 'message': {
+            'role': 'assistant',
+            'content': [{'type': 'text', 'text': 'hi'}]}}
+        self.assertEqual(self.r._row_tag('assistant', rec), 'assistant')
+
+    def test_preview_renders_thinking_text(self):
+        import re as _re
+        out = self.r._render_assistant(self._thinking_rec('deep thought'))
+        plain = _re.sub(r'\x1b\[[0-9;]*m', '', out)
+        self.assertIn('thinking', plain)
+        self.assertIn('deep thought', plain)
+
+
 class TestPassesFilterByLevel(unittest.TestCase):
     """``_passes_filter`` gates each row tag against ``_DETAIL_LEVEL``.
 
     A row shows iff its min level is ``<= _DETAIL_LEVEL``. Verified at all
-    six levels for msg / tool / span / prompt / agent ids.
+    seven levels for msg / tool / span / prompt / agent ids.
     """
 
     @classmethod
@@ -7782,9 +7918,9 @@ class TestPassesFilterByLevel(unittest.TestCase):
         return f.name
 
     def _visible_at(self, item_id, td=None):
-        """Tuple of bools — does ``item_id`` pass at levels 1,2,3,4,5,6?"""
+        """Tuple of bools — does ``item_id`` pass at levels 1-7?"""
         out = []
-        for lvl in (1, 2, 3, 4, 5, 6):
+        for lvl in (1, 2, 3, 4, 5, 6, 7):
             self.r._DETAIL_LEVEL = lvl
             out.append(self.r._passes_filter(item_id, td))
         return tuple(out)
@@ -7816,27 +7952,38 @@ class TestPassesFilterByLevel(unittest.TestCase):
                  {'type': 'tool_result', 'tool_use_id': 't1', 'content': 'ok'},
              ]}},
             {'type': 'tag', 'tag': 'release'},        # level 5
-            {'type': 'progress', 'data': {}},          # level 6 (unknown)
+            {'type': 'progress', 'data': {}},          # level 6 (known noise)
+            {'type': 'attachment', 'uuid': 'at1',      # level 6 (known noise)
+             'attachment': {'type': 'total_tokens_reminder'}},
+            {'type': 'never-seen-kind'},               # level 7 (unknown)
+            {'type': 'attachment', 'uuid': 'at2',      # level 7 (unknown)
+             'attachment': {'type': 'never-seen-attach'}},
         ])
         try:
             td = self.r._scan_tree(path)
             T = True; F = False
             self.assertEqual(self._visible_at(('msg', path, 0), td),
-                             (T, T, T, T, T, T))   # turn-root prompt (1)
+                             (T, T, T, T, T, T, T))   # turn-root prompt (1)
             self.assertEqual(self._visible_at(('msg', path, 1), td),
-                             (T, T, T, T, T, T))   # end_turn (1)
+                             (T, T, T, T, T, T, T))   # end_turn (1)
             self.assertEqual(self._visible_at(('msg', path, 2), td),
-                             (F, T, T, T, T, T))   # intermediate voice (2)
+                             (F, T, T, T, T, T, T))   # intermediate voice (2)
             self.assertEqual(self._visible_at(('msg', path, 3), td),
-                             (F, F, T, T, T, T))   # Edit tool_use (3)
+                             (F, F, T, T, T, T, T))   # Edit tool_use (3)
             self.assertEqual(self._visible_at(('msg', path, 4), td),
-                             (F, F, F, T, T, T))   # bare tool_use (4)
+                             (F, F, F, T, T, T, T))   # bare tool_use (4)
             self.assertEqual(self._visible_at(('msg', path, 5), td),
-                             (F, F, F, T, T, T))   # tool_result (4)
+                             (F, F, F, T, T, T, T))   # tool_result (4)
             self.assertEqual(self._visible_at(('msg', path, 6), td),
-                             (F, F, F, F, T, T))   # tag (5)
+                             (F, F, F, F, T, T, T))   # tag (5)
             self.assertEqual(self._visible_at(('msg', path, 7), td),
-                             (F, F, F, F, F, T))   # unknown (6)
+                             (F, F, F, F, F, T, T))   # known noise (6)
+            self.assertEqual(self._visible_at(('msg', path, 8), td),
+                             (F, F, F, F, F, T, T))   # known-noise attach (6)
+            self.assertEqual(self._visible_at(('msg', path, 9), td),
+                             (F, F, F, F, F, F, T))   # unknown type (7)
+            self.assertEqual(self._visible_at(('msg', path, 10), td),
+                             (F, F, F, F, F, F, T))   # unknown attach (7)
         finally:
             os.unlink(path)
 
@@ -7857,14 +8004,14 @@ class TestPassesFilterByLevel(unittest.TestCase):
             td = self.r._scan_tree(path)
             # Bare Bash umbrella: hidden until level 4 (tools).
             self.assertEqual(self._visible_at(('tool', path, 1), td),
-                             (False, False, False, True, True, True))
+                             (False, False, False, True, True, True, True))
             # Subagent-wrap promotion: stub the predicate so the same
             # umbrella id reads as a resolvable-subagent wrap → voice (2).
             saved = self.r._tool_umbrella_wraps_subagent
             try:
                 self.r._tool_umbrella_wraps_subagent = lambda rec, td_: True
                 self.assertEqual(self._visible_at(('tool', path, 1), td),
-                                 (False, True, True, True, True, True))
+                                 (False, True, True, True, True, True, True))
             finally:
                 self.r._tool_umbrella_wraps_subagent = saved
         finally:
@@ -7885,10 +8032,12 @@ class TestPassesFilterByLevel(unittest.TestCase):
         ]
         self.r._TREE_CACHE[path] = td
         try:
-            self.assertEqual(self._visible_at(('span', path, 0), td),
-                             (False, False, False, False, True, True))  # min L5
-            self.assertEqual(self._visible_at(('span', path, 1), td),
-                             (True, True, True, True, True, True))  # has voice
+            self.assertEqual(
+                self._visible_at(('span', path, 0), td),
+                (False, False, False, False, True, True, True))  # min L5
+            self.assertEqual(
+                self._visible_at(('span', path, 1), td),
+                (True, True, True, True, True, True, True))  # has voice
         finally:
             self.r._TREE_CACHE.pop(path, None)
 
@@ -7903,14 +8052,14 @@ class TestPassesFilterByLevel(unittest.TestCase):
         self.r._TREE_CACHE[path] = td
         try:
             self.assertEqual(self._visible_at(('prompt', path, 0), td),
-                             (True, True, True, True, True, True))
+                             (True, True, True, True, True, True, True))
         finally:
             self.r._TREE_CACHE.pop(path, None)
 
     def test_agent_umbrella_always_visible(self):
         # Subagent umbrellas are unconditionally shown at every level.
         self.assertEqual(self._visible_at(('agent', 'whatever', 'ABC')),
-                         (True, True, True, True, True, True))
+                         (True, True, True, True, True, True, True))
 
 
 class TestShowId(unittest.TestCase):
