@@ -287,6 +287,22 @@ def _decode_project_path(name):
     return p
 
 
+def _human_count(n):
+    """Compact human form of a count: 15000000 → ``15.0M``, 9800 → ``9.8K``."""
+    if n >= 1_000_000:
+        return f'{n / 1_000_000:.1f}M'
+    if n >= 1_000:
+        return f'{n / 1_000:.1f}K'
+    return str(n)
+
+
+def _total_tokens_left(a):
+    """Token count from a ``total_tokens_reminder`` attachment's text
+    (``<total_tokens>N tokens left</total_tokens>``), or ``None``."""
+    m = re.search(r'(\d+)\s+tokens left', a.get('text') or '')
+    return int(m.group(1)) if m else None
+
+
 def _human_time(epoch):
     """Compact relative-time formatter (``2m ago``, ``3d ago``, …)."""
     if not epoch:
@@ -1765,6 +1781,8 @@ _TAG_STYLE_FOR_KIND = {
     'marble-origami-commit':      'dim',
     'marble-origami-snapshot':    'dim',
     'progress':                   'dim',
+    'cost-state':                 'dim',
+    'atis-latch':                 'dim',
 }
 
 
@@ -1897,25 +1915,14 @@ _L3_USEFUL = frozenset([
 # (unknown) is a maintenance view: ``_record_min_level``'s fallthrough
 # returns 7 only for a type / system subtype / attachment type the
 # recipe does not recognise anywhere — neither in a tier above, nor
-# here, nor in ``_ATTACH_FORMATTERS`` / ``_METADATA_TYPES``.
+# here, nor in ``_ATTACH_FORMATTERS`` / ``_METADATA_TYPES`` (the
+# renderer registries double as the known lists).
 _KNOWN_SYSTEM_NOISE = frozenset([
     'stop_hook_summary',
     'scheduled_task_fire',
     'informational',
 ])
-_KNOWN_ATTACH_NOISE = frozenset([
-    'total_tokens_reminder',
-    'agent_listing_delta',
-    'batching_reminder_sent',
-    'bash_output_audience_note',
-    'nested_memory',
-    'read_truncation_notice',
-    'auto_mode',
-    'plan_mode',
-    'silent_turn_reminder',
-    'already_read_file',
-])
-_KNOWN_TYPE_NOISE = frozenset(['atis-latch', 'file-history-delta'])
+_KNOWN_TYPE_NOISE = frozenset(['file-history-delta'])
 
 
 def _thinking_text(rec):
@@ -2101,7 +2108,7 @@ def _record_min_level(rec):
         sub = a.get('type') if isinstance(a, dict) else None
         if (t, sub) in _L3_USEFUL:
             return 5
-        if sub in _ATTACH_FORMATTERS or sub in _KNOWN_ATTACH_NOISE:
+        if sub in _ATTACH_FORMATTERS:
             return 6
         return 7
     if t in _L3_USEFUL:
@@ -2316,6 +2323,12 @@ def _summarise_message(obj):
         d = obj.get('data') or {}
         dt = d.get('type', '?') if isinstance(d, dict) else '?'
         return f'progress: {dt}'
+    if t == 'cost-state':
+        cost = obj.get('totalCostUSD') or 0
+        return (f'💰 ${cost:.2f} · {obj.get("totalLinesAdded", 0)}+'
+                f'/{obj.get("totalLinesRemoved", 0)}−')
+    if t == 'atis-latch':
+        return 'atis-latch'
 
     # System events.
     if t == 'system':
@@ -2328,6 +2341,18 @@ def _summarise_message(obj):
         if sub == 'local_command':
             cmd = _trim(obj.get('content') or obj.get('command', ''), 5000)
             return f'$ {cmd}' if cmd else 'local_command'
+        if sub == 'compact_boundary':
+            trig = (obj.get('compactMetadata') or {}).get('trigger', '')
+            base = obj.get('content') or 'Conversation compacted'
+            return f'♻ {base}' + (f' ({trig})' if trig else '')
+        if sub == 'model_refusal_fallback':
+            return f'⚠ refusal fallback: {_trim(obj.get("content", ""), 5000)}'
+        if sub == 'away_summary':
+            return f'away: {_trim(obj.get("content", ""), 5000)}'
+        if sub == 'informational':
+            return f'ℹ {_trim(obj.get("content", ""), 5000)}'
+        if sub == 'agents_killed':
+            return '■ agents killed'
         return f'system: {sub}' if sub else 'system'
 
     # Attachment — pick the most salient field per subtype.
@@ -2364,6 +2389,35 @@ def _summarise_message(obj):
             return f'allowed: {", ".join(a.get("allowedTools") or [])}'
         if sub == 'ultrathink_effort':
             return '🧠 ultrathink'
+        if sub == 'total_tokens_reminder':
+            n = _total_tokens_left(a)
+            return (f'⛽ {_human_count(n)} tokens left' if n is not None
+                    else '⛽ tokens left')
+        if sub == 'agent_listing_delta':
+            return (f'agents Δ: +{len(a.get("addedTypes") or [])}'
+                    f' -{len(a.get("removedTypes") or [])}')
+        if sub == 'batching_reminder_sent':
+            return '🔔 batching reminder'
+        if sub == 'bash_output_audience_note':
+            return 'bash output audience note'
+        if sub == 'nested_memory':
+            return f'📎 memory: {a.get("displayPath", a.get("path", ""))}'
+        if sub == 'read_truncation_notice':
+            return f'✂ {_trim(a.get("banner", ""), 5000)}'
+        if sub in ('auto_mode', 'plan_mode'):
+            return f'⇆ {sub.replace("_", " ")}'
+        if sub == 'silent_turn_reminder':
+            return f'🔔 {_trim(a.get("text", ""), 5000)}'
+        if sub == 'already_read_file':
+            return (f'📎 already read: '
+                    f'{a.get("displayPath", a.get("filename", ""))}')
+        if sub == 'hook_cancelled':
+            return (f'✗ hook {a.get("hookName", "?")} cancelled '
+                    f'({a.get("hookEvent", "?")})')
+        if sub == 'invoked_skills':
+            names = [s.get('name', '?') for s in a.get('skills') or []
+                     if isinstance(s, dict)]
+            return f'📚 invoked: {", ".join(names)}'
         return f'📎 {sub}'
 
     # User / assistant — peek into content for salient fragment.
@@ -3094,7 +3148,7 @@ _METADATA_TYPES = frozenset([
     'mode', 'permission-mode', 'worktree-state', 'content-replacement',
     'file-history-snapshot', 'attribution-snapshot', 'speculation-accept',
     'queue-operation', 'marble-origami-commit', 'marble-origami-snapshot',
-    'progress',
+    'progress', 'cost-state', 'atis-latch',
 ])
 
 
@@ -4950,11 +5004,12 @@ def _fmt_attach_skill_listing(a):
 
 
 def _fmt_attach_delta(a):
-    """mcp_instructions_delta and deferred_tools_delta — same shape."""
+    """mcp_instructions_delta / deferred_tools_delta / agent_listing_delta
+    — the same ±names shape (agent deltas key on ``*Types``)."""
     out = []
-    for n in a.get('addedNames') or []:
+    for n in a.get('addedNames') or a.get('addedTypes') or []:
         out.append(f'{GREEN}+ {n}{RESET}')
-    for n in a.get('removedNames') or []:
+    for n in a.get('removedNames') or a.get('removedTypes') or []:
         out.append(f'{RED}- {n}{RESET}')
     return '\n'.join(out)
 
@@ -4965,6 +5020,79 @@ def _fmt_attach_date_change(a):
 
 def _fmt_attach_ultrathink(a):
     return f'{MAGENTA}🧠 ultrathink{RESET}'
+
+
+def _fmt_attach_total_tokens(a):
+    n = _total_tokens_left(a)
+    left = f'{_human_count(n)} tokens left' if n is not None else 'tokens left'
+    return f'{CYAN}⛽ {left}{RESET}'
+
+
+def _fmt_attach_batching_reminder(a):
+    head = f'{YELLOW}🔔 batching reminder{RESET}'
+    if a.get('model'):
+        head += f'  {MUTE}({a["model"]}){RESET}'
+    return head + '\n\n' + (a.get('text', '') or '')
+
+
+def _fmt_attach_bash_audience_note(a):
+    return (f'{MUTE}bash output audience note  '
+            f'· tool_use={a.get("toolUseID", "?")}{RESET}')
+
+
+def _fmt_attach_nested_memory(a):
+    """Injected nested CLAUDE.md — file-style header (displayPath first,
+    full path on a second line, like ``file``), content inline
+    (memories are small, unlike ``file`` attachments)."""
+    c = a.get('content') if isinstance(a.get('content'), dict) else {}
+    out = [f'{CYAN}📎 memory: {a.get("displayPath", a.get("path", "?"))}{RESET}']
+    if a.get('path') and a.get('path') != a.get('displayPath'):
+        out.append(f'{MUTE}{a["path"]}{RESET}')
+    body = c.get('content', '') or ''
+    if body:
+        out.append('')
+        out.append(body)
+    return '\n'.join(out)
+
+
+def _fmt_attach_read_truncation(a):
+    return f'{YELLOW}{a.get("banner", "")}{RESET}'
+
+
+def _fmt_attach_mode_flag(a):
+    """auto_mode / plan_mode reminders — symmetric with plan_mode_exit."""
+    out = [f'{YELLOW}⇆ mode{RESET}  '
+           f'{(a.get("type") or "").replace("_", " ")}']
+    if a.get('planFilePath'):
+        out.append(f'{MUTE}plan:{RESET} {a["planFilePath"]}')
+    return '\n'.join(out)
+
+
+def _fmt_attach_silent_turn(a):
+    return f'{YELLOW}🔔{RESET} {a.get("text", "")}'
+
+
+def _fmt_attach_hook_cancelled(a):
+    name = a.get('hookName', '?')
+    event = a.get('hookEvent', '?')
+    dur = a.get('durationMs', 0)
+    out = [f'{RED}✗ {name} cancelled{RESET}  '
+           f'{MUTE}{event} · {dur}ms'
+           f'{" · timed out" if a.get("timedOut") else ""}{RESET}']
+    if a.get('command'):
+        out.append(f'{MUTE}$ {a["command"]}{RESET}')
+    return '\n'.join(out)
+
+
+def _fmt_attach_invoked_skills(a):
+    """Names + paths only — the per-skill content blobs are large."""
+    out = []
+    for s in a.get('skills') or []:
+        if isinstance(s, dict):
+            out.append(f'{MAGENTA}{s.get("name", "?")}{RESET}  '
+                       f'{MUTE}{s.get("path", "")}{RESET}')
+    head = f'{BLUE}📚 invoked skills{RESET}'
+    return head + ('\n\n' + '\n'.join(out) if out else '')
 
 
 def _fmt_attach_default(a):
@@ -4988,8 +5116,20 @@ _ATTACH_FORMATTERS = {
     'skill_listing':          _fmt_attach_skill_listing,
     'mcp_instructions_delta': _fmt_attach_delta,
     'deferred_tools_delta':   _fmt_attach_delta,
+    'agent_listing_delta':    _fmt_attach_delta,
     'date_change':            _fmt_attach_date_change,
     'ultrathink_effort':      _fmt_attach_ultrathink,
+    'total_tokens_reminder':  _fmt_attach_total_tokens,
+    'batching_reminder_sent': _fmt_attach_batching_reminder,
+    'bash_output_audience_note': _fmt_attach_bash_audience_note,
+    'nested_memory':          _fmt_attach_nested_memory,
+    'read_truncation_notice': _fmt_attach_read_truncation,
+    'auto_mode':              _fmt_attach_mode_flag,
+    'plan_mode':              _fmt_attach_mode_flag,
+    'silent_turn_reminder':   _fmt_attach_silent_turn,
+    'already_read_file':      _fmt_attach_file,
+    'hook_cancelled':         _fmt_attach_hook_cancelled,
+    'invoked_skills':         _fmt_attach_invoked_skills,
 }
 
 
@@ -5010,6 +5150,23 @@ def _render_system(obj):
         return f'{GRAY}$ {cmd}{RESET}'
     if sub == 'scheduled_task_fire':
         return f'{CYAN}⏲ scheduled fire{RESET}'
+    if sub == 'compact_boundary':
+        # Prominent — it's a structural marker (voice tier, level 2).
+        head = (f'{YELLOW}{BOLD}♻ '
+                f'{obj.get("content") or "Conversation compacted"}{RESET}')
+        trig = (obj.get('compactMetadata') or {}).get('trigger', '')
+        if trig:
+            head += f'  {MUTE}({trig}){RESET}'
+        return head
+    if sub == 'model_refusal_fallback':
+        return (f'{YELLOW}{BOLD}⚠ model refusal fallback{RESET}\n\n'
+                f'{YELLOW}{obj.get("content", "")}{RESET}')
+    if sub == 'away_summary':
+        return f'{CYAN}{BOLD}away summary{RESET}\n\n{obj.get("content", "")}'
+    if sub == 'informational':
+        return f'{MUTE}ℹ info{RESET}\n\n{obj.get("content", "")}'
+    if sub == 'agents_killed':
+        return f'{RED}■ agents killed{RESET}'
     if sub == 'api_error':
         try:
             body = json.dumps(obj, indent=2, ensure_ascii=False)
@@ -5109,6 +5266,25 @@ def _render_metadata(obj):
         d = obj.get('data') or {}
         dt = d.get('type', '?') if isinstance(d, dict) else '?'
         return f'{head}  {MUTE}{dt}{RESET}'
+    if t == 'cost-state':
+        cost = obj.get('totalCostUSD') or 0
+        dur = (obj.get('totalDuration') or 0) / 1000
+        out = [f'{head}  {YELLOW}${cost:.2f}{RESET}  '
+               f'{GREEN}+{obj.get("totalLinesAdded", 0)}{RESET}/'
+               f'{RED}-{obj.get("totalLinesRemoved", 0)}{RESET} lines  '
+               f'{MUTE}· {dur:.0f}s{RESET}']
+        usage = obj.get('modelUsage') or {}
+        for model, u in usage.items():
+            if isinstance(u, dict):
+                out.append(f'{MAGENTA}{model}{RESET}  {MUTE}'
+                           f'in={_human_count(u.get("inputTokens", 0))} '
+                           f'out={_human_count(u.get("outputTokens", 0))}'
+                           f'{RESET}')
+        if len(out) > 1:
+            out.insert(1, '')
+        return '\n'.join(out)
+    if t == 'atis-latch':
+        return f'{GRAY}atis-latch{RESET}'
     if t == 'summary':
         return f'{head}\n\n{obj.get("summary", "")}'
     return f'{head}\n{GRAY}{json.dumps(obj, indent=2, ensure_ascii=False)}{RESET}'

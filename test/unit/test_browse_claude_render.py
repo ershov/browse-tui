@@ -215,7 +215,8 @@ class TestClassify(unittest.TestCase):
                   'worktree-state', 'content-replacement',
                   'file-history-snapshot', 'attribution-snapshot',
                   'speculation-accept', 'queue-operation', 'progress',
-                  'marble-origami-commit', 'marble-origami-snapshot'):
+                  'marble-origami-commit', 'marble-origami-snapshot',
+                  'cost-state', 'atis-latch'):
             self.assertEqual(self.r._classify({'type': t}), 'metadata',
                              f'type {t!r} should classify as metadata')
 
@@ -657,6 +658,131 @@ class TestAttachmentRenderers(unittest.TestCase):
         self.assertIn('queued', out)
         self.assertIn('do the thing', out)
 
+    def test_total_tokens_reminder(self):
+        out = self.r._render_attachment(self._attach(
+            'total_tokens_reminder',
+            text='<total_tokens>15000000 tokens left</total_tokens>',
+        ))
+        self.assertIn('⛽ 15.0M tokens left', out)
+        self.assertNotIn('<total_tokens>', out)
+
+    def test_agent_listing_delta(self):
+        out = self.r._render_attachment(self._attach(
+            'agent_listing_delta',
+            addedTypes=['Explore', 'Plan'], removedTypes=['old-agent'],
+        ))
+        self.assertIn('+ Explore', out)
+        self.assertIn('+ Plan', out)
+        self.assertIn('- old-agent', out)
+
+    def test_batching_reminder_sent(self):
+        out = self.r._render_attachment(self._attach(
+            'batching_reminder_sent',
+            text='Request every independent item at once.',
+            model='claude-fable-5-1',
+        ))
+        self.assertIn('batching reminder', out)
+        self.assertIn('claude-fable-5-1', out)
+        self.assertIn('Request every independent item', out)
+
+    def test_bash_output_audience_note(self):
+        # Neutral label only — the record carries nothing beyond the
+        # toolUseID, so the render must not assert extra semantics.
+        out = self.r._render_attachment(self._attach(
+            'bash_output_audience_note', toolUseID='toolu_123',
+        ))
+        self.assertIn('bash output audience note', out)
+        self.assertIn('toolu_123', out)
+
+    def test_nested_memory(self):
+        # Same path preference as ``file``: displayPath first, full
+        # path on a muted second line; content inline.
+        out = self.r._render_attachment(self._attach(
+            'nested_memory',
+            path='/repo/sub/CLAUDE.md', displayPath='CLAUDE.md',
+            content={'path': '/repo/sub/CLAUDE.md', 'type': 'Project',
+                     'content': '@AGENTS.md'},
+        ))
+        self.assertIn('memory: CLAUDE.md', out)
+        self.assertIn('/repo/sub/CLAUDE.md', out)
+        self.assertIn('@AGENTS.md', out)
+
+    def test_read_truncation_notice(self):
+        out = self.r._render_attachment(self._attach(
+            'read_truncation_notice',
+            banner='[Truncated: showing lines 1-100 of 900]',
+        ))
+        self.assertIn('[Truncated: showing lines 1-100 of 900]', out)
+
+    def test_auto_and_plan_mode_flags(self):
+        for sub, want in (('auto_mode', 'auto mode'),
+                          ('plan_mode', 'plan mode')):
+            with self.subTest(sub=sub):
+                out = self.r._render_attachment(self._attach(sub))
+                self.assertIn('⇆ mode', out)
+                self.assertIn(want, out)
+
+    def test_plan_mode_includes_plan_path(self):
+        out = self.r._render_attachment(self._attach(
+            'plan_mode', reminderType='full',
+            planFilePath='/p/plan.md', planExists=False,
+        ))
+        self.assertIn('/p/plan.md', out)
+
+    def test_silent_turn_reminder(self):
+        out = self.r._render_attachment(self._attach(
+            'silent_turn_reminder', text='Say what you are doing.',
+        ))
+        self.assertIn('🔔', out)
+        self.assertIn('Say what you are doing.', out)
+
+    def test_already_read_file_path_only(self):
+        # Same rendering as ``file``: paths only, never the content blob.
+        out = self.r._render_attachment(self._attach(
+            'already_read_file',
+            filename='/abs/tool.sh', displayPath='tool.sh',
+            content={'type': 'text', 'file': {'filePath': '/abs/tool.sh',
+                                              'content': '#!/bin/bash\n'}},
+        ))
+        self.assertIn('tool.sh', out)
+        self.assertIn('/abs/tool.sh', out)
+        self.assertNotIn('#!/bin/bash', out)
+
+    def test_hook_cancelled(self):
+        out = self.r._render_attachment(self._attach(
+            'hook_cancelled', hookName='Stop', hookEvent='Stop',
+            command='bash stop-hook.sh', durationMs=67, timedOut=False,
+        ))
+        self.assertIn('Stop cancelled', out)
+        self.assertIn('67ms', out)
+        self.assertIn('bash stop-hook.sh', out)
+        self.assertNotIn('timed out', out)
+
+    def test_hook_cancelled_timed_out(self):
+        out = self.r._render_attachment(self._attach(
+            'hook_cancelled', hookName='Stop', hookEvent='Stop',
+            durationMs=600000, timedOut=True,
+        ))
+        self.assertIn('timed out', out)
+
+    def test_invoked_skills_names_not_content(self):
+        out = self.r._render_attachment(self._attach(
+            'invoked_skills',
+            skills=[{'name': 'sp:debugging', 'path': 'plugin:sp:debugging',
+                     'content': 'HUGE SKILL BODY'}],
+        ))
+        self.assertIn('invoked skills', out)
+        self.assertIn('sp:debugging', out)
+        self.assertIn('plugin:sp:debugging', out)
+        self.assertNotIn('HUGE SKILL BODY', out)
+
+    def test_unknown_attachment_falls_back_to_json(self):
+        out = self.r._render_attachment(self._attach(
+            'never_seen_kind', someField='xyz',
+        ))
+        self.assertIn('never_seen_kind', out)
+        self.assertIn('xyz', out)
+
 
 class TestSystemRenderers(unittest.TestCase):
 
@@ -681,6 +807,50 @@ class TestSystemRenderers(unittest.TestCase):
         self.assertIn('api_error', out)
         self.assertIn('rate limited', out)
         self.assertIn('429', out)
+
+    def test_compact_boundary(self):
+        out = self.r._render_system({
+            'type': 'system', 'subtype': 'compact_boundary',
+            'content': 'Conversation compacted',
+            'compactMetadata': {'trigger': 'manual'},
+        })
+        self.assertIn('♻ Conversation compacted', out)
+        self.assertIn('(manual)', out)
+
+    def test_model_refusal_fallback(self):
+        out = self.r._render_system({
+            'type': 'system', 'subtype': 'model_refusal_fallback',
+            'content': 'Safeguards flagged this message.',
+        })
+        self.assertIn('model refusal fallback', out)
+        self.assertIn('Safeguards flagged this message.', out)
+
+    def test_away_summary(self):
+        out = self.r._render_system({
+            'type': 'system', 'subtype': 'away_summary',
+            'content': 'Building the tool index.',
+        })
+        self.assertIn('away summary', out)
+        self.assertIn('Building the tool index.', out)
+
+    def test_informational(self):
+        out = self.r._render_system({
+            'type': 'system', 'subtype': 'informational',
+            'content': 'Auto mode lets Claude handle prompts.',
+        })
+        self.assertIn('Auto mode lets Claude handle prompts.', out)
+
+    def test_agents_killed(self):
+        out = self.r._render_system({
+            'type': 'system', 'subtype': 'agents_killed',
+        })
+        self.assertIn('agents killed', out)
+
+    def test_unknown_subtype_falls_back_generically(self):
+        out = self.r._render_system({
+            'type': 'system', 'subtype': 'never_seen',
+        })
+        self.assertIn('never_seen', out)
 
 
 class TestMetadataRenderers(unittest.TestCase):
@@ -752,6 +922,28 @@ class TestMetadataRenderers(unittest.TestCase):
         })
         self.assertIn('2 files', out)
         self.assertIn('150', out)
+
+    def test_cost_state(self):
+        out = self.r._render_metadata({
+            'type': 'cost-state', 'totalCostUSD': 20.252094,
+            'totalDuration': 1645814,
+            'totalLinesAdded': 61, 'totalLinesRemoved': 0,
+            'modelUsage': {'claude-fable-5': {'inputTokens': 1200000,
+                                              'outputTokens': 34000}},
+        })
+        self.assertIn('$20.25', out)
+        self.assertIn('+61', out)
+        self.assertIn('-0', out)
+        self.assertIn('claude-fable-5', out)
+        self.assertIn('in=1.2M', out)
+        self.assertIn('out=34.0K', out)
+
+    def test_atis_latch_one_worder(self):
+        out = self.r._render_metadata({
+            'type': 'atis-latch', 'atis': '', 'sessionId': 's',
+        })
+        self.assertIn('atis-latch', out)
+        self.assertNotIn('sessionId', out)
 
 
 class TestChrome(unittest.TestCase):
@@ -6964,6 +7156,77 @@ class TestSummariseTitles(unittest.TestCase):
         for obj, want in cases:
             self.assertEqual(self.r._summarise_message(obj), want,
                              f'failed for {obj["type"]}')
+
+    def test_new_attachment_short_forms(self):
+        def att(sub, **fields):
+            return {'type': 'attachment',
+                    'attachment': dict(type=sub, **fields)}
+        cases = [
+            (att('total_tokens_reminder',
+                 text='<total_tokens>15000000 tokens left</total_tokens>'),
+             '⛽ 15.0M tokens left'),
+            (att('agent_listing_delta', addedTypes=['a', 'b'],
+                 removedTypes=['c']),
+             'agents Δ: +2 -1'),
+            (att('batching_reminder_sent', text='x', model='m'),
+             '🔔 batching reminder'),
+            (att('bash_output_audience_note', toolUseID='t1'),
+             'bash output audience note'),
+            (att('nested_memory', path='/r/CLAUDE.md',
+                 displayPath='CLAUDE.md', content={}),
+             '📎 memory: CLAUDE.md'),
+            (att('read_truncation_notice', banner='[Truncated: partial]'),
+             '✂ [Truncated: partial]'),
+            (att('auto_mode'), '⇆ auto mode'),
+            (att('plan_mode'), '⇆ plan mode'),
+            (att('silent_turn_reminder', text='speak up'),
+             '🔔 speak up'),
+            (att('already_read_file', filename='/abs/t.sh',
+                 displayPath='t.sh'),
+             '📎 already read: t.sh'),
+            (att('hook_cancelled', hookName='Stop', hookEvent='Stop'),
+             '✗ hook Stop cancelled (Stop)'),
+            (att('invoked_skills',
+                 skills=[{'name': 'a:b', 'content': 'BLOB'},
+                         {'name': 'c:d'}]),
+             '📚 invoked: a:b, c:d'),
+        ]
+        for obj, want in cases:
+            self.assertEqual(self.r._summarise_message(obj), want,
+                             f'failed for {obj["attachment"]["type"]}')
+
+    def test_new_system_short_forms(self):
+        cases = [
+            ({'type': 'system', 'subtype': 'compact_boundary',
+              'content': 'Conversation compacted',
+              'compactMetadata': {'trigger': 'auto'}},
+             '♻ Conversation compacted (auto)'),
+            ({'type': 'system', 'subtype': 'model_refusal_fallback',
+              'content': 'flagged'},
+             '⚠ refusal fallback: flagged'),
+            ({'type': 'system', 'subtype': 'away_summary',
+              'content': 'built the index'},
+             'away: built the index'),
+            ({'type': 'system', 'subtype': 'informational',
+              'content': 'auto mode info'},
+             'ℹ auto mode info'),
+            ({'type': 'system', 'subtype': 'agents_killed'},
+             '■ agents killed'),
+        ]
+        for obj, want in cases:
+            self.assertEqual(self.r._summarise_message(obj), want,
+                             f'failed for {obj["subtype"]}')
+
+    def test_new_top_level_short_forms(self):
+        self.assertEqual(
+            self.r._summarise_message({
+                'type': 'cost-state', 'totalCostUSD': 20.252094,
+                'totalLinesAdded': 61, 'totalLinesRemoved': 0,
+            }),
+            '💰 $20.25 · 61+/0−')
+        self.assertEqual(
+            self.r._summarise_message({'type': 'atis-latch', 'atis': ''}),
+            'atis-latch')
 
     def test_user_meta_marker(self):
         out = self.r._summarise_message({
