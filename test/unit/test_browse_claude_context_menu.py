@@ -34,12 +34,14 @@ import os
 import subprocess
 import sys
 import tempfile
+import time
 import types
 import unittest
 from importlib.machinery import SourceFileLoader
 from pathlib import Path
 
-from test.async_._helpers import Context, Item, make_browser
+from test.async_._helpers import (Context, Item, make_browser,
+                                  mod as _real_mod, upsert as _real_upsert)
 
 
 _REPO = Path(__file__).resolve().parents[2]
@@ -1285,6 +1287,187 @@ class TestCrossLinkJumpVoiceRace(unittest.TestCase):
         self.assertEqual(Context(b).cursor.id, ('msg', self.ap, 2),
                          'a manual re-expand must jump to the latest '
                          'voice — the claim is consume-on-fire')
+
+
+class TestTailSubagentBlockInsert(unittest.TestCase):
+    """#1245: a subagent linked by the live tail must land INSIDE the
+    session's top block (the divider sentinel ids double as insertion
+    pivots), not append at the bottom of the root listing; a session's
+    FIRST subagent brings the whole block in at the top. After every
+    insert the visible sequence equals a fresh ``_list_tree_roots``
+    refetch, so a later refetch is an ordering no-op.
+
+    Same harness as ``TestCrossLinkJumpVoiceRace``: headless Browser
+    with the recipe's real hooks and the drain→apply→fire pump. The
+    recipe's ``upsert``/``mod`` globals (inert stubs from
+    ``_stub_browse_tui``) are swapped for the REAL op constructors from
+    the same state module the Browser uses, so ``_push_tail_diffs``
+    ops interoperate with its ``update_data``.
+    """
+
+    def setUp(self):
+        self.r = _load_recipe()
+        self.r.upsert = _real_upsert
+        self.r.mod = _real_mod
+        self.r._DETAIL_LEVEL = 6
+        self._tmp = tempfile.TemporaryDirectory()
+        self.sess = os.path.join(self._tmp.name, 'parent.jsonl')
+        self.sub_dir = os.path.join(self._tmp.name, 'parent', 'subagents')
+        os.makedirs(self.sub_dir)
+
+    def tearDown(self):
+        b = getattr(self, 'b', None)
+        if b is not None:
+            b.stop_workers()
+        self._tmp.cleanup()
+
+    def _append(self, path, recs):
+        import json as _json
+        with open(path, 'a') as f:
+            for rec in recs:
+                f.write(_json.dumps(rec) + '\n')
+
+    def _spawn_recs(self, aid, tool_id, auuid):
+        """Assistant Agent tool_use + linking tool_result pair."""
+        return [
+            {'type': 'assistant', 'uuid': auuid,
+             'message': {'role': 'assistant', 'content': [
+                 {'type': 'tool_use', 'id': tool_id, 'name': 'Agent',
+                  'input': {'prompt': 'go'}},
+             ]}},
+            {'type': 'user',
+             'message': {'role': 'user', 'content': [
+                 {'type': 'tool_result', 'tool_use_id': tool_id,
+                  'content': 'spawned'},
+             ]},
+             'toolUseResult': {'agentId': aid, 'status': 'completed'}},
+        ]
+
+    def _mk_agent_file(self, aid, mtime=None):
+        ap = os.path.join(self.sub_dir, f'agent-{aid}.jsonl')
+        self._append(ap, [
+            {'type': 'user',
+             'message': {'role': 'user', 'content': 'sub prompt'}},
+        ])
+        if mtime is not None:
+            os.utime(ap, (mtime, mtime))
+        return ap
+
+    def _mk_session(self, *, with_agent):
+        recs = [
+            {'type': 'user', 'uuid': 'u1',
+             'message': {'role': 'user', 'content': 'kick off'}},
+        ]
+        if with_agent:
+            recs += self._spawn_recs('W1', 'toolu_A', 'a1')
+            self._mk_agent_file('W1', mtime=time.time() - 100)
+        self._append(self.sess, recs)
+
+    def _hooked_browser(self):
+        sess_item = Item(id=('session', self.sess), title='s',
+                         has_children=True)
+
+        def kids(item_id, *, reload=False):
+            if item_id is None:
+                return [sess_item]
+            return [Item(id=c.id, title=getattr(c, 'title', ''),
+                         has_children=bool(getattr(c, 'has_children',
+                                                   False)),
+                         hidden=bool(getattr(c, 'hidden', False)),
+                         meta=bool(getattr(c, 'meta', False)),
+                         boundary=bool(getattr(c, 'boundary', False)))
+                    for c in self.r.get_children(item_id)]
+
+        self.b = make_browser(get_children=kids,
+                              on_expand=self.r._on_expand,
+                              on_children_loaded=self.r._on_children_loaded)
+        return self.b
+
+    def _pump(self, b, timeout=5.0):
+        import time as _time
+        deadline = _time.monotonic() + timeout
+        while _time.monotonic() < deadline:
+            b.drain_main_queue()
+            b.apply_children_results()
+            b._fire_expand_collapse_if_pending()
+            b._fire_children_loaded_if_pending()
+            if (b._main_queue.empty() and not b._children_queue
+                    and not b._children_results
+                    and not b._children_in_flight
+                    and not b._state._children_pending
+                    and not self.r._AWAITING_VOICE_JUMP):
+                return
+            _time.sleep(0.005)
+        self.fail('pump: browser did not settle')
+
+    def _open_session(self):
+        b = self._hooked_browser()
+        b.refresh()
+        self._pump(b)
+        b.expand(('session', self.sess))
+        self._pump(b)
+        return b
+
+    def _tail_arrive(self, b, aid, tool_id, auuid):
+        """Simulate one tail tick that links a NEW subagent."""
+        self._mk_agent_file(aid)
+        self._append(self.sess, self._spawn_recs(aid, tool_id, auuid))
+        records, dirty = self.r._read_new_records(self.sess)
+        self.assertIn(('session', self.sess), dirty)
+        self.r._push_tail_diffs(b, dirty)
+        self._pump(b)
+
+    def _root_ids(self, b):
+        return [it.id for it in b.cached_children(('session', self.sess))]
+
+    def test_insert_into_existing_block(self):
+        self._mk_session(with_agent=True)
+        b = self._open_session()
+        sep_sub = ('sep', self.sess, 'subagents')
+        sep_sess = ('sep', self.sess, 'session')
+        self.assertEqual(self._root_ids(b), [
+            sep_sub, ('agent', self.sess, 'W1'), sep_sess,
+            ('prompt', self.sess, 0)])
+
+        self._tail_arrive(b, 'W2', 'toolu_B', 'a2')
+        got = self._root_ids(b)
+        # Newest-first: W2 lands right after the Subagents divider.
+        self.assertEqual(got, [
+            sep_sub, ('agent', self.sess, 'W2'),
+            ('agent', self.sess, 'W1'), sep_sess,
+            ('prompt', self.sess, 0)])
+        # Refetch-identical (and dividers not duplicated).
+        self.assertEqual(got,
+                         [c.id for c in
+                          self.r.get_children(('session', self.sess))])
+
+    def test_first_agent_creates_block_at_top(self):
+        self._mk_session(with_agent=False)
+        b = self._open_session()
+        self.assertEqual(self._root_ids(b), [('prompt', self.sess, 0)])
+
+        self._tail_arrive(b, 'W1', 'toolu_A', 'a1')
+        got = self._root_ids(b)
+        self.assertEqual(got, [
+            ('sep', self.sess, 'subagents'), ('agent', self.sess, 'W1'),
+            ('sep', self.sess, 'session'), ('prompt', self.sess, 0)])
+        self.assertEqual(got,
+                         [c.id for c in
+                          self.r.get_children(('session', self.sess))])
+
+    def test_subsequent_refetch_is_ordering_noop(self):
+        self._mk_session(with_agent=True)
+        b = self._open_session()
+        self._tail_arrive(b, 'W2', 'toolu_B', 'a2')
+        before = self._root_ids(b)
+        # A refetch of the session's children reproduces the same
+        # sequence: no divider duplicates, no reordering.
+        b.refresh(('session', self.sess))
+        self._pump(b)
+        self.assertEqual(self._root_ids(b), before)
+        # And an idle tail tick (no new bytes) pushes nothing.
+        records, dirty = self.r._read_new_records(self.sess)
+        self.assertEqual((records, dirty), ([], set()))
 
 
 if __name__ == '__main__':

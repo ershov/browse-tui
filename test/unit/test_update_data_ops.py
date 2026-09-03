@@ -718,6 +718,25 @@ class TestPositioningBeforeAfterById(unittest.TestCase):
         apply_ops(s, [upsert('x', '/', where=('after', None, 'c'), title='X')])
         self.assertEqual(_ids(s, '/'), ['a', 'b', 'c', 'x'])
 
+    def test_tuple_id_pivot(self):
+        # Recipe ids are tuples (e.g. browse-claude's divider sentinels);
+        # a tuple reference resolves by id equality like a str one.
+        s = State(root_id='/')
+        apply_ops(s, [upsert(('sep', 'j', 'subagents'), '/', title='S1'),
+                      upsert(('sep', 'j', 'session'), '/', title='S2')])
+        apply_ops(s, [upsert(('agent', 'j', 'A1'), '/',
+                             where=('after', None, ('sep', 'j', 'subagents')),
+                             title='A1')])
+        self.assertEqual(_ids(s, '/'), [('sep', 'j', 'subagents'),
+                                        ('agent', 'j', 'A1'),
+                                        ('sep', 'j', 'session')])
+
+    def test_tuple_id_pivot_missing_falls_back(self):
+        s = _seed_parent('a', 'b')
+        apply_ops(s, [upsert('x', '/', where=('after', None, ('no', 'pe')),
+                             title='X')])
+        self.assertEqual(_ids(s, '/'), ['a', 'b', 'x'])
+
 
 class TestPositioningBeforeAfterByIndex(unittest.TestCase):
     """``where=("before"/"after", None, int_idx)`` uses index lookup."""

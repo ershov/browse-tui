@@ -6511,10 +6511,16 @@ def _push_tail_diffs(b, dirty_parents):
 
     For each parent id whose child list grew during the fold step, we
     compare the live ``get_children(parent)`` output against what the
-    framework already has cached and ``upsert`` only the new entries.
-    Parents not yet expanded by the user are skipped — their children
-    will be fetched the normal way once expansion happens. Called on
-    the main thread via ``Browser.update_data`` (thread-safe).
+    framework already has cached and ``upsert`` only the new entries,
+    each positioned after its predecessor in the fresh listing (so a
+    tail-linked subagent lands INSIDE the session's top block — the
+    divider sentinel ids double as pivots — and a first subagent
+    brings the whole block in at the top, refetch-identical). Ops
+    apply in batch order, so a pivot upserted earlier in the same
+    batch resolves; a missing pivot degrades to append. Parents not
+    yet expanded by the user are skipped — their children will be
+    fetched the normal way once expansion happens. Called on the main
+    thread via ``Browser.update_data`` (thread-safe).
     """
     if not dirty_parents:
         return
@@ -6542,11 +6548,14 @@ def _push_tail_diffs(b, dirty_parents):
             fresh = get_children(parent_id)
         except Exception:
             continue
+        prev_id = None
         for child in fresh:
-            if child.id in existing_ids:
-                continue
-            ops.append(upsert(child.id, parent_id,
-                              **_item_to_upsert_kwargs(child)))
+            if child.id not in existing_ids:
+                where = (('first', None) if prev_id is None
+                         else ('after', None, prev_id))
+                ops.append(upsert(child.id, parent_id, where=where,
+                                  **_item_to_upsert_kwargs(child)))
+            prev_id = child.id
     if ops:
         b.update_data(ops)
 

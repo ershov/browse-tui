@@ -988,7 +988,8 @@ def _drop_subtree_indexes(state: State, item_id) -> None:
 #   TYPE:      "first" | "last" | "before" | "after"
 #   OPTIONS:   None  | frozenset of strings  (currently only "reposition")
 #   REFERENCE: required for "before"/"after"; int (child index, clamped)
-#              or str (child id, falls back to first/last when missing)
+#              or a child id — str or tuple — (falls back to first/last
+#              when missing)
 #
 # See ``docs/superpowers/specs/2026-05-15-update-data-positioning-design.md``.
 
@@ -1031,10 +1032,10 @@ def _validate_where(where) -> None:
                 f'{type_!r} requires a reference (3-tuple)'
             )
         ref = where[2]
-        if not isinstance(ref, (int, str)):
+        if not isinstance(ref, (int, str, tuple)):
             raise ValueError(
-                f'where reference must be int or str, '
-                f'got {type(ref).__name__}'
+                f'where reference must be int (index) or str/tuple '
+                f'(child id), got {type(ref).__name__}'
             )
     # For "first"/"last" a 3-tuple is tolerated; the reference slot is
     # silently ignored (forgiving — the parser dispatches on TYPE).
@@ -1054,7 +1055,7 @@ def _resolve_where_index(children_list, where, self_id=None):
           - ref < 0          -> collapse to first (0)
           - ref >= len       -> collapse to last (len)
           - 0 <= ref < len   -> use children_list[ref] as pivot
-      * "before"/"after" with str reference:
+      * "before"/"after" with id (str/tuple) reference:
           - id present       -> use that child as pivot
           - id missing       -> "before"->first, "after"->last
       * Same-id pivot (pivot resolves to ``self_id``) -> None

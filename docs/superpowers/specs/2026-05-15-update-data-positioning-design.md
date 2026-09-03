@@ -62,8 +62,8 @@ OPTIONS:   None
          | frozenset of strings   (e.g. frozenset({"reposition"}))
 REFERENCE: omitted for "first" / "last"
            required for "before" / "after":
-             int  — child index (clamped, see below)
-             str  — child id (looked up, see below)
+             int         — child index (clamped, see below)
+             str / tuple — child id (looked up, see below)
 ```
 
 Parser, in full:
@@ -274,7 +274,7 @@ mutation, not a viewport intent.
 | `where[0]` is `"first"`/`"last"` and `len(where) == 3`   | Tolerated — REFERENCE silently ignored. (Forgiving.) |
 | `where[0]` is `"before"`/`"after"` and `len(where) == 2` | `ValueError("'before'/'after' requires a reference")` |
 | `where[1]` not None and not a `set`/`frozenset`          | `ValueError("options must be None or a frozenset")` |
-| `where[2]` not None / int / str                          | `ValueError("reference must be int or str")`        |
+| `where[2]` not None / int / str / tuple (id)             | `ValueError("reference must be int (index) or str/tuple (child id)")` |
 | Unknown flag in options set                              | `ValueError("unknown option: …")`                   |
 
 Validation runs once per op, at the top of `_apply_upsert` / `_apply_set`,
