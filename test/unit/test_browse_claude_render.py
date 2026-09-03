@@ -10003,6 +10003,39 @@ class TestJsonPreviews(unittest.TestCase):
         # 2-space indentation proves the JSON path (raw body is compact).
         self.assertIn('  "type": "idle_notification"', out)
 
+    def _peer_body_rec(self, body):
+        return {'type': 'user', 'isMeta': True,
+                'origin': {'kind': 'peer', 'from': 'rev'},
+                'message': {'role': 'user', 'content': (
+                    '<agent-message from="rev">\n'
+                    + body + '\n</agent-message>')}}
+
+    def test_row_summary_idle_compact(self):
+        idle = ('{"type":"idle_notification","from":"rev",'
+                '"idleReason":"available","summary":"[to main] done"}')
+        out = self.r._summarise_message(self._peer_body_rec(idle))
+        self.assertEqual(out, '← rev: idle · available · [to main] done')
+
+    def test_row_summary_other_json_type_line(self):
+        out = self.r._summarise_message(
+            self._peer_body_rec('{"type":"task_update","detail":"x"}'))
+        self.assertEqual(out, '← rev: {task_update}')
+
+    def test_row_summary_json_no_type_first_key(self):
+        out = self.r._summarise_message(
+            self._peer_body_rec('{"status": "ok", "n": 3}'))
+        self.assertEqual(out, '← rev: {status: …}')
+
+    def test_row_summary_malformed_json_raw(self):
+        out = self.r._summarise_message(
+            self._peer_body_rec('{"type": "oops", broken'))
+        self.assertEqual(out, '← rev: {"type": "oops", broken')
+
+    def test_row_summary_markdown_body_unchanged(self):
+        out = self.r._summarise_message(
+            self._peer_body_rec('## Review\nall fine'))
+        self.assertEqual(out, '← rev: ## Review\nall fine')
+
     def test_peer_message_markdown_body_unchanged(self):
         rec = {'type': 'user', 'isMeta': True,
                'origin': {'kind': 'peer', 'from': 'rev'},

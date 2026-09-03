@@ -2258,7 +2258,7 @@ def _summarise_message(obj):
         return '← ' + ' · '.join(bits) if bits else '← task-notification'
     if _is_agent_message(obj):
         sender, body = _parse_agent_message(obj)
-        body = _trim(body, 5000)
+        body = _summarise_json_body(body) or _trim(body, 5000)
         return f'← {sender}: {body}' if sender else f'← {body}'
 
     # Metadata records — surface the salient field.
@@ -4519,6 +4519,33 @@ def _parse_agent_message(rec):
         if body.startswith(_AGENT_MSG_PREAMBLE):
             body = body[len(_AGENT_MSG_PREAMBLE):].strip()
     return sender, body
+
+
+def _summarise_json_body(body):
+    """Compact row one-liner for a JSON-object peer-message body, or
+    ``None`` (non-JSON, malformed almost-JSON and non-object JSON keep
+    the raw text — the preview still pretty-prints what parses).
+
+    Known shapes summarise off their salient fields (idle_notification
+    → reason + summary); any other object gets a short type/first-key
+    marker instead of a full raw-JSON line.
+    """
+    if not body.lstrip().startswith('{'):
+        return None
+    try:
+        parsed = json.loads(body)
+    except (TypeError, ValueError):
+        return None
+    if not isinstance(parsed, dict) or not parsed:
+        return None
+    if parsed.get('type') == 'idle_notification':
+        bits = [b for b in ('idle', parsed.get('idleReason'),
+                            parsed.get('summary')) if b]
+        return _trim(' · '.join(str(b) for b in bits), 5000)
+    t = parsed.get('type')
+    if isinstance(t, str) and t:
+        return f'{{{t}}}'
+    return f'{{{next(iter(parsed))}: …}}'
 
 
 def _fmt_tool_use_send_message(inp):
