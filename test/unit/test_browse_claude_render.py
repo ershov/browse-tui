@@ -9566,15 +9566,16 @@ class TestSendMessage(unittest.TestCase):
         self.assertNotIn("'content'", out)
 
     def test_fmt_tur_send_routing_json_content_colored(self):
-        # When the delivered content is itself JSON, it's JSON-colored
-        # (pretty-printed) rather than markdown-rendered.
+        # When the delivered content is itself a JSON object, it renders
+        # field-wise rather than markdown-rendered or dumped raw.
         out = self.r._fmt_tur_send_message({
             'success': True, 'message': 'sent',
             'routing': {'sender': 'a', 'target': '@b',
                         'content': '{"k": 1, "v": "x"}'},
         })
-        self.assertIn('"k"', out)
-        self.assertIn('"v"', out)
+        self.assertIn('k:', out)
+        self.assertIn('v:', out)
+        self.assertNotIn('"k"', out)
 
     # -- routing through _fmt_tool_use_result ------------------------------
 
@@ -9936,9 +9937,11 @@ class TestAgentPeerMessage(unittest.TestCase):
 
 
 class TestJsonPreviews(unittest.TestCase):
-    """Agent-exchanged bodies that ARE JSON render JSON-colored (never
-    through markdown), and string fields that themselves parse as JSON
-    unwrap into appended ``<path> =`` sections."""
+    """Agent-exchanged bodies that parse as a JSON object render
+    field-wise (``key: value`` header + per-field sections for long
+    strings); other JSON stays JSON-colored, and string fields that
+    themselves parse as JSON unwrap into appended ``<path> =``
+    sections."""
 
     @classmethod
     def setUpClass(cls):
@@ -10000,8 +10003,63 @@ class TestJsonPreviews(unittest.TestCase):
                    '<agent-message from="rev">\n'
                    + self._IDLE + '\n</agent-message>')}}
         out = self.r._render_agent_message(rec)
-        # 2-space indentation proves the JSON path (raw body is compact).
-        self.assertIn('  "type": "idle_notification"', out)
+        # Field-wise header block, not a JSON dump.
+        self.assertIn('idleReason:', out)
+        self.assertIn('idle_notification', out)
+        self.assertNotIn('"type"', out)
+
+    # -- field-wise rendering of JSON-object bodies -----------------------------
+
+    def test_json_object_body_header_block_aligned(self):
+        out = self.r._render_message_body(
+            '{"type":"idle_notification","from":"rev",'
+            '"idleReason":"available","n":3,"ok":true}')
+        # Keys pad to the longest ('idleReason') so values align.
+        self.assertIn('type:      ', out)
+        self.assertIn('idleReason:', out)
+        # Non-string scalars render via json (true, not True).
+        self.assertIn('true', out)
+        self.assertIn('3', out)
+        self.assertNotIn('  "type"', out)
+
+    def test_json_object_body_long_field_multiline(self):
+        import json as _json
+        body = _json.dumps({
+            'type': 'idle_notification', 'from': 'rev',
+            'idleReason': 'available',
+            'result': ('Ticket done. Summary:\n\n'
+                       '- **Finding:** the gap was the row summary\n'
+                       '- **Change:** added a summariser\n'),
+        })
+        out = self.r._render_message_body(body)
+        # Header block for the short fields...
+        self.assertIn('idleReason:', out)
+        # ...then a per-field rule and the REAL multi-line text.
+        self.assertIn('── result ', out)
+        self.assertIn('- **Finding:** the gap was the row summary', out)
+        self.assertNotIn('\\n', out)
+
+    def test_json_object_body_nested_container_inline(self):
+        out = self.r._render_message_body(
+            '{"type":"spawn","cfg":{"a": 1, "b": [2]},"ids":[1,2]}')
+        self.assertIn('{"a": 1, "b": [2]}', out)
+        self.assertIn('[1, 2]', out)
+        # Compact inline, never the 2-space pretty-print.
+        self.assertNotIn('  "a": 1', out)
+
+    def test_json_array_body_keeps_pretty_print(self):
+        out = self.r._render_message_body('[1, 2, 3]')
+        self.assertEqual(out, self.r._maybe_json_color('[1, 2, 3]'))
+
+    def test_malformed_json_body_fallback_unchanged(self):
+        body = '{"type": "oops", broken'
+        self.assertEqual(self.r._render_message_body(body),
+                         self.r._md_voice(body))
+
+    def test_markdown_body_byte_identical(self):
+        body = '## Review\n\nall *fine* here'
+        self.assertEqual(self.r._render_message_body(body),
+                         self.r._md_voice(body))
 
     def _peer_body_rec(self, body):
         return {'type': 'user', 'isMeta': True,
@@ -10049,13 +10107,15 @@ class TestJsonPreviews(unittest.TestCase):
         text = ('<task-notification><status>completed</status>'
                 '<result>' + self._IDLE + '</result></task-notification>')
         out = self.r._render_task_notification(text)
-        self.assertIn('  "type": "idle_notification"', out)
+        self.assertIn('idleReason:', out)
+        self.assertNotIn('"type"', out)
 
     def test_outbound_send_message_json_body(self):
         out = self.r._fmt_tool_use_send_message(
             {'recipient': 'worker', 'summary': 's',
              'message': self._IDLE})
-        self.assertIn('  "type": "idle_notification"', out)
+        self.assertIn('idleReason:', out)
+        self.assertNotIn('"type"', out)
 
     # -- JSON in raw tool_result bodies (leaf + umbrellas) ---------------------
 
@@ -13473,8 +13533,10 @@ class TestToolUmbrellaSearchSkillSend(unittest.TestCase):
         out = self.r._fmt_tool_umbrella_send_message(
             {'recipient': 'w', 'message': '{"cmd": "run", "n": 2}'},
             None, None, False)
-        self.assertIn('"cmd"', out)
-        self.assertIn('"n"', out)
+        # JSON-object body renders field-wise, once.
+        self.assertIn('cmd:', out)
+        self.assertEqual(out.count('run'), 1)
+        self.assertNotIn('"cmd"', out)
 
     def test_send_message_empty_input_degrades(self):
         self.assertIsNone(self.r._fmt_tool_umbrella_send_message(

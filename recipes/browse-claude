@@ -3233,7 +3233,7 @@ def _user_body_text(content, bg='0'):
 
 def _render_task_notification(text):
     """Inbound worker→leader reply: a status/summary/output-file header
-    then the ``<result>`` rendered as markdown via ``_md_voice``."""
+    then the ``<result>`` through ``_render_message_body``."""
     d = _parse_task_notification(text)
     head = f'{CYAN}{BOLD}← task-notification{RESET}'
     if d['task_id']:
@@ -3253,8 +3253,8 @@ def _render_task_notification(text):
 
 def _render_agent_message(obj):
     """Inbound peer message (another session's SendMessage): a sender
-    header, then the wrapped body — JSON-colored when the body IS JSON
-    (idle notifications, protocol messages), markdown otherwise."""
+    header, then the wrapped body — field-wise when the body is a JSON
+    object (idle notifications, protocol messages), markdown otherwise."""
     sender, body = _parse_agent_message(obj)
     head = f'{GREEN}{BOLD}← agent-message{RESET}'
     if sender:
@@ -4524,7 +4524,8 @@ def _parse_agent_message(rec):
 def _summarise_json_body(body):
     """Compact row one-liner for a JSON-object peer-message body, or
     ``None`` (non-JSON, malformed almost-JSON and non-object JSON keep
-    the raw text — the preview still pretty-prints what parses).
+    the raw text — the preview renders objects field-wise and still
+    pretty-prints other JSON).
 
     Known shapes summarise off their salient fields (idle_notification
     → reason + summary); any other object gets a short type/first-key
@@ -4841,11 +4842,56 @@ def _fmt_tur_skill(tur):
     return f'{MAGENTA}{name}{RESET}  {color}[{"ok" if ok else "fail"}]{RESET}'
 
 
+# Longest string still shown inline in the header block of a field-wise
+# JSON body render; longer (or multi-line) strings get a full section.
+_JSON_FIELD_SHORT_MAX = 80
+
+
+def _render_json_fields(obj):
+    """Field-wise render of a JSON-object agent-message body.
+
+    Short scalars (strings without newlines up to
+    ``_JSON_FIELD_SHORT_MAX``, numbers, bools, null) form an aligned dim
+    ``key: value`` header block in object key order; nested containers
+    join it as compact one-line dumps. Long / multi-line strings follow,
+    each under a ``── <key> ──`` rule, rendered exactly like a plain
+    markdown body (``_md_voice``).
+    """
+    header, long_fields = [], []
+    for key, val in obj.items():
+        if isinstance(val, str) and ('\n' in val
+                                     or len(val) > _JSON_FIELD_SHORT_MAX):
+            long_fields.append((key, val))
+        elif isinstance(val, str):
+            header.append((key, val))
+        else:
+            header.append((key, json.dumps(val, ensure_ascii=False)))
+    out = []
+    if header:
+        w = max(len(k) for k, _ in header) + 1
+        out.extend(f'{MUTE}{(k + ":").ljust(w)}{RESET} {GRAY}{v}{RESET}'
+                   for k, v in header)
+    for key, val in long_fields:
+        if out:
+            out.append('')
+        out.append(_rule(key))
+        out.append(_md_voice(val))
+    return '\n'.join(out)
+
+
 def _render_message_body(message):
-    """Render an agent-exchanged body: JSON-colored when it parses as
-    JSON (nested JSON-strings decoded too), else through ``_md_voice``
-    (the body is markdown otherwise). Shared by SendMessage in both
-    directions, task-notification results and peer messages."""
+    """Render an agent-exchanged body: a JSON OBJECT renders field-wise
+    (``_render_json_fields``), other JSON keeps the colored pretty-print,
+    else through ``_md_voice`` (the body is markdown otherwise). Shared
+    by SendMessage in both directions, task-notification results and
+    peer messages."""
+    if isinstance(message, str) and re.match(r'^\s*\{', message):
+        try:
+            parsed = json.loads(message)
+        except (TypeError, ValueError):
+            parsed = None
+        if isinstance(parsed, dict) and parsed:
+            return _render_json_fields(parsed)
     colored = _maybe_json_color(message)
     return colored if colored is not None else _md_voice(message)
 
@@ -4876,7 +4922,8 @@ def _fmt_tur_send_message(tur):
     (``✓ delivered`` / ``✗ <error>``). Success shape adds a ``routing`` block
     (``sender``/``target``/``summary``/``content``, all echoing the request);
     when present we surface ``<sender> → <target>``, the summary, and the
-    delivered content (``_render_message_body`` — JSON-colored or markdown).
+    delivered content (``_render_message_body`` — field-wise /
+    JSON-colored / markdown).
     """
     status = _send_message_status_line(tur)
     routing = tur.get('routing')
