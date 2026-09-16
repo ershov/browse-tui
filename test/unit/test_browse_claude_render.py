@@ -8030,9 +8030,14 @@ class TestRecordMinLevel(unittest.TestCase):
         rec = {'type': 'system', 'subtype': 'compact_boundary'}
         self.assertEqual(self.r._record_min_level(rec), 2)
 
+    def test_model_refusal_fallback_is_level_2(self):
+        # The answer was replaced by a safeguards notice — a reader
+        # skimming voice must see why the turn looks off.
+        rec = {'type': 'system', 'subtype': 'model_refusal_fallback'}
+        self.assertEqual(self.r._record_min_level(rec), 2)
+
     def test_promoted_system_subtypes_are_level_5(self):
-        for sub in ('model_refusal_fallback', 'away_summary',
-                    'agents_killed'):
+        for sub in ('away_summary', 'agents_killed'):
             with self.subTest(subtype=sub):
                 rec = {'type': 'system', 'subtype': sub}
                 self.assertEqual(self.r._record_min_level(rec), 5)

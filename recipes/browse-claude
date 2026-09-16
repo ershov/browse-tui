@@ -1899,7 +1899,6 @@ _L3_USEFUL = frozenset([
     'marble-origami-commit',
     'cost-state',
     ('system', 'local_command'),
-    ('system', 'model_refusal_fallback'),
     ('system', 'away_summary'),
     ('system', 'agents_killed'),
     ('attachment', 'file'),
@@ -2041,7 +2040,9 @@ def _record_min_level(rec):
       * an Edit/Write/NotebookEdit/MultiEdit tool record   → 3  (edits)
       * other user / assistant machinery (tool_use,
         tool_result)                                       → 4  (tools)
-      * ``system/compact_boundary`` (structural marker)    → 2
+      * ``system/compact_boundary`` (structural marker) and
+        ``system/model_refusal_fallback`` (the answer was
+        replaced by a safeguards notice)                   → 2
       * ``_LIVE_EXTRAS`` framing (system turn_duration /
         api_error)                                         → 4
       * ``_L3_USEFUL`` curated metadata                    → 5  (detailed)
@@ -2094,9 +2095,10 @@ def _record_min_level(rec):
         return 4
     if t == 'system':
         sub = rec.get('subtype')
-        # "Conversation compacted" is a structural boundary the reader
-        # should see even when skimming voice.
-        if sub == 'compact_boundary':
+        # Events the reader must see even when skimming voice: the
+        # conversation was compacted, or the answer was replaced by a
+        # safeguards notice.
+        if sub in ('compact_boundary', 'model_refusal_fallback'):
             return 2
         if (t, sub) in _LIVE_EXTRAS:
             return 4
