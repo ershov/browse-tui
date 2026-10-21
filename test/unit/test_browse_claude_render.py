@@ -4946,6 +4946,7 @@ class TestSubagentUmbrellaVoice(unittest.TestCase):
             class _State:
                 cursor = 0
                 expanded = set()
+                scope_stack = []
 
             class _Pending:
                 def __init__(self):
@@ -5037,6 +5038,7 @@ class TestSubagentUmbrellaVoice(unittest.TestCase):
             class _State:
                 cursor = 0
                 expanded = set()
+                scope_stack = []
 
             class _Pending:
                 def __init__(self):
@@ -5109,6 +5111,7 @@ class TestSubagentUmbrellaVoice(unittest.TestCase):
             class _State:
                 cursor = 0
                 expanded = set()
+                scope_stack = []
 
             class _Pending:
                 def __init__(self):
@@ -13642,6 +13645,135 @@ class TestToolUmbrellaExitPlanMode(unittest.TestCase):
             {}, 'User has approved your plan.', None, False))
         self.assertIsNone(self.r._fmt_tool_umbrella_exit_plan_mode(
             {'plan': ''}, None, None, False))
+
+
+class TestChainExpandTrimsToScope(unittest.TestCase):
+    """``_chain_expand_then_cursor`` never expands an ancestor that sits
+    above the current scope root.
+
+    A subagent ``.jsonl`` opened directly is scoped as
+    ``('session', agent_path)``; its records' ancestor chain still starts
+    at the outer ``('agent', parent_session, aid)`` group row, which is
+    not in the displayed tree. Expanding it lists the same ids as the
+    scope root and the framework reparents them away (empty list). The
+    chain must be trimmed to what lies below the scope.
+    """
+
+    @classmethod
+    def setUpClass(cls):
+        cls.r = _load_recipe()
+
+    def _fake_browser(self, scope_stack, expanded=()):
+        calls = []
+
+        class _Pending:
+            def then(self, cb):
+                cb()
+
+        class _State:
+            pass
+        st = _State()
+        st.scope_stack = list(scope_stack)
+        st.expanded = set(expanded)
+
+        class _B:
+            _state = st
+
+            def expand(self, id_, autoscroll=False):
+                calls.append(('expand', id_))
+                return _Pending()
+
+            def cursor_to(self, id_):
+                calls.append(('cursor_to', id_))
+        return _B(), calls
+
+    SESS = '/p/parent.jsonl'
+    AGENT = '/p/parent/subagents/agent-A1.jsonl'
+
+    def _chain(self):
+        return [('agent', self.SESS, 'A1'), ('prompt', self.AGENT, 0)]
+
+    def test_direct_open_drops_outer_group(self):
+        b, calls = self._fake_browser([('session', self.AGENT)])
+        target = ('msg', self.AGENT, 1)
+        self.r._chain_expand_then_cursor(b, self._chain(), target)
+        self.assertEqual(calls, [
+            ('expand', ('prompt', self.AGENT, 0)),
+            ('cursor_to', target),
+        ])
+
+    def test_nested_in_parent_session_keeps_full_chain(self):
+        b, calls = self._fake_browser([('session', self.SESS)])
+        target = ('msg', self.AGENT, 1)
+        self.r._chain_expand_then_cursor(b, self._chain(), target)
+        self.assertEqual(calls, [
+            ('expand', ('agent', self.SESS, 'A1')),
+            ('expand', ('prompt', self.AGENT, 0)),
+            ('cursor_to', target),
+        ])
+
+    def test_scope_id_inside_chain_is_dropped_with_everything_above(self):
+        # Scoped into the subagent group row itself (alt-down on it).
+        b, calls = self._fake_browser([('session', self.SESS),
+                                       ('agent', self.SESS, 'A1')])
+        target = ('msg', self.AGENT, 1)
+        self.r._chain_expand_then_cursor(b, self._chain(), target)
+        self.assertEqual(calls, [
+            ('expand', ('prompt', self.AGENT, 0)),
+            ('cursor_to', target),
+        ])
+
+    def test_parent_project_scope_keeps_group_row(self):
+        b, calls = self._fake_browser([('project', '/p')])
+        target = ('msg', self.AGENT, 1)
+        self.r._chain_expand_then_cursor(b, self._chain(), target)
+        self.assertEqual([c for c in calls if c[0] == 'expand'], [
+            ('expand', ('agent', self.SESS, 'A1')),
+            ('expand', ('prompt', self.AGENT, 0)),
+        ])
+
+    def test_subagents_dir_project_scope_drops_group_row(self):
+        # alt-up from a directly opened subagent lands on its
+        # ``subagents/`` dir as a project; the parent session is not
+        # listed there, so its group row is above the scope.
+        b, calls = self._fake_browser([('project', '/p/parent/subagents')])
+        target = ('msg', self.AGENT, 1)
+        self.r._chain_expand_then_cursor(b, self._chain(), target)
+        self.assertEqual(calls, [
+            ('expand', ('prompt', self.AGENT, 0)),
+            ('cursor_to', target),
+        ])
+
+    def test_umbrella_scope_under_direct_open_drops_group_row(self):
+        # Scoped into the subagent's <prompt> umbrella with the cursor
+        # on the scope row: the target IS the scope root, so the chain
+        # is just the outer group row — which must not be expanded.
+        b, calls = self._fake_browser([('project', '/p/parent/subagents'),
+                                       ('session', self.AGENT),
+                                       ('prompt', self.AGENT, 0)])
+        target = ('prompt', self.AGENT, 0)
+        self.r._chain_expand_then_cursor(
+            b, [('agent', self.SESS, 'A1')], target)
+        self.assertEqual(calls, [('cursor_to', target)])
+
+    def test_no_scope_is_untouched(self):
+        b, calls = self._fake_browser([])
+        self.r._chain_expand_then_cursor(b, self._chain(),
+                                         ('msg', self.AGENT, 1))
+        self.assertEqual(len([c for c in calls if c[0] == 'expand']), 2)
+
+    def test_trim_helper_edge_cases(self):
+        trim = self.r._trim_chain_to_scope
+        # Chain entirely above the scope → nothing left to expand.
+        self.assertEqual(trim([('session', self.AGENT)],
+                              [('agent', self.SESS, 'A1')]), [])
+        # Legacy team worker: the worker transcript is a sibling session
+        # with no agent hop in the chain — nothing to drop even though
+        # its ids are keyed under another file.
+        worker_chain = [('prompt', '/p/worker.jsonl', 0)]
+        self.assertEqual(trim([('session', self.SESS)], worker_chain),
+                         worker_chain)
+        self.assertEqual(trim([], self._chain()), self._chain())
 
 
 if __name__ == '__main__':

@@ -8063,12 +8063,14 @@ def _outer_subagent_group_id(path):
         <project_dir>/<parent_session_id>/subagents/agent-<aid>.jsonl
 
     and the parent session shows them as collapsible rows with id
-    ``('agent', parent_session_path, aid)``. That outer row is the
-    framework-visible parent of every record inside the subagent —
-    if it isn't expanded, none of the subagent's records are
-    reachable. Used by ``_ancestor_ids_for`` to prepend it to the
-    chain so cursor preservation works across t-toggle from anywhere
-    inside a subagent.
+    ``('agent', parent_session_path, aid)``. When the parent session is
+    the view, that outer row is the framework-visible parent of every
+    record inside the subagent — if it isn't expanded, none of the
+    subagent's records are reachable. Used by ``_ancestor_ids_for`` to
+    prepend it to the chain so cursor preservation works across
+    t-toggle from anywhere inside a subagent. (When the subagent file is
+    itself the scope root the row is above the scope;
+    ``_trim_chain_to_scope`` drops it again.)
 
     For a worktree-relocated subagent the session ``.jsonl`` is NOT the
     co-located sibling of the ``<sid>`` dir (it lives in a different,
@@ -8451,7 +8453,8 @@ def _jump_to_link(ctx, target_id):
 
     Tree mode walks the full umbrella chain (crossing into a subagent's
     group row when the target lives in its .jsonl); flat mode only needs
-    the group row expanded for a cross-file target. A target the active
+    the group row expanded for a cross-file target. Either chain is
+    trimmed to the current scope by ``_chain_expand_then_cursor``. A target the active
     detail level hides can't take the cursor — land on its nearest
     filter-visible ancestor instead (e.g. the wrapping ``<prompt>``).
     """
@@ -8538,6 +8541,43 @@ def _seed_scope_root_item(b, target_jsonl):
     b._state._items_by_id[item.id] = item
 
 
+def _trim_chain_to_scope(scope_stack, ancestor_ids):
+    """Drop the ancestors that sit at or above the current scope root.
+
+    ``_ancestor_ids_for`` walks the data structure, so a record inside a
+    subagent ``.jsonl`` always gets the outer ``('agent', S, aid)`` group
+    row (a top-level row of the parent session ``S``) prepended. When the
+    subagent file is itself the scope root — opened directly, scoped
+    into one of its umbrellas, or listed from its ``subagents/`` dir as
+    a project — that row is not in the displayed tree. Expanding it
+    lists the same ids as the scope root and the framework's
+    single-parent model reparents them away, emptying the visible list.
+
+    Two cuts:
+
+      * the scope id itself appears in the chain → keep only what follows
+        it (scoped into the subagent group row);
+      * a leading agent group row is kept only when its session ``S`` is
+        part of the view — ``('session', S)`` on the scope stack, or the
+        scope is the project dir that lists ``S``. Otherwise it is above
+        the scope and is dropped. Every other id shape has a single
+        parent, so an out-of-scope expand of it is harmless.
+    """
+    chain = list(ancestor_ids)
+    if not scope_stack or not chain:
+        return chain
+    scope_id = scope_stack[-1]
+    if scope_id in chain:
+        return chain[chain.index(scope_id) + 1:]
+    head = chain[0]
+    if isinstance(head, tuple) and head[:1] == ('agent',):
+        sess = head[1]
+        if (('session', sess) not in scope_stack
+                and scope_id != ('project', os.path.dirname(sess))):
+            return chain[1:]
+    return chain
+
+
 def _chain_expand_then_cursor(b, ancestor_ids, target_id):
     """Sequentially expand ``ancestor_ids`` (root → leaf), then ``cursor_to``.
 
@@ -8558,13 +8598,18 @@ def _chain_expand_then_cursor(b, ancestor_ids, target_id):
     claimed: an already-expanded one never re-fires ``on_expand``, so
     its claim would go stale and eat a later manual re-expand's jump.
 
+    The chain is first trimmed to what lies below the current scope
+    root (``_trim_chain_to_scope``) — an ancestor above the scope is not
+    in the displayed tree, and expanding it can steal the scope's rows.
+
     ``b`` is a Browser or a Context — both expose ``expand`` /
     ``cursor_to``; the expanded-set read handles either shape.
     """
+    state = b._state if hasattr(b, '_state') else b.state
+    ancestor_ids = _trim_chain_to_scope(state.scope_stack, ancestor_ids)
     if not ancestor_ids:
         b.cursor_to(target_id)
         return
-    state = b._state if hasattr(b, '_state') else b.state
     def _step(i):
         if i >= len(ancestor_ids):
             b.cursor_to(target_id)
