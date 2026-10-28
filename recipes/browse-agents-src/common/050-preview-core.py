@@ -13,7 +13,7 @@
 # inline here — ``md_doc`` is codec-free and only contributes single-document
 # operations (``get_doc`` / ``node_at_line`` / ``visible_children`` /
 # ``find_md_refs`` / ``resolve_md_ref``). ``anchor`` is the host message
-# ``('msg', jsonl, n)``; ``chain`` is a TUPLE of referenced-file abspaths
+# ``('msg', sess, n)``; ``chain`` is a TUPLE of referenced-file abspaths
 # followed from the anchor (``()`` = the message's own inline doc); ``line`` is
 # a heading ``line_offset`` (int) or ``None`` for the doc root. Routing is
 # ``id[0] == 'md'`` / ``id[0] == 'refs'``. The whole section is a no-op when
@@ -303,7 +303,7 @@ def _md_refs_umbrella_children(item_id):
     Two document shapes, mirroring the two callers:
 
       * **message base** (``chain == ()``) → scan the whole record's string
-        leaves (prose + tool paths), anchored on ``_session_cwd_and_root`` with
+        leaves (prose + tool paths), anchored on ``store_session_cwd_and_root`` with
         ``doc_dir = cwd or project_root`` — the message-level rule. Refs chain
         directly off the message anchor.
       * **file-doc** (``chain`` non-empty) → the file's own text
@@ -314,8 +314,8 @@ def _md_refs_umbrella_children(item_id):
     ref exists, so an empty result here means the doc became unreadable since).
     """
     _, anchor, chain = item_id
-    jsonl_path = anchor[1]
-    cwd, project_root = _session_cwd_and_root(jsonl_path)
+    sess = anchor[1]
+    cwd, project_root = store_session_cwd_and_root(sess)
     if chain:
         # File-doc umbrella: resolve the file's own refs, nested onto its chain.
         text, doc = _md_chain_doc(anchor, chain)
@@ -328,7 +328,7 @@ def _md_refs_umbrella_children(item_id):
                 text, doc_dir, cwd or '', project_root or '')
         ]
     # Message-level umbrella: resolve every existing ref across the record.
-    rec = _read_jsonl_line(jsonl_path, anchor[2])
+    rec = _record_at(sess, anchor[2])
     if rec is None:
         return []
     doc_dir = cwd or project_root
@@ -341,7 +341,7 @@ def _md_refs_umbrella_children(item_id):
 
 
 def _md_message_children(anchor):
-    """Children of a markdown message row ``anchor`` (``('msg', jsonl, n)``).
+    """Children of a markdown message row ``anchor`` (``('msg', sess, n)``).
 
     The authoritative build (lazy, on expand): an inline ``markdown`` document
     node (only when the message's own text actually parses to ≥1 heading) plus a
@@ -356,7 +356,7 @@ def _md_message_children(anchor):
     neither holds (the optimistic detection arrow then self-heals).
     """
     path, n = anchor[1], anchor[2]
-    rec = _read_jsonl_line(path, n)
+    rec = _record_at(path, n)
     if rec is None:
         return []
 
@@ -382,7 +382,7 @@ def _md_message_children(anchor):
     # (its ``('refs', …)`` id routes to ``_md_refs_umbrella_children`` in
     # ``get_children``); here we only short-circuit on the FIRST existing ref.
     # The same concatenated string leaves (prose + tool paths) feed both halves.
-    cwd, project_root = _session_cwd_and_root(path)
+    cwd, project_root = store_session_cwd_and_root(path)
     doc_dir = cwd or project_root
     record_text = '\n'.join(_iter_str_leaves(rec))
     if _has_any_existing_ref(record_text, doc_dir, cwd or '', project_root or ''):
@@ -406,7 +406,7 @@ def _md_chain_doc(anchor, chain):
             return _md_doc.get_doc(chain[-1])
         except OSError:
             return None, None
-    rec = _read_jsonl_line(anchor[1], anchor[2])
+    rec = _record_at(anchor[1], anchor[2])
     if rec is None:
         return None, None
     text = _message_md_text(rec)
@@ -460,7 +460,7 @@ def _md_subtree_children(item_id):
     out = [_md_node_item(anchor, chain, node)
            for node in _md_doc.visible_children(doc.tree)]
     if chain:
-        cwd, project_root = _session_cwd_and_root(anchor[1])
+        cwd, project_root = store_session_cwd_and_root(anchor[1])
         doc_dir = os.path.dirname(chain[-1])
         if _has_any_existing_ref(text, doc_dir, cwd or '', project_root or ''):
             out.append(_md_refs_umbrella_item(anchor, chain))
@@ -723,19 +723,34 @@ def _looks_markdown(text):
 # ---- get_preview ---------------------------------------------------------
 
 
+def _record_at(sess, n):
+    """The record with key ``n`` in session ``sess``, or ``None``.
+
+    Served from the cached ``_TreeData`` (read on first use), so a
+    preview is an O(1) lookup. ``None`` for an unknown session, a key
+    out of range and placeholder records.
+    """
+    if sess not in _TREE_CACHE and not store_session_exists(sess):
+        return None
+    td = _scan_tree(sess)
+    if 0 <= n < len(td.records):
+        return td.records[n]
+    return None
+
+
 def get_preview(item_id):
     """Preview-pane content for the cursor item.
 
     * ``('project', dir)``     : human-readable summary + session list
-    * ``('session', jsonl)``   : concatenated child previews (same machinery
+    * ``('session', sess)``    : concatenated child previews (same machinery
                                   as the umbrella previews — uniform body
                                   cascade, honours the detail filter
                                   transparently via ``hidden`` on children).
-    * ``('agent', jsonl, aid)``: same uniform cascade against the subagent's
-                                  own .jsonl.
+    * ``('agent', sess, aid)`` : same uniform cascade against the subagent's
+                                  own transcript.
     * ``('prompt'|'tool'|'span', …)`` umbrella: concatenated bodies of the
                                   umbrella's direct children.
-    * ``('msg', jsonl, n)``    : pretty-printed JSON of the line.
+    * ``('msg', sess, n)``     : the rendered record.
     * ``('md'|'refs', …)``     : its own document / label-list preview.
     """
     if not isinstance(item_id, tuple) or not item_id:
@@ -762,15 +777,14 @@ def get_preview(item_id):
     if _is_cross_file_id(item_id):
         if _item_is_active(item_id):
             return _preview_umbrella(item_id)
-        file_path = _scope_card_path(item_id)
-        return _preview_file_metadata(file_path) if file_path else ''
+        sess = _scope_card_session(item_id)
+        return _preview_session_card(sess) if sess else ''
     if tag in ('prompt', 'tool', 'span'):
         return _preview_umbrella(item_id)
     if tag == 'msg':
         return _preview_message(item_id[1], item_id[2])
     if tag == 'project':
-        project_dir = item_id[1]
-        return _preview_project(project_dir) if os.path.isdir(project_dir) else ''
+        return store_project_preview(item_id[1])
     return ''
 
 
@@ -794,88 +808,27 @@ def _item_is_active(item_id):
     return item_id in state.expanded
 
 
-def _preview_file_metadata(path):
+def _preview_session_card(sess):
     """Cheap metadata-only preview for a cross-file row.
 
-    Reads only the first line of the file (for the Claude stamps)
-    and one ``os.stat``. Avoids ``_scan_tree`` entirely — scrolling
-    through a project of large transcripts (or a session with many
-    subagents) must not block on parsing megabytes of records.
-
-    Detects the subagent variant when ``path`` lives under a
-    ``subagents/`` directory with a sibling ``.meta.json``; surfaces
-    agentId / agentType / description from the meta file.
+    Built from ``store_session_info`` (first record + one stat; never a
+    full read), so scrolling through a project of large transcripts
+    (or a session with many subagents) does not block on parsing.
     """
-    rec = {}
-    try:
-        with open(path, 'r', encoding='utf-8', errors='replace') as f:
-            line = f.readline()
-        if line.strip():
-            try:
-                parsed = json.loads(line)
-                if isinstance(parsed, dict):
-                    rec = parsed
-            except (TypeError, ValueError):
-                pass
-    except OSError:
-        pass
-    is_sub = False
-    parent = os.path.dirname(path)
-    if os.path.basename(parent) == 'subagents':
-        fname = os.path.basename(path)
-        if fname.startswith('agent-') and fname.endswith('.jsonl'):
-            meta_path = os.path.join(parent,
-                                     fname[:-len('.jsonl')] + '.meta.json')
-            if os.path.isfile(meta_path):
-                is_sub = True
-    rows = [('path', path)]
-    if is_sub:
-        agent_id = os.path.basename(path)[len('agent-'):-len('.jsonl')]
-        meta = _read_subagent_meta(os.path.join(
-            os.path.dirname(path), f'agent-{agent_id}.meta.json',
-        ))
-        rows.append(('agentId', agent_id))
-        if meta.get('agentType'):
-            rows.append(('agentType', meta['agentType']))
-        if meta.get('description'):
-            rows.append(('description', meta['description']))
-    for key in ('sessionId', 'entrypoint', 'cwd', 'gitBranch', 'slug'):
-        v = rec.get(key)
-        if v:
-            rows.append((key, v))
-    try:
-        st = os.stat(path)
-        rows.append(('mtime', _human_time(st.st_mtime)))
-    except OSError:
-        pass
+    info = store_session_info(sess)
+    rows = [('path', info['path'])] + list(info['meta'])
+    if info['mtime'] is not None:
+        rows.append(('mtime', _human_time(info['mtime'])))
     w = max(len(k) for k, _ in rows)
     body = '\n'.join(
         f'   {MUTE}{k.ljust(w)}:{RESET} {v}' for k, v in rows
     )
     hint = (f'\n\n{MUTE}(expand or scope in to see the transcript){RESET}')
-    label = 'browse-claude (subagent)' if is_sub else 'browse-claude'
+    label = _prog_name() + (' (subagent)' if info['is_child'] else '')
     return f'{_rule(label, BLUE)}\n{body}\n{_rule()}{hint}'
 
 
-def _preview_project(path):
-    try:
-        names = sorted(
-            n for n in os.listdir(path) if n.endswith('.jsonl')
-        )
-    except OSError as e:
-        return f'[error] {e}'
-    header = (
-        f'project: {_real_project_path(path)}\n'
-        f'path:    {path}\n'
-        f'\n{len(names)} session(s):'
-    )
-    body = '\n'.join(f'  {n}' for n in names[:1000])
-    if len(names) > 50:
-        body += f'\n  … and {len(names) - 50} more'
-    return f'{header}\n{body}' if body else header
-
-
-def _preview_message(path, n):
+def _preview_message(sess, n):
     """Per-line preview for a leaf message: classify + dispatch + chrome.
 
     Each renderer returns a body str with ANSI inlined. The chrome
@@ -884,83 +837,48 @@ def _preview_message(path, n):
     preview no longer concatenates anything extra — the umbrella's own
     preview is where multi-child concatenation lives.
     """
-    obj = _read_jsonl_line(path, n)
+    obj = _record_at(sess, n)
     if obj is None:
         return ''
     kind = _classify(obj)
     body = _RENDERERS.get(kind, _render_unknown)(obj)
-    chrome = _fmt_chrome(obj, _turn_root_ts(path, n))
+    chrome = _fmt_chrome(obj, _turn_root_ts(sess, n))
     return body + ('\n' + chrome if chrome else '')
 
 
-def _scope_card_path(item_id):
-    """Return the on-disk .jsonl whose scope card should prepend the
-    preview, or None if ``item_id`` doesn't anchor a synthetic top row.
+def _scope_card_session(item_id):
+    """The session whose scope card should prepend the preview, or None.
 
-    Two id kinds earn the card: a ``('session', jsonl)`` row (top row in
-    the project's session list, or when ``--file`` opens a transcript
+    Two id kinds earn the card: a ``('session', sess)`` row (top row in
+    the project's session list, or when a transcript is opened
     directly) and an ``('agent', sess, aid)`` row whose preview is
-    composed from the subagent's own jsonl.
+    composed from the subagent's own transcript.
     """
     if not isinstance(item_id, tuple) or not item_id:
         return None
     if item_id[0] == 'agent':
-        sess, aid = item_id[1], item_id[2]
-        if not aid:
-            return None
-        agent_path = _resolve_agent_jsonl(sess, aid)
-        return agent_path if os.path.isfile(agent_path) else None
+        return store_child_session(item_id[1], item_id[2])
     if item_id[0] == 'session':
-        jsonl_path = item_id[1]
-        return jsonl_path if os.path.isfile(jsonl_path) else None
+        sess = item_id[1]
+        return sess if store_session_exists(sess) else None
     return None
 
 
-def _fmt_scope_card(path, td):
-    """One-block header identifying the file backing the synthetic top row.
+def _fmt_scope_card(sess, td):
+    """One-block header identifying the session backing the synthetic top row.
 
-    Pulls sessionId / entrypoint / cwd / gitBranch / slug from the
-    first record that has them (every Claude record carries the
-    stamps), plus the session name captured during the scan
-    (custom-title outranks ai-title). Subagent variant additionally
-    lists agentId, agentType and description from the sibling
-    meta.json. Returns a string ready to prepend to the cascade body.
+    Store facts (``store_session_info``: path, child metadata, the
+    session stamps) plus what the scan knows — the session name
+    captured during the fold (custom-title outranks ai-title), the
+    record and voice counts. Returns a string ready to prepend to the
+    cascade body.
     """
-    rec = next((r for r in td.records if isinstance(r, dict)), None) or {}
-    is_sub = False
-    parent = os.path.dirname(path)
-    if os.path.basename(parent) == 'subagents':
-        fname = os.path.basename(path)
-        if fname.startswith('agent-') and fname.endswith('.jsonl'):
-            meta_path = os.path.join(parent, fname[:-len('.jsonl')]
-                                     + '.meta.json')
-            if os.path.isfile(meta_path):
-                is_sub = True
-    rows = []
-    rows.append(('path', path))
+    info = store_session_info(sess)
+    rows = [('path', info['path'])]
     name = _clean_title(td.custom_title or td.ai_title)
     if name:
         rows.append(('name', name))
-    if is_sub:
-        agent_id = os.path.basename(path)[len('agent-'):-len('.jsonl')]
-        meta = _read_subagent_meta(os.path.join(
-            os.path.dirname(path), f'agent-{agent_id}.meta.json',
-        ))
-        rows.append(('agentId', agent_id))
-        if meta.get('agentType'):
-            rows.append(('agentType', meta['agentType']))
-        if meta.get('description'):
-            rows.append(('description', meta['description']))
-    if rec.get('sessionId'):
-        rows.append(('sessionId', rec['sessionId']))
-    if rec.get('entrypoint'):
-        rows.append(('entrypoint', rec['entrypoint']))
-    if rec.get('cwd'):
-        rows.append(('cwd', rec['cwd']))
-    if rec.get('gitBranch'):
-        rows.append(('gitBranch', rec['gitBranch']))
-    if rec.get('slug'):
-        rows.append(('slug', rec['slug']))
+    rows.extend(info['meta'])
     n_lines = sum(1 for r in td.records if r is not None)
     rows.append(('lines', str(n_lines)))
     if td.voice_count is None:
@@ -968,12 +886,9 @@ def _fmt_scope_card(path, td):
             1 for r in td.records if isinstance(r, dict) and _is_voice(r)
         )
     rows.append(('voice', str(td.voice_count)))
-    try:
-        st = os.stat(path)
-        rows.append(('mtime', _human_time(st.st_mtime)))
-    except OSError:
-        pass
-    label = 'browse-claude (subagent)' if is_sub else 'browse-claude'
+    if info['mtime'] is not None:
+        rows.append(('mtime', _human_time(info['mtime'])))
+    label = _prog_name() + (' (subagent)' if info['is_child'] else '')
     w = max(len(k) for k, _ in rows)
     body = '\n'.join(
         f'   {MUTE}{k.ljust(w)}:{RESET} {v}' for k, v in rows
@@ -996,7 +911,7 @@ def _preview_umbrella(item_id):
     """Generator — yields rendered chunks for an umbrella row's descendants.
 
     First yield (when applicable) is the scope card for the umbrella's
-    file; subsequent yields are ``<rendered_body>\\n\\n`` per leaf in
+    session; subsequent yields are ``<rendered_body>\\n\\n`` per leaf in
     document order, with nested same-file umbrellas folded in
     transparently. Subagent-group children are skipped (the dispatch
     pair already renders in the parent file).
@@ -1019,11 +934,11 @@ def _preview_umbrella(item_id):
     Per-leaf renderer errors surface as a red error stub so one bad
     row doesn't blank the entire preview.
     """
-    card_path = _scope_card_path(item_id)
-    if card_path is not None:
+    card_sess = _scope_card_session(item_id)
+    if card_sess is not None:
         try:
-            td = _scan_tree(card_path)
-            yield _fmt_scope_card(card_path, td) + '\n\n'
+            td = _scan_tree(card_sess)
+            yield _fmt_scope_card(card_sess, td) + '\n\n'
         except Exception as e:
             yield _rule(f'error in scope card: {e}', RED) + '\n\n'
     if item_id[0] == 'tool':
@@ -1178,7 +1093,7 @@ def _walk_umbrella(item_id, _state, _flush):
             # via set_preview_op. A direct cursor-visit caches body +
             # chrome there; the cascade wants body-only (chrome between
             # blocks is noise), so sharing one slot would bleed chrome
-            # in (or strip it out) depending on visit order. JSONL read +
+            # in (or strip it out) depending on visit order. Record read +
             # render is cheap enough to redo per compose.
             unit = _node_own_body(cid)
             if unit is not None:
@@ -1194,7 +1109,7 @@ def _walk_umbrella(item_id, _state, _flush):
                    + f'\n{type(e).__name__}: {e}\n\n')
 
 
-def _render_record_with_rule(path, n):
+def _render_record_with_rule(sess, n):
     """Read one record, render its body, prefix with a section rule.
 
     Most leaves get the fixed ~60-wide bright-yellow rule. A
@@ -1205,7 +1120,7 @@ def _render_record_with_rule(path, n):
     logical line — so successive turns stand out as the visual anchors
     of a composed multi-turn preview.
     """
-    obj = _read_jsonl_line(path, n)
+    obj = _record_at(sess, n)
     if obj is None or not isinstance(obj, dict):
         return None
     kind = _classify(obj)
@@ -1224,7 +1139,7 @@ def _render_record_with_rule(path, n):
 
 
 def _tool_label(cid):
-    """Tool name for a composed ``('tool', jsonl, line)`` block's section rule.
+    """Tool name for a composed ``('tool', sess, key)`` block's section rule.
 
     Resolves the dispatching assistant record's first ``tool_use`` name from
     ``td.tool_use_name_of`` — the same source the ``<tool:Name>`` umbrella
@@ -1232,8 +1147,8 @@ def _tool_label(cid):
     entry falls back to ``'tool'`` so the rule still renders.
     """
     try:
-        _tag, jsonl_path, assistant_line = cid
-        td = _scan_tree(jsonl_path)
+        _tag, sess, assistant_line = cid
+        td = _scan_tree(sess)
         rec = td.records[assistant_line]
         return td.tool_use_name_of.get(rec.get('uuid'), 'tool')
     except Exception:

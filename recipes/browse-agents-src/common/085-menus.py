@@ -40,18 +40,17 @@
 def _cursor_context_dirs(item_id):
     """``[(role, abspath), …]`` context dirs for ``item_id`` — project / cwd(s) / worktree.
 
-    A project / session / message / subagent row anchors on a Claude project
-    dir (a session row's project dir is its .jsonl's parent). A single session
-    can span SEVERAL working directories over its life (it starts in one repo,
-    then enters a git worktree, …) — each recorded in the records' ``cwd`` — so
-    we surface every distinct one, in role order:
+    A project / session / message / subagent row anchors on its project; a
+    session can span SEVERAL working directories over its life (it starts in
+    one repo, then enters a git worktree, …), so every distinct one is
+    surfaced, in role order:
 
-      * ``project``   — the Claude project's real source directory
-        (``_real_project_cwd``), the canonical anchor.
-      * ``cwd``       — the session's PRIMARY recorded working directory (the
-        one that round-trips to the project dir name). For the common case this
-        is the same dir as ``project``; both roles are surfaced so the chooser
-        can label a single dir by every role it fills, and dedup collapses them.
+      * ``project``   — the project's real source directory, the canonical
+        anchor.
+      * ``cwd``       — the session's PRIMARY recorded working directory. For
+        the common case this is the same dir as ``project``; both roles are
+        surfaced so the chooser can label a single dir by every role it
+        fills, and dedup collapses them.
       * ``workspace`` — each ADDITIONAL distinct working directory the session
         recorded (e.g. a git worktree it entered). This is the case the chooser
         exists for: a session that genuinely worked in two directories offers
@@ -61,64 +60,36 @@ def _cursor_context_dirs(item_id):
         its gitdir, so this resolves worktree sessions too). Omitted for a cwd
         that isn't under a git work tree, or when md_doc is unavailable.
 
-    The session's cwds are read from its OWN .jsonl (``_session_cwds``) for a
-    session / message / subagent row, so a row resolves the dirs *that session*
-    touched. A ``project`` row has no single session, so it falls back to the
-    project-wide ``_real_project_cwd`` (one representative cwd) — unchanged.
+    The project / cwd / workspace dirs come from ``store_context_dirs``; a
+    session / message / subagent row resolves the dirs *that session*
+    touched, a project row its representative cwd.
 
-    Returns raw (un-deduped) ``(role, abspath)`` pairs with falsy paths
-    dropped; ``_dedup_dirs`` collapses coincident roles by realpath, so a
-    single-cwd session still yields ONE dir (no chooser). A project / session /
-    message row always resolves at least one dir (its real cwd, or the decoded
-    project dir as a fallback); a synthetic / markdown / non-tuple cursor
+    Returns raw (un-deduped) ``(role, abspath)`` pairs; ``_dedup_dirs``
+    collapses coincident roles by realpath, so a single-cwd session still
+    yields ONE dir (no chooser). A synthetic / markdown / non-tuple cursor
     yields ``[]`` so the directory cluster is simply omitted.
     """
     if not isinstance(item_id, tuple) or not item_id:
         return []
     kind = item_id[0]
-    session_jsonl = None
     if kind == 'project':
-        project_dir = item_id[1]
+        project_key, sess = item_id[1], None
     elif kind in ('session', 'agent', 'msg', 'prompt', 'tool', 'span'):
-        # A session/message/subagent row is keyed under its .jsonl, whose
-        # containing dir is the Claude project dir.
-        session_jsonl = item_id[1]
-        project_dir = os.path.dirname(session_jsonl)
+        sess = item_id[1]
+        project_key = store_project_of_session(sess)
     else:
         return []
-
-    # project: the Claude project's canonical source dir. Read straight from
-    # the project dir's sessions (no md_doc dependency); fall back to the lossy
-    # name-decode when no session records a readable cwd (an empty/unreadable
-    # project dir) so the row still browses *something*.
-    project = _real_project_cwd(project_dir) or os.path.expanduser(
-        _decode_project_path(os.path.basename(project_dir.rstrip('/'))))
-
-    # The session's recorded working dirs, first-seen order. For a session /
-    # message / subagent row read THIS session's .jsonl (the dirs that session
-    # touched); a project row has no single session, so use its primary cwd.
-    if session_jsonl is not None:
-        cwds = _session_cwds(session_jsonl)
-    else:
-        cwds = [project] if project else []
-    # The primary cwd (the one that round-trips to the project dir name) is the
-    # ``cwd`` role; any other distinct cwd is a ``workspace``. Lacking that the
-    # first recorded cwd is primary.
-    base = os.path.basename(project_dir.rstrip('/'))
-    primary = next((c for c in cwds if _encode_project_path(c) == base),
-                   cwds[0] if cwds else None)
-
-    out = [('project', project)]
-    for cwd in cwds:
-        out.append(('cwd' if cwd == primary else 'workspace', cwd))
+    out = []
+    for role, path in store_context_dirs(project_key, sess):
+        out.append((role, path))
         # worktree: the enclosing git work-tree root of this cwd. Guarded on
         # md_doc (the only piece here that needs it) so the cluster still
         # resolves project / cwd(s) when the md_doc plugin failed to import.
-        if _md_doc is not None:
-            root = _md_doc.find_git_root(cwd)
+        if role in ('cwd', 'workspace') and _md_doc is not None:
+            root = _md_doc.find_git_root(path)
             if root:
                 out.append(('worktree', root))
-    return [(role, path) for role, path in out if path]
+    return out
 
 
 def _dedup_dirs(role_paths):
@@ -314,7 +285,7 @@ def _run_dir_action(ctx, token, dirs):
 
 
 def context_menu_message(ctx, item_id):
-    """``(label, token)`` rows for a ``('msg', jsonl, n)`` cursor row.
+    """``(label, token)`` rows for a ``('msg', sess, n)`` cursor row.
 
     Reuses the existing message actions (E / V / M / y / m), so the duplicate
     rows carry the literal hotkey hint per the convention. "Toggle markdown
@@ -334,7 +305,7 @@ def context_menu_message(ctx, item_id):
 
 
 def context_menu_session(ctx, item_id):
-    """``(label, token)`` rows for a ``('session', jsonl)`` cursor row.
+    """``(label, token)`` rows for a ``('session', sess)`` cursor row.
 
     Open the transcript in $PAGER (reuses the ``V`` source path) and show the
     session path (pop-up). The directory cluster is appended.
@@ -346,7 +317,7 @@ def context_menu_session(ctx, item_id):
 
 
 def context_menu_agent(ctx, item_id):
-    """``(label, token)`` rows for an ``('agent', jsonl, aid)`` subagent row.
+    """``(label, token)`` rows for an ``('agent', sess, aid)`` subagent row.
 
     Open the subagent transcript in $PAGER and show the agent id (pop-up). The
     directory cluster is appended (a subagent shares its session's dirs).
@@ -369,7 +340,7 @@ def context_menu_project(ctx, item_id):
 
 
 def context_menu_umbrella(ctx, item_id):
-    """``(label, token)`` rows for a ``('prompt'|'tool'|'span', jsonl, line)`` row.
+    """``(label, token)`` rows for a ``('prompt'|'tool'|'span', sess, key)`` row.
 
     A tree-mode umbrella groups a turn / tool-execution / metadata span; its
     source actions act on the umbrella ITSELF — the grouped lines, resolved by
@@ -428,12 +399,12 @@ _MENU_ACTIONS = {
 
 
 def context_menu_options(ctx):
-    """``(label, token)`` rows for the browse-claude context menu (pure — no modal).
+    """``(label, token)`` rows for the context menu (pure — no modal).
 
     Branches on the cursor item's KIND (``id[0]``): a message
-    (``('msg', jsonl, n)``), session (``('session', jsonl)``), subagent
-    (``('agent', jsonl, aid)``), project (``('project', dir)``) or tree-mode
-    umbrella (``('prompt'|'tool'|'span', jsonl, line)``) row gets its per-kind
+    (``('msg', sess, n)``), session (``('session', sess)``), subagent
+    (``('agent', sess, aid)``), project (``('project', dir)``) or tree-mode
+    umbrella (``('prompt'|'tool'|'span', sess, key)``) row gets its per-kind
     rows, then the SHARED directory cluster (``_dir_action_rows`` against the
     cursor's deduped context dirs) when those rows resolve. A synthetic /
     markdown / cursorless row has no menu (``[]``), so the hook opens nothing.
@@ -462,7 +433,7 @@ def context_menu_options(ctx):
 
 
 def on_context_menu(ctx):
-    """Open the browse-claude context menu and dispatch the chosen entry.
+    """Open the context menu and dispatch the chosen entry.
 
     The hook the framework fires on right-click / backslash-F1: build the (pure)
     per-kind option list, open it with ``ctx.menu``, and route the chosen token

@@ -861,42 +861,6 @@ _PERM_COLOR = {
 }
 
 
-def _read_jsonl_line(path, n):
-    """Return the parsed object for line ``n`` of ``path`` or ``None``.
-
-    Serves from ``_TREE_CACHE[path].records[n]`` when the file has
-    been scanned (every read path now triggers ``_scan_tree``), so
-    previews are O(1) dict lookups rather than O(file_size) line
-    iterations. Falls back to a one-off file read for paths the
-    scanner hasn't visited yet (rare — covers transient setups).
-    ``None`` for missing files, out-of-range lines, blank lines, and
-    lines whose JSON failed to parse — re-parsing wouldn't change
-    the answer, and the caller surfaces an empty preview either way.
-    """
-    cached = _TREE_CACHE.get(path)
-    if cached is not None:
-        if 0 <= n < len(cached.records):
-            return cached.records[n]
-        return None
-    # Fallback: file not yet scanned. Cheaper than a full scan when
-    # all we need is one line, but should be hit only at startup
-    # races / unusual paths.
-    try:
-        with open(path, 'r', encoding='utf-8', errors='replace') as f:
-            for i, line in enumerate(f):
-                if i == n:
-                    line = line.rstrip('\n')
-                    if not line.strip():
-                        return None
-                    try:
-                        return json.loads(line)
-                    except json.JSONDecodeError:
-                        return None
-    except OSError:
-        return None
-    return None
-
-
 _METADATA_TYPES = frozenset([
     'summary', 'ai-title', 'custom-title', 'last-prompt', 'task-summary',
     'tag', 'agent-name', 'agent-color', 'agent-setting', 'pr-link',

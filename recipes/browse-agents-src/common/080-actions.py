@@ -23,23 +23,23 @@ def _current_view_targets(ctx):
 
 
 def _gather_line_source(items):
-    """Group items into ``{path: [line_no, ...]}`` for byte extraction.
+    """Group items into ``{session_key: [record_key, ...]}`` for the excerpt.
 
     Each input item is classified by id tag:
 
-      * ``('msg', jsonl, n)`` (message leaf) → ``(jsonl, n)`` recorded.
+      * ``('msg', sess, n)`` (message leaf) → ``(sess, n)`` recorded.
       * Umbrella ids (``prompt`` / ``tool`` / ``span``) → recurse through the
-        umbrella's same-file descendants and record each leaf's line.
-        ``agent`` boundaries are NOT crossed — subagents live in their own
-        ``.jsonl`` files.
+        umbrella's same-session descendants and record each leaf's key.
+        ``agent`` boundaries are NOT crossed — subagents are their own
+        sessions.
       * ``('agent', sess, aid)`` (subagent group row) → the subagent's own
-        ``.jsonl`` is the "whole file" to open.
-      * ``('session', jsonl)`` / ``('trunc'|'err', jsonl)`` → that file
-        whole. ``('project', dir)`` → that directory whole.
+        source is the "whole file" to open.
+      * ``('session', sess)`` / ``('trunc'|'err', sess)`` → that session's
+        source whole. ``('project', key)`` → that directory whole.
 
     Returns ``(per_line, whole_paths)`` where ``per_line`` is the
-    grouping dict (lines kept in document order) and ``whole_paths``
-    is a list of ``(path, item)`` tuples for non-line targets.
+    grouping dict (keys kept in document order) and ``whole_paths``
+    is a list of ``(path, item)`` tuples for non-record targets.
     """
     per_line = {}
     whole_paths = []
@@ -49,32 +49,35 @@ def _gather_line_source(items):
             continue
         tag = iid[0]
         if tag == 'agent':
-            agent_path = _resolve_agent_jsonl(iid[1], iid[2])
-            whole_paths.append((agent_path, item))
+            whole_paths.append(
+                (store_child_source_path(iid[1], iid[2]), item))
             continue
         if tag in ('prompt', 'tool', 'span'):
-            # Recurse through the umbrella's same-file leaves.
-            path = iid[1]
+            # Recurse through the umbrella's same-session leaves.
+            sess = iid[1]
             same_file_lines = _gather_umbrella_lines(iid)
             if same_file_lines:
-                per_line.setdefault(path, []).extend(same_file_lines)
+                per_line.setdefault(sess, []).extend(same_file_lines)
             else:
                 # Defensive: empty umbrella → fall back to opening
-                # the file as a whole rather than silently doing
-                # nothing.
-                whole_paths.append((path, item))
+                # the whole source rather than silently doing nothing.
+                whole_paths.append((store_source_path(sess), item))
             continue
         if tag == 'msg':
             per_line.setdefault(iid[1], []).append(iid[2])
             continue
         # Whole-file / whole-dir targets (session, trunc, err, project) and
         # any other id: open the underlying path.
-        path = _id_jsonl(iid)
-        if path is None and tag == 'project':
-            path = iid[1]
+        sess = _id_session(iid)
+        if sess is not None:
+            path = store_source_path(sess)
+        elif tag == 'project':
+            path = store_project_path(iid[1])
+        else:
+            path = None
         whole_paths.append((path, item))
-    # Pre-select pass: dedupe + sort each file's lines into
-    # canonical (file) order. Multi-target invocations (umbrella +
+    # Pre-select pass: dedupe + sort each session's keys into
+    # canonical (document) order. Multi-target invocations (umbrella +
     # one of its children, or two umbrellas with overlapping
     # contents) collapse to one entry per leaf in document order —
     # no surprises when ``_write_line_excerpts`` walks the list.
@@ -84,13 +87,13 @@ def _gather_line_source(items):
 
 
 def _gather_umbrella_lines(item_id):
-    """Return [line_no, ...] for every leaf message under ``item_id``.
+    """Return [record_key, ...] for every leaf message under ``item_id``.
 
     Walks the umbrella's children recursively in document order via
     ``get_children`` (the same listing helper that builds the
-    displayed tree). Nested umbrellas in the SAME file are followed
+    displayed tree). Nested umbrellas in the SAME session are followed
     transparently; ``boundary`` children (subagent groups) are NOT
-    crossed — their records live in a different ``.jsonl`` and the user
+    crossed — their records live in a different session and the user
     can drill into that group row separately if they want them.
     """
     out = []
@@ -99,7 +102,7 @@ def _gather_umbrella_lines(item_id):
 
 
 def _walk_umbrella_lines(item_id, out):
-    """Append leaf line numbers under ``item_id`` to ``out`` in order."""
+    """Append leaf record keys under ``item_id`` to ``out`` in order."""
     try:
         children = get_children(item_id)
     except Exception:
@@ -122,65 +125,14 @@ def _walk_umbrella_lines(item_id, out):
             out.append(cid[2])
 
 
-def _write_line_excerpts(per_line):
-    """Extract specific lines from one-or-more files into a temp .jsonl.
-
-    Uses ``_TREE_CACHE[path].line_offsets`` for O(1) seek + read —
-    no whole-file scan. Returns the temp path (caller is responsible
-    for unlinking it after the external tool exits) or ``None`` if
-    nothing could be extracted.
-    """
-    import tempfile
-    written_any = False
-    tmp = tempfile.NamedTemporaryFile(
-        'wb', suffix='.jsonl', delete=False,
-    )
-    try:
-        # ``per_line`` is already pre-selected (deduped + sorted) by
-        # ``_gather_line_source`` — iterate as-is.
-        for path, line_nos in per_line.items():
-            cached = _TREE_CACHE.get(path)
-            if cached is None:
-                continue
-            offsets = cached.line_offsets
-            try:
-                f = open(path, 'rb')
-            except OSError:
-                continue
-            with f:
-                for n in line_nos:
-                    if not (0 <= n < len(offsets) - 1):
-                        continue
-                    start = offsets[n]
-                    end = offsets[n + 1]
-                    if end <= start:
-                        continue
-                    f.seek(start)
-                    chunk = f.read(end - start)
-                    if not chunk:
-                        continue
-                    tmp.write(chunk)
-                    if not chunk.endswith(b'\n'):
-                        tmp.write(b'\n')
-                    written_any = True
-    finally:
-        tmp.close()
-    if not written_any:
-        try:
-            os.unlink(tmp.name)
-        except OSError:
-            pass
-        return None
-    return tmp.name
-
-
 def _run_source_command(ctx, cmd_env_var, default_cmd):
     """Shared body of ``V`` / ``E``: resolve targets, dispatch external tool.
 
     Strategy:
-      * All targets are message ids on the SAME file → extract just
-        those lines to a temp .jsonl and open that.
-      * All targets are message ids spanning multiple files → same,
+      * All targets are message ids on the SAME session → extract just
+        those records to a temp file (``store_source_excerpt``) and
+        open that.
+      * All targets are message ids spanning multiple sessions → same,
         concatenated into one temp file.
       * Anything else (umbrella, subagent group, session, project) →
         open the resolved path directly. With multiple non-message
@@ -193,9 +145,9 @@ def _run_source_command(ctx, cmd_env_var, default_cmd):
     per_line, whole_paths = _gather_line_source(targets)
     cmd = _split_cmd(os.environ.get(cmd_env_var) or default_cmd)
 
-    # All-message-targets path: extract bytes from line_offsets.
+    # All-message-targets path: the store writes the excerpt.
     if per_line and not whole_paths:
-        tmp_path = _write_line_excerpts(per_line)
+        tmp_path = store_source_excerpt(per_line)
         if tmp_path is None:
             ctx.error('could not extract line bytes (cache missing?)')
             return
@@ -223,8 +175,8 @@ def _run_source_command(ctx, cmd_env_var, default_cmd):
 def _action_edit_source(ctx):
     """``E`` — open the source for the cursor row (or selection) in $EDITOR.
 
-    Message rows (single or multi-selected) extract just their lines
-    via ``_TreeData.line_offsets`` into a temp .jsonl. Session /
+    Message rows (single or multi-selected) extract just their records
+    via ``store_source_excerpt`` into a temp file. Session /
     subagent / umbrella / project rows open their underlying file
     or directory in $EDITOR directly.
 
@@ -638,7 +590,7 @@ def _is_md_managed_id(item_id):
 
     Markdown-managed = ``md_doc`` is importable AND the id is an ``('md', …)``
     node (inline document, file doc, or heading), a ``[links]`` References umbrella
-    (``('refs', …)``), or a plain message id ``('msg', jsonl, n)`` (which gains
+    (``('refs', …)``), or a plain message id ``('msg', sess, n)`` (which gains
     markdown children when the message has a heading or references a ``.md``
     file). These are the rows whose post-expand cursor lands on the first child
     rather than a voice child (``_jump_to_latest_voice``) — so a single ``→``
@@ -669,7 +621,7 @@ def _action_tree_right(ctx):
     ``→`` is pressed on a row that is *already* expanded, no state change
     occurs, so ``on_expand`` does not fire. The framework default would
     step the cursor onto the row's FIRST child (oldest, since children
-    list chronologically); browse-claude's signature instead drills to
+    list chronologically); this recipe's signature instead drills to
     the LATEST voice one level down. This handler keeps only that case —
     a single ``cursor_to`` — so a second ``→`` walks to the newest reply
     rather than the top of the turn.

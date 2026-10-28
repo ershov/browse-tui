@@ -1,78 +1,20 @@
-# Cache ``<sid> → session .jsonl path`` for the cross-project-dir lookup
-# below. Session ids are UUID-unique, so a hit is stable for the life of
-# the process; misses aren't cached (a session whose file lands later
-# should still be found on a subsequent toggle).
-_SESSION_PATH_BY_SID = {}
+def _outer_subagent_group_id(sess):
+    """If ``sess`` is a subagent transcript, return its outer-row id.
 
-
-def _session_path_for_sid(sid):
-    """Find ``<CLAUDE_ROOT>/*/<sid>.jsonl`` — the real session for ``sid``.
-
-    A worktree-relocated subagent's ``<sid>`` dir sits under the
-    cwd-derived project dir, NOT next to the session ``.jsonl`` (which
-    stays under the project dir it was created in). Since session ids
-    are UUID-unique, the first ``<sid>.jsonl`` found anywhere under
-    ``CLAUDE_ROOT`` is the right one. Returns the path or ``None``.
-    """
-    cached = _SESSION_PATH_BY_SID.get(sid)
-    if cached is not None and os.path.isfile(cached):
-        return cached
-    name = f'{sid}.jsonl'
-    try:
-        projects = os.listdir(CLAUDE_ROOT)
-    except OSError:
-        return None
-    for project in projects:
-        candidate = os.path.join(CLAUDE_ROOT, project, name)
-        if os.path.isfile(candidate):
-            _SESSION_PATH_BY_SID[sid] = candidate
-            return candidate
-    return None
-
-
-def _outer_subagent_group_id(path):
-    """If ``path`` is a subagent's ``.jsonl``, return its outer-row id.
-
-    Subagent transcripts live at::
-
-        <project_dir>/<parent_session_id>/subagents/agent-<aid>.jsonl
-
-    and the parent session shows them as collapsible rows with id
-    ``('agent', parent_session_path, aid)``. When the parent session is
+    The parent session shows a subagent as a collapsible row with id
+    ``('agent', parent_session_key, aid)``. When the parent session is
     the view, that outer row is the framework-visible parent of every
     record inside the subagent — if it isn't expanded, none of the
     subagent's records are reachable. Used by ``_ancestor_ids_for`` to
     prepend it to the chain so cursor preservation works across
-    t-toggle from anywhere inside a subagent. (When the subagent file is
+    t-toggle from anywhere inside a subagent. (When the subagent is
     itself the scope root the row is above the scope;
     ``_trim_chain_to_scope`` drops it again.)
-
-    For a worktree-relocated subagent the session ``.jsonl`` is NOT the
-    co-located sibling of the ``<sid>`` dir (it lives in a different,
-    cwd-derived project dir), so when the sibling is absent we fall
-    back to searching ``<CLAUDE_ROOT>/*/<sid>.jsonl`` for the real one.
     """
-    if not isinstance(path, str):
+    parent = store_parent_of_child(sess)
+    if parent is None:
         return None
-    parent_dir = os.path.dirname(path)
-    if os.path.basename(parent_dir) != 'subagents':
-        return None
-    name = os.path.basename(path)
-    if not name.startswith('agent-') or not name.endswith('.jsonl'):
-        return None
-    aid = name[len('agent-'):-len('.jsonl')]
-    sess_dir = os.path.dirname(parent_dir)
-    # Co-located fast path: the legacy layout keeps the session .jsonl
-    # next to its ``<sid>`` dir.
-    sess_path = sess_dir + '.jsonl'
-    if not os.path.isfile(sess_path):
-        # Relocated layout: the real session lives in a different
-        # project dir — locate it by its (UUID-unique) session id.
-        sid = os.path.basename(sess_dir)
-        sess_path = _session_path_for_sid(sid)
-        if sess_path is None:
-            return None
-    return ('agent', sess_path, aid)
+    return ('agent', parent[0], parent[1])
 
 
 def _ancestor_ids_for(item_id):
@@ -83,15 +25,15 @@ def _ancestor_ids_for(item_id):
     ``span``), so the chain consists exclusively of umbrella ids and
     subagent-group ids — never of raw message ids.
 
-    Crosses file boundaries:
+    Crosses session boundaries:
 
-      * Records inside a subagent's ``.jsonl`` walk up through their
-        in-file umbrellas, then across to the
-        ``('agent', parent_session_path, aid)`` subagent group row —
+      * Records inside a subagent transcript walk up through their
+        in-session umbrellas, then across to the
+        ``('agent', parent_session_key, aid)`` subagent group row —
         itself a top-level row in the parent session (the subagents
         block), so the chain ends there.
-      * Top-level umbrellas inside a subagent jsonl still nest under
-        the outer subagent group — same prepend rule.
+      * Top-level umbrellas inside a subagent transcript still nest
+        under the outer subagent group — same prepend rule.
 
     Without this full walk a t-toggle from inside a subagent (where
     refresh wiped the cached children) can't reach the outer chain,
@@ -110,7 +52,7 @@ def _ancestor_ids_for(item_id):
     # ``tool`` umbrella: parent is the containing ``prompt``.
     if tag == 'tool':
         path, n = item_id[1], item_id[2]
-        if not os.path.isfile(path):
+        if not store_session_exists(path):
             return []
         td = _scan_tree(path)
         turn_line = td.tool_to_turn_root_line.get(n)
@@ -122,8 +64,8 @@ def _ancestor_ids_for(item_id):
         parent_id = ('prompt', path, turn_line)
         return _ancestor_ids_for(parent_id) + [parent_id]
 
-    # ``prompt`` / ``span`` umbrella: top-level in its file, but cross to
-    # the outer subagent chain if the file is a subagent jsonl.
+    # ``prompt`` / ``span`` umbrella: top-level in its session, but cross
+    # to the outer subagent chain if the session is a subagent transcript.
     if tag in ('prompt', 'span'):
         path = item_id[1]
         outer = _outer_subagent_group_id(path)
@@ -135,7 +77,7 @@ def _ancestor_ids_for(item_id):
     # up from there.
     if tag == 'msg':
         path, n = item_id[1], item_id[2]
-        if not os.path.isfile(path):
+        if not store_session_exists(path):
             return []
         td = _scan_tree(path)
         parent_id = td.parent_id_of.get(n)
@@ -224,11 +166,11 @@ def _link_map(path):
 
     Returns ``{'lines': {master_line: [target_id, …]},
     'agents': {agent_id: spawn_site_id},
-    'rev': {(agent_jsonl, agent_line): [master_id, …]},
-    'agent_counts': {agent_jsonl: record_count_at_build}}`` cached on
+    'rev': {(agent_sess, agent_line): [master_id, …]},
+    'agent_counts': {agent_sess: record_count_at_build}}`` cached on
     ``td.link_map``; rebuilt when the record count changed (a tail
     append can add spawn/send/reply rows). Target ids are ordinary row
-    ids — ``('msg', jsonl, n)`` or the ``('agent', …)`` group row for
+    ids — ``('msg', sess, n)`` or the ``('agent', …)`` group row for
     an unresolvable join — so the jump path reuses the existing
     ancestor/expand machinery.
 
@@ -288,7 +230,7 @@ def _link_map(path):
         spawn_line = td.agent_to_assistant_line.get(aid)
         if spawn_line is None or not agent_path:
             continue
-        if not os.path.isfile(agent_path):
+        if not store_session_exists(agent_path):
             continue
         std = _scan_tree(agent_path)
         agent_counts[agent_path] = len(std.records)
@@ -366,7 +308,7 @@ def _links_for_id(item_id):
     """Cross-link targets for a row; ``[]`` when it carries none.
 
     A leaf and the umbrella wrapping it share the record line, so both
-    resolve the same links (``('msg'|'tool'|'prompt', jsonl, line)``).
+    resolve the same links (``('msg'|'tool'|'prompt', sess, key)``).
     The ``('agent', …)`` group row resolves its spawn-site backlink.
     Rows inside a subagent transcript resolve through the OWNING master
     session's reverse index; when this transcript grew since that map
@@ -377,7 +319,7 @@ def _links_for_id(item_id):
     if not isinstance(item_id, tuple) or len(item_id) != 3:
         return []
     tag, path, key = item_id
-    if not isinstance(path, str) or not os.path.isfile(path):
+    if not store_session_exists(path):
         return []
     if tag == 'agent':
         tgt = _link_map(path)['agents'].get(key)
@@ -386,7 +328,7 @@ def _links_for_id(item_id):
         return []
     links = list(_link_map(path)['lines'].get(key, ()))
     outer = _outer_subagent_group_id(path)
-    if outer is None or not os.path.isfile(outer[1]):
+    if outer is None or not store_session_exists(outer[1]):
         return links
     lm = _link_map(outer[1])
     count = len(_scan_tree(path).records)
@@ -405,16 +347,15 @@ def _link_label(target_id):
     """Human menu label for one jump target."""
     if target_id[0] == 'agent':
         return f'↗ subagent {target_id[2]}'
-    path, n = target_id[1], target_id[2]
-    name = os.path.basename(path)
-    if name.startswith('agent-') and name.endswith('.jsonl'):
-        name = name[len('agent-'):-len('.jsonl')]
-    td = _scan_tree(path)
+    sess, n = target_id[1], target_id[2]
+    name = store_session_info(sess)['label']
+    _src, line = store_source_locator(sess, n)
+    td = _scan_tree(sess)
     rec = td.records[n] if 0 <= n < len(td.records) else None
-    what = _oneline(_summarise_message(rec)) if rec else f'line {n + 1}'
+    what = _oneline(_summarise_message(rec)) if rec else f'line {line}'
     if len(what) > 60:
         what = what[:59] + '…'
-    return f'↗ {name}:{n + 1}  {what}'
+    return f'↗ {name}:{line}  {what}'
 
 
 def _link_menu_rows(item_id):
@@ -427,7 +368,7 @@ def _jump_to_link(ctx, target_id):
     """Reveal + move: expand the target's ancestors, then ``cursor_to``.
 
     Tree mode walks the full umbrella chain (crossing into a subagent's
-    group row when the target lives in its .jsonl); flat mode only needs
+    group row when the target lives in its transcript); flat mode only needs
     the group row expanded for a cross-file target. Either chain is
     trimmed to the current scope by ``_chain_expand_then_cursor``. A target the active
     detail level hides can't take the cursor — land on its nearest
@@ -468,11 +409,11 @@ def _on_enter_jump(ctx):
         _jump_to_link(ctx, choice[1])
 
 
-def _seed_scope_root_item(b, target_jsonl):
+def _seed_scope_root_item(b, target):
     """Register a REAL session Item for the initial scope_root (#730).
 
-    On direct launch (``browse-claude <file.jsonl>`` / ``--file`` / etc.)
-    the framework scopes straight into the ``('session', target_jsonl)``
+    On direct launch (a transcript positional / ``--file`` / etc.) the
+    framework scopes straight into the ``('session', target)``
     id before its children — or the parent dir's listing — have been
     fetched, so the scope-root row has no Item in the index.
     ``visible_items`` then fabricates a *synthetic* placeholder
@@ -491,7 +432,7 @@ def _seed_scope_root_item(b, target_jsonl):
     children list with this single session would make the framework treat
     that listing as already cached, so a later scope-up (``_scope_up`` →
     ``_ensure_children_fetched``) would skip the real
-    ``_list_sessions(parent_scope)`` fetch and show only this one session
+    ``store_list_sessions(parent_scope)`` fetch and show only this one session
     instead of all of the project's. Leaving ``_children[parent_scope]``
     unset lets that lazy fetch run on scope-up (and the per-scope-level
     re-fetch on refresh), which populates ``_children`` + ``_parent_of_id``
@@ -510,7 +451,7 @@ def _seed_scope_root_item(b, target_jsonl):
     no live process) — the synthetic placeholder then stands and
     ``_is_cross_file_id``'s id-tag fallback keeps the preview correct.
     """
-    item = _session_item(target_jsonl)
+    item = store_session_item(target)
     if item is None:
         return
     b._state._items_by_id[item.id] = item
@@ -520,7 +461,7 @@ def _trim_chain_to_scope(scope_stack, ancestor_ids):
     """Drop the ancestors that sit at or above the current scope root.
 
     ``_ancestor_ids_for`` walks the data structure, so a record inside a
-    subagent ``.jsonl`` always gets the outer ``('agent', S, aid)`` group
+    subagent transcript always gets the outer ``('agent', S, aid)`` group
     row (a top-level row of the parent session ``S``) prepended. When the
     subagent file is itself the scope root — opened directly, scoped
     into one of its umbrellas, or listed from its ``subagents/`` dir as
@@ -548,7 +489,7 @@ def _trim_chain_to_scope(scope_stack, ancestor_ids):
     if isinstance(head, tuple) and head[:1] == ('agent',):
         sess = head[1]
         if (('session', sess) not in scope_stack
-                and scope_id != ('project', os.path.dirname(sess))):
+                and scope_id != ('project', store_project_of_session(sess))):
             return chain[1:]
     return chain
 
@@ -595,7 +536,7 @@ def _chain_expand_then_cursor(b, ancestor_ids, target_id):
     _step(0)
 
 
-def _focus_latest_voice_when_ready(b, target_jsonl):
+def _focus_latest_voice_when_ready(b, target):
     """Defer the cursor-on-open jump until scope_root's children land.
 
     Replaces the pre-``run()`` synchronous ``_last_voice_id`` precompute
@@ -604,7 +545,7 @@ def _focus_latest_voice_when_ready(b, target_jsonl):
     transcripts.
 
     Algorithm:
-      1. Wait for ``b.expand(target_jsonl).then(...)`` to fire —
+      1. Wait for ``b.expand(target).then(...)`` to fire —
          scope_root's children landed via ``_do_initial_fetch``'s
          standard delivery, which means ``_scan_tree`` has run on the
          children-worker thread and ``td.latest_voice_line`` is
@@ -624,15 +565,15 @@ def _focus_latest_voice_when_ready(b, target_jsonl):
     "cursor still on the scope row at fire time" is a reliable proxy
     for "user hasn't touched it yet."
     """
-    scope_id = ('session', target_jsonl)
+    scope_id = ('session', target)
 
     def _fire():
-        last_id = _last_visible_voice_id(target_jsonl)
+        last_id = _last_visible_voice_id(target)
         if not last_id:
             return
         # Cancel if the user has navigated since startup. Post scope-
         # root unification the scope row is a normal row at depth 0
-        # whose item id is ``('session', target_jsonl)``; identify it
+        # whose item id is ``('session', target)``; identify it
         # that way rather than by the (deprecated) ``kind='scope_root'``.
         state = b._state
         vis = visible_items(state)

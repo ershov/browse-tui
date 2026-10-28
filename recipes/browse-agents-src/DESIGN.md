@@ -82,37 +82,68 @@ commit as the parts that changed them.
 
 ## Store contract
 
-`common/030-model` documents the contract; each agent's `025-store` and
-`045-tail` define these plain module-level functions. Common code calls them
-by name. Keys (`project_key`, `session_key`, `record_key`) are opaque to
-common code: hashable, orderable within their kind, and stable across runs.
+`common/030-model` lists the contract as plain module-level function names;
+each agent's `025-store` and `045-tail` define them and common code calls
+them by name. `common/` never touches agent paths, line numbers or SQL.
+
+Keys: `project_key`, `session_key` and `child_key` are opaque to common
+code (hashable, orderable within their kind, stable across runs; for Claude
+the project dir, the transcript path and the agent id). `record_key` is
+**not** opaque: it is a dense 0-based ordinal in transcript order, which
+common code uses to index its cached `_TreeData.records` list, to walk
+records in order and to form `('msg', session_key, record_key)` ids. The
+store maps it back to its native locator (Claude and Codex: the line
+number; OpenCode: `(message_id, index)`) and may yield `None` placeholders
+to keep the ordinals dense (Claude: blank or unparsable lines).
+
+Listings return ready `Item`s (title, tag, `boundary`, per-row attrs such
+as `agent_id` / `mtime`), not plain dicts: the session and child rows are
+presentation the store owns for now. #1268 revisits this with the record
+model.
 
 | Function | Returns |
 |---|---|
-| `store_name()` | `'claude' \| 'codex' \| 'opencode'`; used in the title, env var names and the tail thread name |
-| `store_pop_args()` | pops agent-specific flags from `recipe_argv` (Claude `--pid`, `--running`; OpenCode `--db PATH`); returns a dict of what it consumed |
-| `store_list_projects()` | `list[dict]` with `key`, `title`, `path` (display path or `None`), `mtime` (epoch float), `n_sessions` (int or `None`) |
-| `store_list_sessions(project_key)` | top-level sessions only: `list[dict]` with `key`, `project_key`, `title`, `path` (display path), `cwd`, `started` (epoch float or `None`), `mtime`, `n_records` (int or `None`), `meta` (dict of small facts for the scope card) |
-| `store_find_session(sid)` | `session_key` or `None`; resolves the `--session` CLI value (an id or an id prefix) |
-| `store_session(session_key)` | the session dict above, or `None` |
-| `store_child_sessions(session_key)` | the children of one session (subagents, spawned threads, child sessions) as session dicts in start order; never returned by `store_list_sessions` |
-| `store_iter_records(session_key, limit=None)` | iterable of normalized records in transcript order; `limit` caps the count like `-n` |
-| `store_source_locator(session_key, record_key)` | `(path, line)`; `line` is 1-based or `None`; `path` may be a temp file the store wrote for this call |
-| `store_session_dirs(session_key)` | `list[(role, path)]` for the dir actions, e.g. `('cwd', …)`, `('root', …)` |
+| `store_name()` | `'claude' \| 'codex' \| 'opencode'`; `browse-agents-<name>` is the program name in the title, error prefixes and the tail thread name |
+| `store_init()` | startup indexes (Claude: live pids, team rosters); called once before `store_pop_args` |
+| `store_pop_args()` | pops the agent's target flags from the argv (Claude `--session`, `--pid`, `--file`, `--running`); `{'target': session_key or None, 'error': message or None}` |
+| `store_resolve_positional(arg)` | `('session', key)` or `('project', key)` for the positional argument |
+| `store_reset()` | drops discovery caches on an explicit root refresh |
+| `store_list_projects()` | project `Item`s with ids `('project', project_key)` |
+| `store_list_sessions(project_key)` | top-level session `Item`s with ids `('session', session_key)`; `[]` for an unknown project |
+| `store_project_path(project_key)` | filesystem path for the external source actions |
+| `store_project_preview(project_key)` | preview text for a project row |
+| `store_project_of_session(session_key)` | the project key a session lists under |
+| `store_session_exists(session_key)` | `bool` |
+| `store_session_item(session_key)` | the session `Item` (same shape as the listing) or `None` |
+| `store_session_info(session_key)` | `{'path', 'label', 'is_child', 'meta': [(key, value), …], 'mtime'}` for the scope / metadata cards and link labels; never a full read |
+| `store_session_cwd_and_root(session_key)` | `(cwd, project_root)` anchors for the markdown reference resolver |
+| `store_context_dirs(project_key, session_key)` | `[(role, path)]` with roles `project` / `cwd` / `workspace` for the directory actions; `session_key` may be `None` |
+| `store_child_sessions(session_key)` | child (subagent / worker) `Item`s with ids `('agent', session_key, child_key)`; never returned by `store_list_sessions` |
+| `store_child_session(session_key, child_key)` | the child's `session_key`, or `None` when it has no transcript |
+| `store_child_source_path(session_key, child_key)` | the path a child transcript would live at, existing or not (error reporting) |
+| `store_parent_of_child(session_key)` | `(parent_session_key, child_key)` when the session is a child transcript, else `None` |
+| `store_resolve_spawned_child(session_key, tool_result, tool_input)` | `(child_key, child_session_key)` for a spawn tool result, or `None`; used by the tree fold to link `('agent', …)` rows to their dispatch site |
+| `store_source_path(session_key)` | filesystem path holding the whole transcript (may be a temp file the store wrote) |
+| `store_source_locator(session_key, record_key)` | `(path, line)`; `line` 1-based or `None` |
 
 Tail (`045-tail`):
 
 | Function | Returns |
 |---|---|
-| `store_tail_open(session_key)` | an opaque state object with the current watermark; `None` when the session cannot be tailed |
-| `store_tail_poll(state)` | `(new, changed)`: `new` is a list of records appended since the watermark, `changed` a list of records whose body changed in place (same `key`); updates the watermark |
+| `store_tailable(session_key)` | `bool`; whether the worker should follow this session |
+| `store_tail_open(session_key)` | `(records, state)`: every record so far as `[(record_key, record_or_None), …]` plus an opaque state whose watermark sits at the end of that read; `([], None)` when the session cannot be read. This is the one bulk read of a session |
+| `store_tail_poll(session_key, state)` | `(new, changed)`: `new` is a list of `(record_key, record)` appended since the watermark, `changed` a list of records whose body changed in place (same key); updates the watermark |
 | `store_tail_interval()` | poll period in seconds (Claude and Codex 5.0, OpenCode 1.0) |
+| `store_source_excerpt({session_key: [record_key, …]})` | a temp file holding exactly those records in order (caller unlinks), or `None`; lives next to the reader because it reuses its per-record locators |
 
-Common code never touches agent paths, line numbers or SQL. Identity tuples
-in the tree are `('project', project_key)`, `('session', session_key)`,
-`('msg', session_key, record_key)`, `('agent', session_key, child_key)` and
-the synthetic umbrellas `('prompt'|'tool'|'span', session_key, record_key)`
-plus the markdown ids `('md', anchor, chain, line)` / `('refs', anchor, chain)`.
+Common code keeps the state in `_TAIL_STATE[session_key]` and stores its
+fold cursor on `state.cursor`; the store must leave that attribute alone.
+
+Identity tuples in the tree are `('project', project_key)`,
+`('session', session_key)`, `('msg', session_key, record_key)`,
+`('agent', session_key, child_key)` and the synthetic umbrellas
+`('prompt'|'tool'|'span', session_key, record_key)` plus the markdown ids
+`('md', anchor, chain, line)` / `('refs', anchor, chain)`.
 
 ## Normalized record model
 
@@ -121,7 +152,7 @@ A record is a dict created by `new_record(kind, key, **fields)` in
 
 | Field | Type | Meaning |
 |---|---|---|
-| `key` | opaque | record key; Claude and Codex: 1-based line number; OpenCode: `(message_id, index)` |
+| `key` | int | dense 0-based ordinal into the session's cached record list; the store maps it to its native locator (see Store contract). Ordinals stay stable only while in-place growth happens at the tail of the session (the streaming assistant row is the last message); a new content element in an earlier message would shift every later ordinal (#1270) |
 | `kind` | str | one of the kinds below |
 | `ts` | float or `None` | epoch seconds |
 | `turn_id` | str or `None` | explicit turn id when the store has one; `None` lets the fold derive turns from `user_prompt` records |
@@ -192,8 +223,8 @@ selection events.
 
 ## What the common view expects from records
 
-* `store_iter_records` yields records in display order; `key` is unique
-  within a session and orderable.
+* `store_tail_open` / `store_tail_poll` yield records in display order;
+  `key` is a dense ordinal, unique within a session.
 * `ts` is non-decreasing except for records the store marks `changed`.
 * A `tool_call` is followed by at most one `tool_result` with the same
   `tool.call_id`; an unmatched call renders as pending.
@@ -201,8 +232,8 @@ selection events.
   filled; the voice jumps and the markdown subtree operate on them only.
 * `turn_start`/`turn_end` are optional; when absent the fold opens a turn at
   each `user_prompt` and closes it at the next.
-* `links` targets are keys the store can resolve with `store_session` /
-  `store_iter_records`.
+* `links` targets are keys the store can resolve with
+  `store_session_exists` / `store_tail_open`.
 * `raw` is kept but only read at level 6–7 and by `store_source_locator`.
 
 ## Per-agent format notes
@@ -305,15 +336,17 @@ selection events.
 ## Live-tail model
 
 The common tail worker (`common/040-tree` + `090-main`) is poll-based: a
-daemon thread resolves the cursor's session, calls `store_tail_open`, then
-every `store_tail_interval()` seconds calls `store_tail_poll`, folds `new`
-records into the cached tree data, replaces `changed` ones in place, and
-pushes `upsert` patches for umbrellas whose visible children changed. A stop
-event ends the thread before `sys.exit`.
+daemon thread resolves the cursor's session, makes sure `_scan_tree` has
+opened it (`store_tail_open`), then every `store_tail_interval()` seconds
+calls `store_tail_poll`, folds `new` records into the cached tree data,
+replaces `changed` ones in place, and pushes `upsert` patches for
+umbrellas whose visible children changed. A stop event ends the thread
+before `sys.exit`.
 
 * Claude, Codex (`045-tail`): stat size and mtime, read from the saved byte
   offset, parse complete lines, keep a partial trailing line for the next
-  poll. `changed` is always empty.
+  poll. `changed` is always empty. The per-line byte offsets recorded
+  while reading serve `store_source_excerpt`.
 * OpenCode (`045-tail`): watermark `(max(seq), max(time_updated))` of
   `session_message` for the session (v1: `part.time_updated`). On change,
   rows with `seq` above the watermark become `new`; rows with

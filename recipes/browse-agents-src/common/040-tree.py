@@ -50,7 +50,7 @@ _TREE_METADATA_TYPES = frozenset([
 
 
 class _TreeData:
-    """Cached tree-structure view of one ``.jsonl`` file.
+    """Cached tree-structure view of one session transcript.
 
     The shape is span-based and ignores ``parentUuid`` for structure.
     ``parentUuid`` is just a write-time linked-list back-pointer (see
@@ -103,7 +103,7 @@ class _TreeData:
     * ``agent_link``      — ``{tool_use_id: {agent_id, agent_path,
                             assistant_uuid}}`` for every Agent/Task
                             tool_use whose tool_result resolved a
-                            subagent .jsonl on disk.
+                            subagent transcript on disk.
     * ``assistant_has_tool_use`` — ``{assistant_uuid}`` set; True iff the
                             assistant record at this line carries a
                             ``tool_use`` content part (i.e. it should be
@@ -118,14 +118,6 @@ class _TreeData:
     * ``tool_use_name_of`` — ``{assistant_uuid: tool_name}`` — first
                             tool_use part's name (for the umbrella
                             title prefix).
-    * ``line_offsets``    — ``[int]`` with one **sentinel** entry past
-                            the last record. ``line_offsets[n]`` is the
-                            byte position where line ``n`` starts in
-                            the source file; the length of line ``n``
-                            is ``line_offsets[n+1] - line_offsets[n]``.
-                            Used by the ``V`` / ``E`` actions to
-                            extract per-line bytes without re-reading
-                            the whole file.
 
     Per-record attrs:
       * ``rec['_tree_forked_from']`` — record explicitly forked from
@@ -137,7 +129,7 @@ class _TreeData:
                  'agent_link', 'records_line', 'parent_id_of',
                  'assistant_has_tool_use', 'tool_to_turn_root_line',
                  'agent_to_assistant_line', 'tool_use_name_of',
-                 'line_offsets', 'voice_count', 'latest_voice_line',
+                 'voice_count', 'latest_voice_line',
                  'ai_title', 'custom_title', 'link_map')
 
     def __init__(self):
@@ -153,8 +145,8 @@ class _TreeData:
         # needing a uuid (metadata records often have none).
         self.records_line = {}
         # line_no → parent_id — the parent **umbrella** id for that
-        # line's leaf row. One of: ``('prompt', jsonl, n)``,
-        # ``('tool', jsonl, n)``, or ``('span', jsonl, n)``. Top-level
+        # line's leaf row. One of: ``('prompt', sess, n)``,
+        # ``('tool', sess, n)``, or ``('span', sess, n)``. Top-level
         # rows (the umbrellas themselves) are absent — their parent
         # link lives in tool_to_turn_root_line / agent_to_assistant_line
         # or is None.
@@ -170,11 +162,6 @@ class _TreeData:
         # assistant_uuid → name of first tool_use content part, for the
         # ``<tool:Name>`` umbrella's title prefix.
         self.tool_use_name_of = {}
-        # Byte offsets of each line, with a sentinel past the end so
-        # ``line_offsets[n+1] - line_offsets[n]`` always gives line n's
-        # length. Starts as ``[0]`` (sentinel-only, no lines yet) and
-        # grows by one entry per appended line.
-        self.line_offsets = [0]
         # Cached count of voice-bearing records — populated lazily by
         # ``_fmt_scope_card`` and invalidated by tail appends that
         # bring in new voice records.
@@ -397,7 +384,7 @@ def _fold_record(td, cur, rec, n, path):
                 td.parent_id_of[n] = ('tool', path, owner_line)
                 dirty.add(('tool', path, owner_line))
             # Subagent-link check: a tool_result whose
-            # toolUseResult.agentId resolves an agent jsonl on disk.
+            # toolUseResult.agentId resolves a child transcript.
             # A new link means a new row in the session's top block —
             # dirty the root so it gets re-listed.
             if _maybe_link_subagent(td, rec, owner, path):
@@ -441,7 +428,7 @@ def _fold_record(td, cur, rec, n, path):
 
 def _resolve_tool_owner(rec, tool_owner):
     """Look up the assistant_uuid that this record back-points at, or None."""
-    # (0) Explicit assistant-uuid back-pointer (subagent jsonls stamp
+    # (0) Explicit assistant-uuid back-pointer (subagent transcripts stamp
     # every tool-result user record with the owning assistant turn's
     # uuid). Strongest signal — bypasses the tool_owner indirection.
     asst = rec.get('sourceToolAssistantUUID')
@@ -473,7 +460,7 @@ def _resolve_tool_owner(rec, tool_owner):
 
 
 def _maybe_link_subagent(td, rec, owner_uuid, path):
-    """If ``rec`` is a tool_result that resolves a subagent jsonl, link it.
+    """If ``rec`` is a tool_result that resolves a subagent transcript, link it.
 
     Inspects the owner assistant's tool_use parts to find the matching
     Agent/Task call and records the join via ``td.agent_link`` plus the
@@ -509,45 +496,11 @@ def _maybe_link_subagent(td, rec, owner_uuid, path):
                     and ap.get('id') == tu_id
                     and ap.get('name') in ('Agent', 'Task')):
                 continue
-            tur = rec.get('toolUseResult')
-            agent_id = (tur.get('agentId')
-                        if isinstance(tur, dict) else None)
-            if agent_id:
-                agent_path = _resolve_agent_jsonl(path, agent_id)
-                if not os.path.isfile(agent_path):
-                    continue
-            elif (isinstance(tur, dict)
-                    and tur.get('status') == 'teammate_spawned'):
-                # Team worker: the spawn result carries no agentId.
-                # New backend first: the worker runs in-process and
-                # its transcript lands in this session's own subagents
-                # dir — join via the spawn name + team. The stored
-                # agent_id is the filename-derived one, the same key
-                # the subagent row listing and ``_resolve_agent_jsonl``
-                # use, so the orphan diff and drill-in line up. Legacy
-                # backend fallback: the worker runs as its own sibling
-                # session, joined via the Agent call's ``name`` and
-                # the team roster / head stamps.
-                name = (tur.get('name')
-                        or (ap.get('input') or {}).get('name'))
-                if not name:
-                    continue
-                # Only new-backend spawn results carry ``name`` — gate
-                # the in-process lookup on it so an old-shape spawn can
-                # never claim a same-named in-process transcript from a
-                # different (unrecorded) team.
-                hit = (_find_inprocess_teammate(
-                           path, name, tur.get('team_name'))
-                       if tur.get('name') else None)
-                if hit:
-                    agent_id, agent_path = hit
-                else:
-                    agent_id = name
-                    agent_path = _find_worker_jsonl(path, agent_id)
-                    if not agent_path:
-                        continue
-            else:
+            hit = store_resolve_spawned_child(
+                path, rec.get('toolUseResult'), ap.get('input'))
+            if hit is None:
                 continue
+            agent_id, agent_path = hit
             td.agent_link[tu_id] = {
                 'agent_id': agent_id,
                 'agent_path': agent_path,
@@ -560,7 +513,7 @@ def _maybe_link_subagent(td, rec, owner_uuid, path):
     return linked
 
 
-def _list_tree_roots(jsonl_path):
+def _list_tree_roots(sess):
     """Tree-mode listing for a session: root-level rows in file order.
 
     Each entry is either a ``<prompt>`` umbrella (one per turn) or a
@@ -572,41 +525,41 @@ def _list_tree_roots(jsonl_path):
     newest-first like the flat view; agents with no dispatch site in
     the main thread come back tagged ``orphan`` and dimmed.
     """
-    td = _scan_tree(jsonl_path)
+    td = _scan_tree(sess)
     out = []
-    subs = _tree_subagents_for_session(jsonl_path, td)
+    subs = _tree_subagents_for_session(sess, td)
     # When the session has subagents, bracket their block with two
     # ``meta`` dividers so the user sees where the subagents end and
     # the turn/span umbrellas begin. A session without any renders
     # exactly as before. Ids are session-namespaced
-    # (``('sep', jsonl, which)``) so they stay unique across cached
+    # (``('sep', sess, which)``) so they stay unique across cached
     # sessions AND stable, doubling as insertion sentinels for the
     # ``update_data`` positioning API (meta-rows design sec Migrations
     # → browse-claude). The framework skips the cursor over them, never
     # selects them, and (with ``meta_filter_mode='show'``) keeps them
     # visible under an active filter.
     if subs:
-        out.append(Item(id=('sep', jsonl_path, 'subagents'),
+        out.append(Item(id=('sep', sess, 'subagents'),
                         title='--- Subagents:', meta=True))
         out.extend(subs)
-        out.append(Item(id=('sep', jsonl_path, 'session'),
+        out.append(Item(id=('sep', sess, 'session'),
                         title='--- Session:', meta=True))
     for entry in td.roots_in_order:
         if entry['kind'] == 'turn':
             line = entry['line']
             rec = entry['rec']
-            out.append(_prompt_umbrella_item(jsonl_path, line, rec, td))
+            out.append(_prompt_umbrella_item(sess, line, rec, td))
         else:   # 'span'
             out.append(_span_umbrella_item(
-                jsonl_path, entry['start'], entry['records'],
+                sess, entry['start'], entry['records'],
             ))
     return out
 
 
-def _tree_subagents_for_session(jsonl_path, td):
+def _tree_subagents_for_session(sess, td):
     """Subagent rows for the tree-mode top block, newest-first.
 
-    Keeps the flat-view ordering from ``_list_subagents_for_session``
+    Keeps the flat-view ordering from ``store_child_sessions``
     (newest mtime first) so both views show the same row sequence.
     Agents with no dispatch site in the main thread (no
     ``td.agent_to_assistant_line`` entry, built by
@@ -614,7 +567,7 @@ def _tree_subagents_for_session(jsonl_path, td):
     ``orphan · …`` and dimmed so the user can see they aren't wired
     into the session's turn graph.
     """
-    subs = _list_subagents_for_session(jsonl_path)
+    subs = store_child_sessions(sess)
     for item in subs:
         if item.agent_id in td.agent_to_assistant_line:
             continue
@@ -625,7 +578,7 @@ def _tree_subagents_for_session(jsonl_path, td):
     return subs
 
 
-def _list_prompt_children(jsonl_path, turn_root_line):
+def _list_prompt_children(sess, turn_root_line):
     """Children of a ``<prompt>`` umbrella.
 
     Returns the turn root user voice as a leaf, followed by each turn
@@ -634,7 +587,7 @@ def _list_prompt_children(jsonl_path, turn_root_line):
     tool_result has arrived yet — the umbrella shape stays stable as
     the transcript grows).
     """
-    td = _scan_tree(jsonl_path)
+    td = _scan_tree(sess)
     if not (0 <= turn_root_line < len(td.records)):
         return []
     rec = td.records[turn_root_line]
@@ -647,7 +600,7 @@ def _list_prompt_children(jsonl_path, turn_root_line):
     # indent as the assistant replies that follow. Keeps its
     # ``row_bg`` voice stripe; the user's voice deserves the marker
     # whether or not it happens to be folded under an umbrella.
-    leaf = _tree_item(jsonl_path, rec, td)
+    leaf = _tree_item(sess, rec, td)
     if leaf is not None:
         out.append(leaf)
     # 2) Each turn member.
@@ -659,15 +612,15 @@ def _list_prompt_children(jsonl_path, turn_root_line):
             cline = td.line_of.get(cuuid)
             if cline is None:
                 continue
-            out.append(_tool_umbrella_item(jsonl_path, cline, child, td))
+            out.append(_tool_umbrella_item(sess, cline, child, td))
         else:
-            it = _tree_item(jsonl_path, child, td)
+            it = _tree_item(sess, child, td)
             if it is not None:
                 out.append(it)
     return out
 
 
-def _list_tool_children(jsonl_path, assistant_line):
+def _list_tool_children(sess, assistant_line):
     """Children of a ``<tool>`` umbrella.
 
     Returns the assistant tool_use record as a leaf, then every paired
@@ -676,7 +629,7 @@ def _list_tool_children(jsonl_path, assistant_line):
     across in-flight transcripts. Subagent transcripts are NOT nested
     here — they live in the session's top block (``_list_tree_roots``).
     """
-    td = _scan_tree(jsonl_path)
+    td = _scan_tree(sess)
     if not (0 <= assistant_line < len(td.records)):
         return []
     rec = td.records[assistant_line]
@@ -688,29 +641,29 @@ def _list_tool_children(jsonl_path, assistant_line):
     # voice stripe if the assistant has text content (mixed text +
     # tool_use case) — same reasoning as the prompt umbrella's first
     # leaf: voice markers belong on voice rows, regardless of nesting.
-    leaf = _tree_item(jsonl_path, rec, td)
+    leaf = _tree_item(sess, rec, td)
     if leaf is not None:
         out.append(leaf)
     # 2) Paired tool_children (tool_result, hook attachments, …).
     for child in td.tool_children.get(uuid, []):
-        it = _tree_item(jsonl_path, child, td)
+        it = _tree_item(sess, child, td)
         if it is not None:
             out.append(it)
     return out
 
 
-def _list_span_records(jsonl_path, start_line):
+def _list_span_records(sess, start_line):
     """Children of a ``<system>`` umbrella: the records of one span."""
-    td = _scan_tree(jsonl_path)
+    td = _scan_tree(sess)
     out = []
     for rec in td.span_records.get(start_line, []):
-        it = _tree_item(jsonl_path, rec, td)
+        it = _tree_item(sess, rec, td)
         if it is not None:
             out.append(it)
     return out
 
 
-def _tree_item(jsonl_path, rec, td):
+def _tree_item(sess, rec, td):
     """Build a leaf list-row ``Item`` for ``rec`` in tree mode.
 
     Conversationally a leaf — wrapping into ``<prompt>`` / ``<tool>`` umbrellas
@@ -731,7 +684,7 @@ def _tree_item(jsonl_path, rec, td):
         return None
     kind = _kind_of(rec)
 
-    item_id = ('msg', jsonl_path, n)
+    item_id = ('msg', sess, n)
     item = Item(
         id=item_id,
         title=_link_marker(item_id) + _oneline(_summarise_message(rec)),
@@ -745,7 +698,7 @@ def _tree_item(jsonl_path, rec, td):
     )
     item.kind = 'message'
     item.line_no = n
-    item.session_path = jsonl_path
+    item.session_path = sess
     item.message_kind = kind
     if _is_voice(rec):
         bg = _ROW_BG_FOR_KIND.get(kind)
@@ -754,10 +707,10 @@ def _tree_item(jsonl_path, rec, td):
     return item
 
 
-def _prompt_umbrella_item(jsonl_path, turn_root_line, rec, td):
+def _prompt_umbrella_item(sess, turn_root_line, rec, td):
     """``<prompt>`` umbrella wrapping one turn.
 
-    Id shape: ``('prompt', jsonl, turn_root_line)``. Children are the turn
+    Id shape: ``('prompt', sess, turn_root_line)``. Children are the turn
     root user voice (as a leaf) followed by every turn member, with each
     assistant-with-tool_use member further wrapped in a ``<tool>``
     umbrella. The umbrella's title prefix mirrors the existing
@@ -770,7 +723,7 @@ def _prompt_umbrella_item(jsonl_path, turn_root_line, rec, td):
     # Count of direct children visible when expanded: the user voice
     # itself + each member (tool-using members collapse into one row).
     n_replies = len(members)
-    item_id = ('prompt', jsonl_path, turn_root_line)
+    item_id = ('prompt', sess, turn_root_line)
     # A turn opened by a worker→leader task-notification or an inbound
     # peer message is agent voice, not a human prompt — relabel its
     # umbrella so the row doesn't masquerade as one (a SendMessage-only
@@ -788,7 +741,7 @@ def _prompt_umbrella_item(jsonl_path, turn_root_line, rec, td):
     )
     item.kind = 'prompt'
     item.line_no = turn_root_line
-    item.session_path = jsonl_path
+    item.session_path = sess
     item.message_kind = kind
     # Voice stripe — the umbrella visually IS the user prompt at the
     # turn level. Matches the leaf user-msg row's stripe so the two
@@ -800,10 +753,10 @@ def _prompt_umbrella_item(jsonl_path, turn_root_line, rec, td):
     return item
 
 
-def _tool_umbrella_item(jsonl_path, assistant_line, rec, td):
+def _tool_umbrella_item(sess, assistant_line, rec, td):
     """``<tool:Name>`` umbrella wrapping one tool-execution group.
 
-    Id shape: ``('tool', jsonl, assistant_line)``. Children are the
+    Id shape: ``('tool', sess, assistant_line)``. Children are the
     dispatching assistant itself (leaf) and the paired ``tool_result``
     + hook attachments. The tool name in the prefix is the **first**
     ``tool_use`` part's name.
@@ -817,7 +770,7 @@ def _tool_umbrella_item(jsonl_path, assistant_line, rec, td):
     summary = _oneline(_summarise_message(rec))
     uuid = rec.get('uuid')
     tool_name = td.tool_use_name_of.get(uuid, 'tool')
-    item_id = ('tool', jsonl_path, assistant_line)
+    item_id = ('tool', sess, assistant_line)
     item = Item(
         id=item_id,
         title=f'{_link_marker(item_id)}<tool:{tool_name}>  {summary}',
@@ -828,7 +781,7 @@ def _tool_umbrella_item(jsonl_path, assistant_line, rec, td):
     )
     item.kind = 'tool'
     item.line_no = assistant_line
-    item.session_path = jsonl_path
+    item.session_path = sess
     item.message_kind = _kind_of(rec)
     item.tool_name = tool_name
     if _is_voice(rec):
@@ -865,10 +818,10 @@ def _tool_umbrella_wraps_subagent(rec, td):
     return False
 
 
-def _span_umbrella_item(jsonl_path, start_line, records):
+def _span_umbrella_item(sess, start_line, records):
     """Synthetic ``<system>`` row collapsing a metadata span.
 
-    Id shape: ``('span', jsonl, start_line)``. ``get_children`` routes
+    Id shape: ``('span', sess, start_line)``. ``get_children`` routes
     that id to ``_list_span_records`` which returns the span's records
     as flat children. Title shows the count + dominant types so the
     row's still informative when collapsed.
@@ -903,7 +856,7 @@ def _span_umbrella_item(jsonl_path, start_line, records):
         for r in records
     )
     item = Item(
-        id=('span', jsonl_path, start_line),
+        id=('span', sess, start_line),
         title=f'<system>  {types_summary}',
         tag=f'{len(records)} records',
         tag_style='dim',
@@ -913,5 +866,676 @@ def _span_umbrella_item(jsonl_path, start_line, records):
     item.kind = 'span'
     item.span_start = start_line
     item.span_count = len(records)
-    item.session_path = jsonl_path
+    item.session_path = sess
     return item
+
+
+# ---- live tail -----------------------------------------------------------
+#
+# ``_scan_tree`` reads a session once through ``store_tail_open`` and keeps
+# the returned tail state; the worker thread polls the cursor's session
+# every ``store_tail_interval()`` seconds through ``store_tail_poll``,
+# folds the new records into the cached ``_TreeData`` and pushes
+# ``update_data`` patches for the umbrellas whose visible child list grew.
+
+
+_TAIL_STATE = {}    # session_key → store tail state (``.cursor`` = fold cursor)
+_TAIL_STOP = None   # threading.Event; created in main()
+_TAIL_THREAD = None # threading.Thread; created in main()
+
+
+def _resolve_session_for_bust(item_id):
+    """Map an id to the session whose ``_TreeData`` it depends on.
+
+    Returns ``None`` when ``item_id`` doesn't reference per-session
+    scanned state (projects, synthetic ids).
+    """
+    if not isinstance(item_id, tuple) or not item_id:
+        return None
+    tag = item_id[0]
+    if tag == 'agent':
+        return store_child_session(item_id[1], item_id[2])
+    if tag in ('md', 'refs'):
+        sess = item_id[1][1]
+    elif tag in ('session', 'prompt', 'tool', 'span', 'msg', 'trunc', 'err'):
+        sess = item_id[1]
+    else:
+        return None
+    return sess if store_session_exists(sess) else None
+
+
+def _bust_caches_for(item_id):
+    """Drop cached ``_TreeData`` + tail state for one session's tree.
+
+    Used by ``get_children(..., reload=True)`` to refresh a single
+    subtree without disturbing siblings. No-op for ids that don't
+    resolve to a per-session ``_TreeData``.
+    """
+    sess = _resolve_session_for_bust(item_id)
+    if sess is None:
+        return
+    _TREE_CACHE.pop(sess, None)
+    _TAIL_STATE.pop(sess, None)
+
+
+def _scan_tree(sess):
+    """Return cached ``_TreeData`` for ``sess``; bulk-read on cache miss.
+
+    Cache invalidation is explicit (``get_children(id, reload=True)``
+    drops the entry; ``get_children(None, reload=True)`` clears
+    everything). The live-tail worker keeps the cached ``td`` in sync
+    with the session's growth — no time-based check needed.
+
+    Concurrent callers (children worker + preview worker on open)
+    serialize on a per-session mutex so a huge transcript isn't read
+    twice under GIL contention. The mutex is dropped on completion;
+    the cache lookup is double-checked under the lock so the second
+    caller returns the just-populated entry without re-reading.
+    """
+    cached = _TREE_CACHE.get(sess)
+    if cached is not None:
+        return cached
+    with _SCAN_LOCKS_LOCK:
+        lock = _SCAN_LOCKS.setdefault(sess, threading.Lock())
+    with lock:
+        cached = _TREE_CACHE.get(sess)
+        if cached is not None:
+            return cached
+        return _scan_tree_locked(sess)
+
+
+def _scan_tree_locked(sess):
+    """Body of ``_scan_tree`` — runs under the per-session mutex.
+
+    Reads the transcript through ``store_tail_open`` and folds every
+    record. The returned tail state (watermark at the end of the read)
+    is kept so the worker resumes exactly where this read stopped, with
+    the same open-turn / open-span fold cursor.
+    """
+    td = _TreeData()
+    cur = _ScanCursor()
+    records, state = store_tail_open(sess)
+    _fold_records(td, cur, records, sess)
+    if state is not None:
+        state.cursor = cur
+        _TAIL_STATE[sess] = state
+    _TREE_CACHE[sess] = td
+    return td
+
+
+def _fold_records(td, cur, records, sess):
+    """Store ``[(record_key, rec_or_None), …]`` in ``td`` and fold each record.
+
+    Returns the set of umbrella ids whose visible child list grew (the
+    bulk read ignores it; the tail consumes it).
+    """
+    dirty = set()
+    for n, rec in records:
+        while len(td.records) <= n:
+            td.records.append(None)
+        td.records[n] = rec
+        if rec is None:
+            continue
+        dirty |= _fold_record(td, cur, rec, n, sess)
+        if _is_voice(rec):
+            td.latest_voice_line = n
+    return dirty
+
+
+def _read_new_records(sess):
+    """Records appended since the last call: ``(records, dirty_parents)``.
+
+    ``records`` is ``[(record_key, rec_or_None), …]`` from
+    ``store_tail_poll``. When ``_TREE_CACHE`` has an entry the records
+    are also folded into it (so tree-mode umbrellas, parent_id_of,
+    agent_link … stay current) and ``dirty_parents`` is the set of
+    umbrella ids whose visible child list grew; a record the store
+    reports as changed is replaced in place and its parent dirtied.
+    Flat mode ignores the dirty set and consumes ``records`` directly.
+    ``([], set())`` when the session has no tail state or the store
+    has nothing new.
+    """
+    state = _TAIL_STATE.get(sess)
+    if state is None:
+        return ([], set())
+    new, changed = store_tail_poll(sess, state)
+    td = _TREE_CACHE.get(sess)
+    dirty = set()
+    if td is not None:
+        dirty |= _fold_records(td, state.cursor, new, sess)
+        for n, rec in changed:
+            if 0 <= n < len(td.records):
+                td.records[n] = rec
+                parent = td.parent_id_of.get(n)
+                if parent is not None:
+                    dirty.add(parent)
+    return (new, dirty)
+
+
+def _refresh_hidden_in_op(op):
+    """Return ``op`` with its ``hidden`` field re-evaluated against the
+    live ``_DETAIL_LEVEL`` global.
+
+    Used by the umbrella generator's flush helper so a filter toggle
+    that lands between descent (when an item's ``hidden`` was sampled)
+    and flush (when the upsert is posted to the framework) takes
+    effect on the items being pushed. Non-upsert ops pass through
+    unchanged; upsert ops without ``hidden`` in their fields also
+    pass through.
+    """
+    if not (isinstance(op, tuple) and op and op[0] == 'upsert'):
+        return op
+    _, cid, parent_id, fields, *rest = op
+    if not isinstance(fields, dict) or 'hidden' not in fields:
+        return op
+    new_fields = dict(fields)
+    new_fields['hidden'] = not _passes_filter(cid)
+    return (op[0], cid, parent_id, new_fields) + tuple(rest)
+
+
+def _item_to_upsert_kwargs(item):
+    """Extract Item fields + custom attrs into kwargs for ``upsert``.
+
+    ``upsert`` accepts arbitrary keyword args: declared dataclass
+    fields map to ``Item.__init__`` kwargs, anything else lands as
+    ``setattr`` on the freshly-built Item (mirrors ``to_item``).
+    Iterating ``vars(item)`` picks up both the declared fields and
+    the recipe-specific attrs (kind, line_no, row_bg, …) without
+    enumerating each one by name.
+    """
+    out = {}
+    for k, v in vars(item).items():
+        if k == 'id':
+            continue
+        out[k] = v
+    return out
+
+
+def _push_tail_diffs(b, dirty_parents):
+    """Apply ``update_data`` patches for every dirty umbrella's new kids.
+
+    For each parent id whose child list grew during the fold step, we
+    compare the live ``get_children(parent)`` output against what the
+    framework already has cached and ``upsert`` only the new entries,
+    each positioned after its predecessor in the fresh listing (so a
+    tail-linked subagent lands INSIDE the session's top block — the
+    divider sentinel ids double as pivots — and a first subagent
+    brings the whole block in at the top, refetch-identical). Ops
+    apply in batch order, so a pivot upserted earlier in the same
+    batch resolves; a missing pivot degrades to append. Parents not
+    yet expanded by the user are skipped — their children will be
+    fetched the normal way once expansion happens. Called on the main
+    thread via ``Browser.update_data`` (thread-safe).
+    """
+    if not dirty_parents:
+        return
+    ops = []
+    for parent_id in dirty_parents:
+        # At a reduced detail level, a tail append (e.g., a voice
+        # record joining a previously-hidden ``span`` umbrella) can
+        # cross the parent's min level under the current threshold.
+        # Reveal the parent first, in the same batch as its new
+        # children. Skip when the parent isn't in our index (yet to be
+        # upserted) — it'll be built with the right ``hidden`` from the
+        # builder.
+        parent_item = b.get_item(parent_id)
+        if (
+            parent_item is not None
+            and getattr(parent_item, 'hidden', False)
+            and _passes_filter(parent_id)
+        ):
+            ops.append(mod(parent_id, hidden=False))
+        cached = b.cached_children(parent_id)
+        if cached is None:
+            continue
+        existing_ids = {it.id for it in cached}
+        try:
+            fresh = get_children(parent_id)
+        except Exception:
+            continue
+        prev_id = None
+        for child in fresh:
+            if child.id not in existing_ids:
+                where = (('first', None) if prev_id is None
+                         else ('after', None, prev_id))
+                ops.append(upsert(child.id, parent_id, where=where,
+                                  **_item_to_upsert_kwargs(child)))
+            prev_id = child.id
+    if ops:
+        b.update_data(ops)
+
+
+def _tail_worker(b):
+    """Background loop: poll the cursor's session once per tick.
+
+    Best-effort and single-threaded — one session per tick, the one
+    the cursor currently sits in (per the flat/tree rule encoded in
+    ``_cursor_tail_session``). Polls through ``_read_new_records``, then
+    dispatches mode-specific push:
+
+      * Tree mode consumes the ``dirty_parents`` set returned by the
+        fold step (each parent umbrella's child list grew).
+      * Flat mode consumes the raw ``records`` list and emits one
+        ``upsert`` per new record, appended at the end.
+
+    The tick period is ``store_tail_interval()``. Stopped via the
+    module-level ``_TAIL_STOP`` event when ``main`` exits. Marked
+    daemon as a backstop.
+    """
+    interval = store_tail_interval()
+    while not _TAIL_STOP.is_set():
+        try:
+            sess = _resolve_tail_session_from_browser(b)
+            if sess is not None:
+                records = _maybe_bootstrap_tail_state(sess)
+                new, dirty = _read_new_records(sess)
+                records += new
+                if records or dirty:
+                    if _TREE_MODE:
+                        _push_tail_diffs(b, dirty)
+                    else:
+                        _push_flat_inserts(b, sess, records)
+                    # Bust the preview cache for the session so the
+                    # session-card preview re-renders even when the
+                    # cursor stayed parked on a row above the
+                    # changed listing.
+                    b.post(lambda s=sess: _bust_preview_for_session(b, s))
+        except Exception:
+            # Best-effort: a malformed cursor row / get_children
+            # blowup must not kill the worker. Swallow silently;
+            # the next tick gets a clean shot.
+            pass
+        _TAIL_STOP.wait(timeout=interval)
+
+
+def _maybe_bootstrap_tail_state(sess):
+    """Open the session's tail state if missing; returns the records read.
+
+    ``_scan_tree`` normally opens it (every listing goes through the
+    read). A session whose caches were dropped since its listing is
+    re-read here, and the records come back so flat mode can sync the
+    framework's cached children with them. ``[]`` when the state exists.
+    """
+    if sess in _TAIL_STATE:
+        return []
+    _TREE_CACHE.pop(sess, None)
+    td = _scan_tree(sess)
+    return list(enumerate(td.records))
+
+
+def _push_flat_inserts(b, sess, records):
+    """Flat-mode push: build Items for new records and append them.
+
+    Flat mode now renders messages in chronological order (oldest
+    first, latest at the bottom — same as tree mode). New tail
+    records belong at the **end** of the list. ``where=None`` uses
+    the framework's default "append at the end of the parent's
+    children" behaviour.
+
+    The whole batch goes through one ``update_data`` call so the
+    framework's cursor anchor runs exactly once at the end and the
+    user's cursor position is preserved across the insert.
+    """
+    if not records:
+        return
+    session_id = ('session', sess)
+    existing = b.cached_children(session_id)
+    if existing is None:
+        return
+    existing_ids = {it.id for it in existing}
+
+    ops = []
+    for n, rec in records:
+        if rec is None:
+            continue
+        item_id = ('msg', sess, n)
+        if item_id in existing_ids:
+            continue
+        kind = _kind_of(rec)
+        fields = {
+            'title': _oneline(_summarise_message(rec)),
+            'tag': kind,
+            'tag_style': _TAG_STYLE_FOR_KIND.get(kind, ''),
+            'has_children': False,
+            'hidden': not _passes_filter(item_id),
+            'kind': 'message',
+            'line_no': n,
+            'session_path': sess,
+            'message_kind': kind,
+        }
+        if _is_voice(rec):
+            bg = _ROW_BG_FOR_KIND.get(kind)
+            if bg is not None:
+                fields['row_bg'] = bg
+        ops.append(upsert(item_id, session_id, **fields))
+    if ops:
+        b.update_data(ops)
+
+
+def _id_session(item_id):
+    """The session key an id is keyed under, or ``None``.
+
+    For every per-session id this is the key that appears as the id's
+    first coordinate — the session the row is *displayed under*. A
+    subagent group ``('agent', sess, aid)`` resolves to ``sess`` (the
+    session it nests in). Markdown ids read the key out of their anchor.
+    ``('project', key)`` and synthetic ids yield ``None``.
+    """
+    if not isinstance(item_id, tuple) or not item_id:
+        return None
+    tag = item_id[0]
+    if tag in ('session', 'agent', 'prompt', 'tool', 'span', 'msg',
+               'trunc', 'err'):
+        return item_id[1]
+    if tag in ('md', 'refs'):
+        return item_id[1][1]
+    return None
+
+
+def _bust_preview_for_session(b, sess):
+    """Drop cached preview text for ``sess`` and force a re-fetch.
+
+    Runs on the main thread (via ``Browser.post``). For the cursor's
+    row or any descendant of ``sess``, calls ``invalidate_preview``
+    which re-fetches *without* resetting view state — a user who
+    pinned the view to the bottom (Shift-End) keeps following the
+    tail as the umbrella's preview grows. For non-cursor sessions the
+    cache is dropped so the next visit re-fetches.
+    """
+    cur_id = b.preview_item_id
+    if cur_id == ('session', sess) or _id_session(cur_id) == sess:
+        b.invalidate_preview(cur_id)
+    else:
+        b.drop_preview_cache(('session', sess))
+
+
+def _resolve_tail_session_from_browser(b):
+    """Return the session the cursor's current row maps to, or None.
+
+    Reads the cursor + visible-list through a one-off Context so
+    the scope_root row's id participates too — a freshly-launched
+    recipe that hasn't moved the cursor still resolves a session.
+    """
+    try:
+        from browse_tui import Context
+        ctx = Context(b)
+        vis = ctx.visible_items
+        if not vis:
+            return None
+        idx = ctx.cursor_index
+        if not (0 <= idx < len(vis)):
+            return None
+        item, _kind = vis[idx]
+        item_id = item.id if item is not None else None
+        return _cursor_tail_session(item_id)
+    except Exception:
+        return None
+
+
+def _cursor_tail_session(item_id):
+    """Resolve the session the tailer should follow for ``item_id``.
+
+    Mode-dependent for the subagent group row:
+
+      * Tree mode: ``('agent', sess, aid)`` reflects activity in the
+        parent session's tree, so tail the parent.
+      * Flat mode: ``('agent', sess, aid)`` IS the subagent's listing
+        (drill-into row), so tail the subagent.
+
+    Other id kinds: take the id's session. ``None`` when the resolved
+    session isn't one the store can tail.
+    """
+    if not isinstance(item_id, tuple) or not item_id:
+        return None
+    if item_id[0] == 'agent':
+        sess, aid = item_id[1], item_id[2]
+        if _TREE_MODE:
+            return sess if store_tailable(sess) else None
+        child = store_child_session(sess, aid)
+        return child if child and store_tailable(child) else None
+    sess = _id_session(item_id)
+    return sess if sess is not None and store_tailable(sess) else None
+
+
+def _last_voice_id(sess):
+    """Return ``('msg', sess, n)`` id of the most-recent voice record, or None.
+
+    "Voice" matches ``_is_voice`` (user prompt or assistant text).
+    Reads the eagerly-tracked ``td.latest_voice_line`` populated by
+    ``_scan_tree`` during its forward pass, so this is O(1) on cache
+    hit (no reverse walk).
+    """
+    td = _scan_tree(sess)
+    n = td.latest_voice_line
+    if n is None:
+        return None
+    return ('msg', sess, n)
+
+
+def _last_visible_voice_id(sess):
+    """Newest voice record VISIBLE at the current detail level, or None.
+
+    The absolute latest voice can be filtered out — a mid-turn assistant
+    text at the summary level — and ``cursor_to`` silently no-ops on
+    hidden rows, so the cursor-on-open jump must target a row the filter
+    shows. Walks back from ``td.latest_voice_line`` to the newest voice
+    that passes; when NO voice is visible, returns the absolute latest
+    so the caller's chain trim lands on its nearest visible ancestor
+    (the wrapping ``<prompt>``).
+    """
+    td = _scan_tree(sess)
+    n = td.latest_voice_line
+    if n is None:
+        return None
+    for i in range(n, -1, -1):
+        rec = td.records[i]
+        if not (isinstance(rec, dict) and _is_voice(rec)):
+            continue
+        if _passes_filter(('msg', sess, i), td):
+            return ('msg', sess, i)
+    return ('msg', sess, n)
+
+
+# ---- flat-mode listings --------------------------------------------------
+
+
+def _list_session_children(sess):
+    """Return subagent groups + top-level messages for a session.
+
+    Subagents come first (most users want to see what was dispatched
+    before scrolling through hundreds of main-thread messages).
+    Sessions without any subagents render exactly as before.
+    """
+    subs = store_child_sessions(sess)
+    msgs = _list_messages(sess)
+    return subs + msgs
+
+
+def _list_subagent_messages(item_id):
+    """Children for a subagent group ``('agent', sess, aid)``: its records."""
+    child = store_child_session(item_id[1], item_id[2])
+    return _list_messages(child) if child else []
+
+
+def _list_messages(sess, limit=None):
+    """List messages in **chronological** order (oldest first).
+
+    Matches tree-mode ordering so the cursor-jump-to-latest-voice and
+    the t-toggle don't visually flip the conversation on the user.
+
+    Reads from the cached ``_TREE_CACHE[sess].records`` so we
+    don't re-read the whole transcript on every navigation.
+    ``_scan_tree`` populates the cache the first time we visit the
+    session (and keeps its tail state so the live-tail worker resumes
+    from where the read stopped). Placeholder records (``None``) are
+    skipped without surfacing a fake row.
+
+    ``limit`` truncates from the **start** of the file (so the user
+    keeps the most recent messages — they're scrolling toward the
+    tail anyway). ``limit=0`` (the default after #475) disables
+    truncation entirely.
+    """
+    if limit is None:
+        limit = _message_limit
+    if not store_session_exists(sess):
+        return [Item(
+            id=('err', sess),
+            title=f'[error] no such file: {sess}',
+            tag='err',
+            tag_style='red',
+        )]
+    td = _scan_tree(sess)
+    total = len(td.records)
+    truncated = bool(limit) and total > limit
+    start = total - limit if truncated else 0
+
+    out = []
+    if truncated:
+        older = start
+        out.append(Item(
+            id=('trunc', sess),
+            title=f'({older} older entries hidden; press e to view file)',
+            tag='…',
+            tag_style='dim',
+        ))
+    for n in range(start, total):
+        obj = td.records[n]
+        if obj is None:
+            continue
+        kind = _kind_of(obj)
+        item_id = ('msg', sess, n)
+        item = Item(
+            id=item_id,
+            title=_link_marker(item_id) + _oneline(_summarise_message(obj)),
+            tag=_row_tag(kind, obj),
+            tag_style=_TAG_STYLE_FOR_KIND.get(kind, ''),
+            # Optimistic markdown-subtree detection — see ``_tree_item``. The
+            # feature is mode-agnostic, so flat-mode rows gain the same arrow;
+            # ``get_children`` returns the document nodes regardless of mode.
+            has_children=_md_has_children(obj),
+            hidden=not _passes_filter(item_id, td),
+        )
+        item.kind = 'message'
+        item.line_no = n
+        item.session_path = sess
+        item.message_kind = kind
+        # Stripe rows that carry actual *speech* — the user typing, or
+        # the assistant's text reply. Tool calls (assistant tool_use)
+        # and tool results (user tool_result) are machinery, not voice,
+        # so they keep the default no-bg look even though their record
+        # type is user/assistant.
+        if _is_voice(obj):
+            bg = _ROW_BG_FOR_KIND.get(kind)
+            if bg is not None:
+                item.row_bg = bg
+        out.append(item)
+
+    return out
+
+
+# ---- get_children: dispatches by id tag ----------------------------------
+#
+# The Browser passes the raw item id back into ``get_children``. Every id is a
+# tagged tuple whose first element is a short string tag (or ``None`` for the
+# root), so routing is a flat ``id[0]`` dispatch with direct field access
+# (``id[1]`` = the session key, ``id[2]`` = a record / agent key). No substring
+# scans, no ordering hazards — the tags are unambiguous.
+
+
+def get_children(item_id, *, reload=False):
+    # ``reload=True`` is the framework's explicit "this is a refresh,
+    # not an initial fetch" signal — see ``_do_refresh`` in 040-state.py
+    # and ticket #407. Honour it at every id shape so the framework can
+    # refresh a single subtree (one session file's tree, one subagent's
+    # tree, or the entire root) without disturbing the rest.
+    #
+    # Granularity:
+    #   * ``None``                — full wipe (root refresh / Ctrl-R).
+    #   * ``('session', sess)``   — bust just that session's _TreeData.
+    #   * ``('prompt'|'tool'|'span', sess, key)`` — bust the containing
+    #     session's _TreeData; one umbrella's children are derived from
+    #     indexes in the same TreeData so anything narrower is moot.
+    #   * ``('agent', sess, aid)`` — bust the subagent's tree too.
+    #   * ``('project', dir)``    — nothing to bust (no _TreeData).
+    if reload and item_id is not None:
+        _bust_caches_for(item_id)
+    if item_id is None:
+        # ``get_children(None)`` fires on initial load AND on
+        # ``ctx.refresh()`` / Ctrl-R. The framework distinguishes the
+        # two via ``reload=True`` — only an explicit refresh wipes
+        # ``_TREE_CACHE`` / ``_TAIL_STATE``. Initial-load callers leave
+        # ``reload`` at the default — typical startup sequence already
+        # ran ``_scan_tree`` for the user's scope before the root
+        # listing fires, and we don't want to throw that work away.
+        if reload:
+            _TREE_CACHE.clear()
+            _TAIL_STATE.clear()
+            store_reset()
+            # Drop the shared markdown parse cache too, so a root Ctrl-R
+            # re-reads any referenced ``.md`` files edited on disk. (A
+            # per-file ``_bust_caches_for`` can't reach these — they live
+            # outside the session tree — so the full wipe is the right
+            # granularity.) No-op when md_doc isn't importable.
+            if _md_doc is not None:
+                _md_doc.clear_cache()
+        return store_list_projects()
+    if not isinstance(item_id, tuple) or not item_id:
+        return []
+    tag = item_id[0]
+    if tag == 'agent':
+        # ``('agent', sess, aid)``. Tree mode views the subagent transcript
+        # as its own tree, recursing into _list_tree_roots. Flat mode lists
+        # its records.
+        if _TREE_MODE:
+            child = store_child_session(item_id[1], item_id[2])
+            return _list_tree_roots(child) if child else []
+        return _list_subagent_messages(item_id)
+    if tag == 'prompt':
+        # ``('prompt', sess, turn_root_line)`` — turn umbrella.
+        if _TREE_MODE:
+            return _list_prompt_children(item_id[1], item_id[2])
+        return []
+    if tag == 'tool':
+        # ``('tool', sess, assistant_line)`` — tool-execution umbrella.
+        if _TREE_MODE:
+            return _list_tool_children(item_id[1], item_id[2])
+        return []
+    if tag == 'span':
+        # ``('span', sess, start)`` — synthetic <system> umbrella in tree
+        # mode. Children are the records of that span.
+        if _TREE_MODE:
+            return _list_span_records(item_id[1], item_id[2])
+        return []
+    if tag == 'refs':
+        # ``('refs', anchor, chain)`` — a ``[links]`` References umbrella.
+        # THIS is the lazy point: the full ref resolve happens here, on
+        # umbrella expand. No-op when ``_md_doc is None`` (no ref id can
+        # exist then).
+        return _md_refs_umbrella_children(item_id) if _md_doc is not None else []
+    if tag == 'md':
+        # ``('md', anchor, chain, line)`` — a node inside a message's markdown
+        # document subtree (inline doc, file doc, or heading). Built lazily
+        # and authoritatively here; mode-agnostic (works in tree AND flat).
+        return _md_subtree_children(item_id) if _md_doc is not None else []
+    if tag == 'msg':
+        # ``('msg', sess, n)`` — a message leaf. When ``md_doc`` is present,
+        # a message gains markdown children (its inline document + referenced
+        # ``.md`` files) — built lazily here, mode-agnostic. Otherwise it is a
+        # leaf in tree mode (umbrellas own all the expansion) and flat mode
+        # never had children for these.
+        if _md_doc is not None:
+            return _md_message_children(item_id)
+        return []
+    if tag == 'session':
+        sess = item_id[1]
+        if not store_session_exists(sess):
+            return []
+        if _TREE_MODE:
+            # Tree mode: subagents surface in a top block above the
+            # turn/span umbrellas — all handled by the roots listing.
+            return _list_tree_roots(sess)
+        return _list_session_children(sess)
+    if tag == 'project':
+        return store_list_sessions(item_id[1])
+    # Anything else (unknown / synthetic — 'sep', 'trunc', 'err') — empty.
+    return []

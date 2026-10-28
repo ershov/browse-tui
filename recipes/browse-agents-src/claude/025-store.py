@@ -464,126 +464,7 @@ def _session_name(path):
     return _session_name_lookup(path)[1]
 
 
-# ---- get_children: dispatches by id tag ----------------------------------
-#
-# The Browser passes the raw item id back into ``get_children``. Every id is a
-# tagged tuple whose first element is a short string tag (or ``None`` for the
-# root), so routing is a flat ``id[0]`` dispatch with direct field access
-# (``id[1]`` = the .jsonl path, ``id[2]`` = a line / agent id). No substring
-# scans, no ordering hazards — the tags are unambiguous.
-
-
-def get_children(item_id, *, reload=False):
-    # ``reload=True`` is the framework's explicit "this is a refresh,
-    # not an initial fetch" signal — see ``_do_refresh`` in 040-state.py
-    # and ticket #407. Honour it at every id shape so the framework can
-    # refresh a single subtree (one session file's tree, one subagent's
-    # tree, or the entire root) without disturbing the rest.
-    #
-    # Granularity:
-    #   * ``None``                — full wipe (root refresh / Ctrl-R).
-    #   * ``('session', jsonl)``  — bust just that file's _TreeData.
-    #   * ``('prompt'|'tool'|'span', jsonl, line)`` — bust the containing
-    #     file's _TreeData; one umbrella's children are derived from
-    #     indexes in the same file's TreeData so anything narrower is moot.
-    #   * ``('agent', jsonl, aid)`` — bust the subagent's file too.
-    #   * ``('project', dir)``    — nothing to bust (no _TreeData).
-    if reload and item_id is not None:
-        _bust_caches_for(item_id)
-    if item_id is None:
-        # ``get_children(None)`` fires on initial load AND on
-        # ``ctx.refresh()`` / Ctrl-R. The framework distinguishes the
-        # two via ``reload=True`` — only an explicit refresh wipes
-        # ``_TREE_CACHE`` / ``_TAIL_STATE``. Initial-load callers leave
-        # ``reload`` at the default — typical startup sequence already
-        # ran ``_scan_tree`` for the user's scope before the root
-        # listing fires, and we don't want to throw that work away.
-        if reload:
-            _TREE_CACHE.clear()
-            _TAIL_STATE.clear()
-            # Re-peek worker transcripts + rosters on an explicit
-            # refresh — a worker whose head landed after its file
-            # was scanned, or a roster flip, is picked up here.
-            _WORKER_META_CACHE.clear()
-            _DIR_WORKERS_CACHE.clear()
-            _scan_teams()
-            # Drop the shared markdown parse cache too, so a root Ctrl-R
-            # re-reads any referenced ``.md`` files edited on disk. (A
-            # per-file ``_bust_caches_for`` can't reach these — they live
-            # outside the session tree — so the full wipe is the right
-            # granularity.) No-op when md_doc isn't importable.
-            if _md_doc is not None:
-                _md_doc.clear_cache()
-        return _list_projects()
-    if not isinstance(item_id, tuple) or not item_id:
-        return []
-    tag = item_id[0]
-    if tag == 'agent':
-        # ``('agent', jsonl, aid)``. Tree mode views the subagent .jsonl as
-        # its own tree, recursing into _list_tree_roots. Flat mode lists its
-        # lines newest-first.
-        session_path, agent_id = item_id[1], item_id[2]
-        if _TREE_MODE:
-            if not agent_id:
-                return []
-            agent_path = _resolve_agent_jsonl(session_path, agent_id)
-            if not os.path.isfile(agent_path):
-                return []
-            return _list_tree_roots(agent_path)
-        return _list_subagent_messages(item_id)
-    if tag == 'prompt':
-        # ``('prompt', jsonl, turn_root_line)`` — turn umbrella.
-        if _TREE_MODE:
-            return _list_prompt_children(item_id[1], item_id[2])
-        return []
-    if tag == 'tool':
-        # ``('tool', jsonl, assistant_line)`` — tool-execution umbrella.
-        if _TREE_MODE:
-            return _list_tool_children(item_id[1], item_id[2])
-        return []
-    if tag == 'span':
-        # ``('span', jsonl, start)`` — synthetic <system> umbrella in tree
-        # mode. Children are the records of that span.
-        if _TREE_MODE:
-            return _list_span_records(item_id[1], item_id[2])
-        return []
-    if tag == 'refs':
-        # ``('refs', anchor, chain)`` — a ``[links]`` References umbrella.
-        # THIS is the lazy point: the full ref resolve happens here, on
-        # umbrella expand. No-op when ``_md_doc is None`` (no ref id can
-        # exist then).
-        return _md_refs_umbrella_children(item_id) if _md_doc is not None else []
-    if tag == 'md':
-        # ``('md', anchor, chain, line)`` — a node inside a message's markdown
-        # document subtree (inline doc, file doc, or heading). Built lazily
-        # and authoritatively here; mode-agnostic (works in tree AND flat).
-        return _md_subtree_children(item_id) if _md_doc is not None else []
-    if tag == 'msg':
-        # ``('msg', jsonl, n)`` — a message leaf. When ``md_doc`` is present,
-        # a message gains markdown children (its inline document + referenced
-        # ``.md`` files) — built lazily here, mode-agnostic. Otherwise it is a
-        # leaf in tree mode (umbrellas own all the expansion) and flat mode
-        # never had children for these.
-        if _md_doc is not None:
-            return _md_message_children(item_id)
-        return []
-    if tag == 'session':
-        jsonl_path = item_id[1]
-        if not os.path.isfile(jsonl_path):
-            return []
-        if _TREE_MODE:
-            # Tree mode: subagents surface in a top block above the
-            # turn/span umbrellas — all handled by the roots listing.
-            return _list_tree_roots(jsonl_path)
-        return _list_session_children(jsonl_path)
-    if tag == 'project':
-        project_dir = item_id[1]
-        return _list_sessions(project_dir) if os.path.isdir(project_dir) else []
-    # Anything else (unknown / synthetic — 'sep', 'trunc', 'err') — empty.
-    return []
-
-
-def _list_projects():
+def store_list_projects():
     if not os.path.isdir(CLAUDE_ROOT):
         return []
     out = []
@@ -641,11 +522,11 @@ def _list_projects():
     return out
 
 
-def _session_item(full, st=None):
+def store_session_item(full, st=None):
     """Build the rich session-row Item for the ``.jsonl`` at ``full``.
 
     Single source of truth for the session-row shape, shared by
-    :func:`_list_sessions` (project listing) and the direct-launch
+    :func:`store_list_sessions` (project listing) and the direct-launch
     scope-root seed (:func:`_seed_scope_root_item`, #730). ``st`` is an
     optional pre-fetched ``os.stat`` result; when omitted it's stat'd
     here. Returns ``None`` if the file can't be stat'd or ``--running``
@@ -728,7 +609,7 @@ def _session_item(full, st=None):
     return item
 
 
-def _list_sessions(project_dir):
+def store_list_sessions(project_dir):
     out = []
     try:
         names = os.listdir(project_dir)
@@ -738,7 +619,7 @@ def _list_sessions(project_dir):
         if not name.endswith('.jsonl'):
             continue
         full = os.path.join(project_dir, name)
-        item = _session_item(full)
+        item = store_session_item(full)
         if item is not None:
             out.append(item)
     # Fold team workers under their lead session: a linked worker
@@ -1083,7 +964,7 @@ def _find_inprocess_teammate(session_jsonl_path, name, team):
     return best[1], best[2]
 
 
-def _list_subagents_for_session(session_jsonl_path):
+def store_child_sessions(session_jsonl_path):
     """Enumerate subagent group items for one session.
 
     Each subagent gets one row whose id encodes both the parent session
@@ -1219,7 +1100,7 @@ _NAME_FILL_PENDING = {}
 def _fill_session_names(paths):
     """Tail-scan each pending session and patch its row tag.
 
-    The tag is rebuilt from a fresh ``_session_item`` (the tail-scan
+    The tag is rebuilt from a fresh ``store_session_item`` (the tail-scan
     primes the name cache first), not from text captured at listing
     time — so a row whose counts/liveness moved while the scan ran
     isn't clobbered with stale text. Ops go out in small batches;
@@ -1230,7 +1111,7 @@ def _fill_session_names(paths):
     for path in paths:
         if not _session_name_from_file(path):
             continue
-        item = _session_item(path)
+        item = store_session_item(path)
         if item is None:
             continue
         ops.append(mod(('session', path), tag=item.tag))
@@ -1276,102 +1157,312 @@ def _spawn_session_name_filler(project_dir, paths):
                      daemon=True).start()
 
 
-def _list_session_children(jsonl_path):
-    """Return subagent groups + top-level messages for a session.
+# ---- store contract -------------------------------------------------------
+#
+# The plain functions the common view code calls (DESIGN.md "Store
+# contract"). Keys: ``project_key`` = project dir path, ``session_key`` =
+# transcript path, ``record_key`` = 0-based line ordinal, ``child_key`` =
+# agent id (or team-worker name).
 
-    Subagents come first (most users want to see what was dispatched
-    before scrolling through hundreds of main-thread messages).
-    Sessions without any subagents render exactly as before.
+# ``<sid>`` → session .jsonl path, for the cross-project-dir lookup below.
+# Session ids are UUID-unique, so a hit is stable for the life of the
+# process; misses aren't cached (a session whose file lands later should
+# still be found on a subsequent lookup).
+_SESSION_PATH_BY_SID = {}
+
+
+def _session_path_for_sid(sid):
+    """Find ``<CLAUDE_ROOT>/*/<sid>.jsonl`` — the real session for ``sid``.
+
+    A worktree-relocated subagent's ``<sid>`` dir sits under the
+    cwd-derived project dir, NOT next to the session ``.jsonl`` (which
+    stays under the project dir it was created in). Since session ids
+    are UUID-unique, the first ``<sid>.jsonl`` found anywhere under
+    ``CLAUDE_ROOT`` is the right one. Returns the path or ``None``.
     """
-    subs = _list_subagents_for_session(jsonl_path)
-    msgs = _list_messages(jsonl_path)
-    return subs + msgs
+    cached = _SESSION_PATH_BY_SID.get(sid)
+    if cached is not None and os.path.isfile(cached):
+        return cached
+    name = f'{sid}.jsonl'
+    try:
+        projects = os.listdir(CLAUDE_ROOT)
+    except OSError:
+        return None
+    for project in projects:
+        candidate = os.path.join(CLAUDE_ROOT, project, name)
+        if os.path.isfile(candidate):
+            _SESSION_PATH_BY_SID[sid] = candidate
+            return candidate
+    return None
 
 
-def _list_subagent_messages(item_id):
-    """Children for a subagent group ``('agent', jsonl, aid)``: its .jsonl lines."""
-    session_path, agent_id = item_id[1], item_id[2]
-    if not agent_id:
-        return []
-    agent_path = _resolve_agent_jsonl(session_path, agent_id)
-    if not os.path.isfile(agent_path):
-        return []
-    return _list_messages(agent_path)
+def store_name():
+    return 'claude'
 
 
-def _list_messages(jsonl_path, limit=None):
-    """List messages in **chronological** order (oldest first).
+def store_init():
+    """Startup indexes: live pids (``--pid`` / ``--running``) and team rosters."""
+    _scan_running_sessions()
+    _scan_teams()
 
-    Matches tree-mode ordering so the cursor-jump-to-latest-voice and
-    the t-toggle don't visually flip the conversation on the user.
 
-    Reads from the cached ``_TREE_CACHE[jsonl_path].records`` so we
-    don't re-walk the whole file on every navigation. ``_scan_tree``
-    populates the cache the first time we visit the path (and
-    bootstraps ``_TAIL_STATE`` so the live-tail worker can resume
-    from where the scan stopped). Empty/invalid lines (``None`` in
-    ``records``) are skipped without surfacing a fake row — the
-    ``V`` action can still extract their raw bytes via
-    ``line_offsets`` if the user wants to inspect them.
+def store_reset():
+    """Drop discovery caches on an explicit root refresh (Ctrl-R)."""
+    _WORKER_META_CACHE.clear()
+    _DIR_WORKERS_CACHE.clear()
+    _FILE_INDEX.clear()
+    _scan_teams()
 
-    ``limit`` truncates from the **start** of the file (so the user
-    keeps the most recent messages — they're scrolling toward the
-    tail anyway). ``limit=0`` (the default after #475) disables
-    truncation entirely.
+
+def store_pop_args():
+    """Pop ``--session`` / ``--pid`` / ``--file`` / ``--running``.
+
+    Returns ``{'target': session_key_or_None, 'error': message_or_None}``;
+    the caller prints ``error`` under the program prefix and exits 2.
     """
-    if limit is None:
-        limit = _message_limit
-    if not os.path.isfile(jsonl_path):
-        return [Item(
-            id=('err', jsonl_path),
-            title=f'[error] no such file: {jsonl_path}',
-            tag='err',
-            tag_style='red',
-        )]
-    td = _scan_tree(jsonl_path)
-    total = len(td.records)
-    truncated = bool(limit) and total > limit
-    start = total - limit if truncated else 0
+    global _RUNNING_ONLY
+    session_id = _pop_value('--session')
+    pid_arg = _pop_value('--pid', int)
+    file_arg = _pop_value('--file')
+    _RUNNING_ONLY = _pop_flag('--running')
+    if sum(1 for v in (session_id, pid_arg, file_arg) if v) > 1:
+        return {'target': None,
+                'error': '--session, --pid, and --file are mutually exclusive'}
+    if file_arg is False or session_id is False or pid_arg is False:
+        return {'target': None, 'error': 'invalid argument value'}
+    target = None
+    if file_arg:
+        target = os.path.abspath(file_arg)
+        if not os.path.isfile(target):
+            return {'target': None, 'error': f'no such file: {file_arg}'}
+    elif session_id:
+        target = _find_session_by_id(session_id)
+        if not target:
+            return {'target': None,
+                    'error': f'no session with id {session_id!r}'}
+    elif pid_arg:
+        target = _find_session_by_pid(pid_arg)
+        if not target:
+            return {'target': None,
+                    'error': f'no live session for pid {pid_arg}'}
+    return {'target': target, 'error': None}
 
-    out = []
-    if truncated:
-        older = start
-        out.append(Item(
-            id=('trunc', jsonl_path),
-            title=f'({older} older entries hidden; press e to view file)',
-            tag='…',
-            tag_style='dim',
-        ))
-    for n in range(start, total):
-        obj = td.records[n]
-        if obj is None:
-            continue
-        kind = _kind_of(obj)
-        item_id = ('msg', jsonl_path, n)
-        item = Item(
-            id=item_id,
-            title=_link_marker(item_id) + _oneline(_summarise_message(obj)),
-            tag=_row_tag(kind, obj),
-            tag_style=_TAG_STYLE_FOR_KIND.get(kind, ''),
-            # Optimistic markdown-subtree detection — see ``_tree_item``. The
-            # feature is mode-agnostic, so flat-mode rows gain the same arrow;
-            # ``get_children`` returns the document nodes regardless of mode.
-            has_children=_md_has_children(obj),
-            hidden=not _passes_filter(item_id, td),
+
+def store_resolve_positional(arg):
+    """The positional argument as a scope id: a transcript or a project dir."""
+    arg_abs = os.path.abspath(arg)
+    if arg.endswith('.jsonl') and os.path.isfile(arg_abs):
+        return ('session', arg_abs)
+    return ('project', arg_abs)
+
+
+def store_session_exists(session_key):
+    return isinstance(session_key, str) and os.path.isfile(session_key)
+
+
+def store_project_path(project_key):
+    """Filesystem path of a project (for the external source actions)."""
+    return project_key
+
+
+def store_project_of_session(session_key):
+    return os.path.dirname(session_key) or '/'
+
+
+def store_source_path(session_key):
+    """Filesystem path holding the whole transcript."""
+    return session_key
+
+
+def store_source_locator(session_key, record_key):
+    """``(path, 1-based line)`` of one record in its source file."""
+    return session_key, record_key + 1
+
+
+def store_child_session(session_key, child_key):
+    """Session key of a subagent / worker transcript, or ``None``."""
+    if not child_key:
+        return None
+    p = _resolve_agent_jsonl(session_key, child_key)
+    return p if os.path.isfile(p) else None
+
+
+def store_child_source_path(session_key, child_key):
+    """Filesystem path a child transcript would live at, existing or not.
+
+    The external source actions open it as a whole file and report a
+    missing one by this path.
+    """
+    return _resolve_agent_jsonl(session_key, child_key)
+
+
+def store_parent_of_child(session_key):
+    """``(parent_session_key, child_key)`` when ``session_key`` is a
+    subagent transcript, else ``None``.
+
+    Subagent transcripts live at
+    ``<project_dir>/<parent_session_id>/subagents/agent-<aid>.jsonl``. For a
+    worktree-relocated subagent the parent ``.jsonl`` is NOT the co-located
+    sibling of the ``<sid>`` dir, so the fallback searches
+    ``<CLAUDE_ROOT>/*/<sid>.jsonl``.
+    """
+    if not isinstance(session_key, str):
+        return None
+    parent_dir = os.path.dirname(session_key)
+    if os.path.basename(parent_dir) != 'subagents':
+        return None
+    name = os.path.basename(session_key)
+    if not name.startswith('agent-') or not name.endswith('.jsonl'):
+        return None
+    aid = name[len('agent-'):-len('.jsonl')]
+    sess_dir = os.path.dirname(parent_dir)
+    sess_path = sess_dir + '.jsonl'
+    if not os.path.isfile(sess_path):
+        sess_path = _session_path_for_sid(os.path.basename(sess_dir))
+        if sess_path is None:
+            return None
+    return sess_path, aid
+
+
+def store_resolve_spawned_child(session_key, tur, tool_input):
+    """Join an Agent/Task spawn result to its transcript.
+
+    ``tur`` is the user record's ``toolUseResult``, ``tool_input`` the
+    spawning ``tool_use`` part's input. Returns ``(child_key,
+    child_session_key)`` or ``None`` when nothing on disk matches.
+    """
+    if not isinstance(tur, dict):
+        return None
+    agent_id = tur.get('agentId')
+    if agent_id:
+        p = _resolve_agent_jsonl(session_key, agent_id)
+        return (agent_id, p) if os.path.isfile(p) else None
+    if tur.get('status') != 'teammate_spawned':
+        return None
+    # Team worker: the spawn result carries no agentId. New backend
+    # first: the worker runs in-process and its transcript lands in this
+    # session's own subagents dir — join via the spawn name + team; the
+    # key is the filename-derived one, the same key the child listing
+    # and ``_resolve_agent_jsonl`` use. Legacy fallback: the worker runs
+    # as its own sibling session, joined via the Agent call's ``name``
+    # and the team roster / head stamps. Only new-backend spawn results
+    # carry ``name`` — gate the in-process lookup on it so an old-shape
+    # spawn can never claim a same-named in-process transcript from a
+    # different (unrecorded) team.
+    name = tur.get('name') or (tool_input or {}).get('name')
+    if not name:
+        return None
+    hit = (_find_inprocess_teammate(session_key, name, tur.get('team_name'))
+           if tur.get('name') else None)
+    if hit:
+        return hit
+    p = _find_worker_jsonl(session_key, name)
+    return (name, p) if p else None
+
+
+def store_session_info(session_key):
+    """Cheap facts about one session for the scope / metadata cards.
+
+    Reads the first parsable record (for the Claude stamps) and one
+    ``os.stat``; never scans the transcript. ``meta`` is an ordered list
+    of ``(key, value)`` display rows: the agentId / agentType /
+    description of a subagent (from the sibling ``.meta.json``) followed
+    by the sessionId / entrypoint / cwd / gitBranch / slug stamps.
+    """
+    rec = {}
+    try:
+        with open(session_key, 'r', encoding='utf-8', errors='replace') as f:
+            for line in f:
+                if not line.strip():
+                    continue
+                try:
+                    parsed = json.loads(line)
+                except (TypeError, ValueError):
+                    continue
+                if isinstance(parsed, dict):
+                    rec = parsed
+                    break
+    except OSError:
+        pass
+    is_sub = False
+    label = os.path.basename(session_key)
+    meta = []
+    parent = os.path.dirname(session_key)
+    fname = os.path.basename(session_key)
+    if (os.path.basename(parent) == 'subagents'
+            and fname.startswith('agent-') and fname.endswith('.jsonl')):
+        agent_id = fname[len('agent-'):-len('.jsonl')]
+        label = agent_id
+        meta_path = os.path.join(parent, f'agent-{agent_id}.meta.json')
+        if os.path.isfile(meta_path):
+            is_sub = True
+            m = _read_subagent_meta(meta_path)
+            meta.append(('agentId', agent_id))
+            if m.get('agentType'):
+                meta.append(('agentType', m['agentType']))
+            if m.get('description'):
+                meta.append(('description', m['description']))
+    for key in ('sessionId', 'entrypoint', 'cwd', 'gitBranch', 'slug'):
+        v = rec.get(key)
+        if v:
+            meta.append((key, v))
+    try:
+        mtime = os.stat(session_key).st_mtime
+    except OSError:
+        mtime = None
+    return {'path': session_key, 'label': label, 'is_child': is_sub,
+            'meta': meta, 'mtime': mtime}
+
+
+def store_session_cwd_and_root(session_key):
+    return _session_cwd_and_root(session_key)
+
+
+def store_context_dirs(project_key, session_key=None):
+    """``[(role, abspath), …]`` directory anchors for a project or session.
+
+    * ``project``   — the project's real source directory
+      (``_real_project_cwd``; the lossy name-decode as a fallback).
+    * ``cwd``       — the session's PRIMARY recorded working directory
+      (the one that round-trips to the project dir name).
+    * ``workspace`` — each ADDITIONAL distinct working directory the
+      session recorded (e.g. a git worktree it entered).
+
+    A session's cwds come from its own transcript (``_session_cwds``); a
+    bare project falls back to its representative cwd. Falsy paths are
+    dropped; the caller dedups and adds the git work-tree roots.
+    """
+    project = _real_project_cwd(project_key) or os.path.expanduser(
+        _decode_project_path(os.path.basename(project_key.rstrip('/'))))
+    if session_key is not None:
+        cwds = _session_cwds(session_key)
+    else:
+        cwds = [project] if project else []
+    base = os.path.basename(project_key.rstrip('/'))
+    primary = next((c for c in cwds if _encode_project_path(c) == base),
+                   cwds[0] if cwds else None)
+    out = [('project', project)]
+    for cwd in cwds:
+        out.append(('cwd' if cwd == primary else 'workspace', cwd))
+    return [(role, path) for role, path in out if path]
+
+
+def store_project_preview(project_key):
+    """Preview text for a project row: real path plus its session files."""
+    if not os.path.isdir(project_key):
+        return ''
+    try:
+        names = sorted(
+            n for n in os.listdir(project_key) if n.endswith('.jsonl')
         )
-        item.kind = 'message'
-        item.line_no = n
-        item.session_path = jsonl_path
-        item.message_kind = kind
-        # Stripe rows that carry actual *speech* — the user typing, or
-        # the assistant's text reply. Tool calls (assistant tool_use)
-        # and tool results (user tool_result) are machinery, not voice,
-        # so they keep the default no-bg look even though their record
-        # type is user/assistant.
-        if _is_voice(obj):
-            bg = _ROW_BG_FOR_KIND.get(kind)
-            if bg is not None:
-                item.row_bg = bg
-        out.append(item)
-
-    return out
+    except OSError as e:
+        return f'[error] {e}'
+    header = (
+        f'project: {_real_project_path(project_key)}\n'
+        f'path:    {project_key}\n'
+        f'\n{len(names)} session(s):'
+    )
+    body = '\n'.join(f'  {n}' for n in names[:1000])
+    if len(names) > 50:
+        body += f'\n  … and {len(names) - 50} more'
+    return f'{header}\n{body}' if body else header

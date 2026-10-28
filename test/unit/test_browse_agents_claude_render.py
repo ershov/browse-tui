@@ -1080,7 +1080,7 @@ class TestPreviewMessageDispatcher(unittest.TestCase):
             os.unlink(path)
 
     def test_invalid_json_line_returns_empty_preview(self):
-        # Invalid lines yield ``None`` from ``_read_jsonl_line`` and
+        # Invalid lines yield ``None`` from ``_record_at`` and
         # an empty preview. The previous ``[invalid json] <raw>``
         # stub was dropped because re-parsing a line that failed once
         # never succeeds — surfacing the raw bytes belongs to the
@@ -1282,13 +1282,13 @@ class TestRunningSessions(unittest.TestCase):
             saved_only = self.r._RUNNING_ONLY
             try:
                 self.r._RUNNING_ONLY = True
-                rows = self.r._list_sessions(os.path.join(tmp, 'live-proj'))
+                rows = self.r.store_list_sessions(os.path.join(tmp, 'live-proj'))
                 self.assertEqual(len(rows), 1)
                 self.assertEqual(rows[0].title, 'live-sid')
                 self.assertIn('pid', rows[0].tag)
                 # Without --running, both surface.
                 self.r._RUNNING_ONLY = False
-                rows = self.r._list_sessions(os.path.join(tmp, 'live-proj'))
+                rows = self.r.store_list_sessions(os.path.join(tmp, 'live-proj'))
                 self.assertEqual(len(rows), 2)
             finally:
                 self.r._RUNNING_ONLY = saved_only
@@ -3601,7 +3601,7 @@ class TestLiveTail(unittest.TestCase):
         self.r._TAIL_STATE.clear()
 
     def test_line_offsets_sentinel_pattern(self):
-        # ``td.line_offsets`` has N+1 entries (sentinel past the end)
+        # ``tail.line_offsets`` has N+1 entries (sentinel past the end)
         # so length(line k) = line_offsets[k+1] - line_offsets[k] for
         # all k in [0, N).
         import json as _json
@@ -3618,17 +3618,18 @@ class TestLiveTail(unittest.TestCase):
         path = self._write_jsonl(recs)
         try:
             td = self.r._scan_tree(path)
+            tail = self.r._TAIL_STATE[path]
             self.assertEqual(len(td.records), 3)
-            self.assertEqual(len(td.line_offsets), 4)
-            self.assertEqual(td.line_offsets[0], 0)
+            self.assertEqual(len(tail.line_offsets), 4)
+            self.assertEqual(tail.line_offsets[0], 0)
             # Each entry strictly increases (every line has content).
-            for i in range(len(td.line_offsets) - 1):
-                self.assertLess(td.line_offsets[i], td.line_offsets[i + 1])
+            for i in range(len(tail.line_offsets) - 1):
+                self.assertLess(tail.line_offsets[i], tail.line_offsets[i + 1])
             # The recorded line bytes round-trip back to the source.
             with open(path, 'rb') as f:
                 for k, want in enumerate(recs):
-                    f.seek(td.line_offsets[k])
-                    chunk = f.read(td.line_offsets[k + 1] - td.line_offsets[k])
+                    f.seek(tail.line_offsets[k])
+                    chunk = f.read(tail.line_offsets[k + 1] - tail.line_offsets[k])
                     self.assertEqual(_json.loads(chunk), want)
         finally:
             os.unlink(path)
@@ -3643,8 +3644,9 @@ class TestLiveTail(unittest.TestCase):
         ])
         try:
             td = self.r._scan_tree(path)
+            tail = self.r._TAIL_STATE[path]
             self.assertEqual(len(td.records), 1)
-            self.assertEqual(len(td.line_offsets), 2)
+            self.assertEqual(len(tail.line_offsets), 2)
             self._append(path, [
                 {'type': 'assistant', 'uuid': 'a1',
                  'message': {'role': 'assistant', 'content': [
@@ -3655,14 +3657,14 @@ class TestLiveTail(unittest.TestCase):
             ])
             self.r._read_new_records(path)
             self.assertEqual(len(td.records), 3)
-            self.assertEqual(len(td.line_offsets), 4)
+            self.assertEqual(len(tail.line_offsets), 4)
             # Sentinel matches the file size.
-            self.assertEqual(td.line_offsets[-1], os.path.getsize(path))
+            self.assertEqual(tail.line_offsets[-1], os.path.getsize(path))
         finally:
             os.unlink(path)
 
     def test_read_jsonl_line_serves_from_cache(self):
-        # After ``_scan_tree`` runs, ``_read_jsonl_line`` reads the
+        # After ``_scan_tree`` runs, ``_record_at`` reads the
         # cached parsed dict — no file I/O.
         path = self._write_jsonl([
             {'type': 'user', 'uuid': 'u1',
@@ -3673,10 +3675,10 @@ class TestLiveTail(unittest.TestCase):
             # Tamper with the cached record; if the function used
             # the cache, it must return the tampered value.
             self.r._TREE_CACHE[path].records[0] = {'__probe__': 'YES'}
-            self.assertEqual(self.r._read_jsonl_line(path, 0),
+            self.assertEqual(self.r._record_at(path, 0),
                              {'__probe__': 'YES'})
             # Out-of-range / invalid index → None.
-            self.assertIsNone(self.r._read_jsonl_line(path, 5))
+            self.assertIsNone(self.r._record_at(path, 5))
         finally:
             os.unlink(path)
 
@@ -3691,7 +3693,7 @@ class TestLiveTail(unittest.TestCase):
             f.write('not json\n')
         try:
             self.r._scan_tree(path)
-            self.assertIsNone(self.r._read_jsonl_line(path, 0))
+            self.assertIsNone(self.r._record_at(path, 0))
         finally:
             os.unlink(path)
 
@@ -4110,19 +4112,19 @@ class TestLiveTail(unittest.TestCase):
         # Session id: resolves to its .jsonl when it exists.
         path = self._write_jsonl([{'type': 'user'}])
         try:
-            self.assertEqual(self.r._cursor_tail_path(('session', path)), path)
+            self.assertEqual(self.r._cursor_tail_session(('session', path)), path)
             # Message id ``('msg', jsonl, n)``.
-            self.assertEqual(self.r._cursor_tail_path(('msg', path, 0)), path)
+            self.assertEqual(self.r._cursor_tail_session(('msg', path, 0)), path)
             # Umbrella ids resolve to the path.
-            self.assertEqual(self.r._cursor_tail_path(('prompt', path, 0)),
+            self.assertEqual(self.r._cursor_tail_session(('prompt', path, 0)),
                              path)
-            self.assertEqual(self.r._cursor_tail_path(('tool', path, 1)),
+            self.assertEqual(self.r._cursor_tail_session(('tool', path, 1)),
                              path)
-            self.assertEqual(self.r._cursor_tail_path(('span', path, 2)),
+            self.assertEqual(self.r._cursor_tail_session(('span', path, 2)),
                              path)
             # Non-jsonl path: None.
-            self.assertIsNone(self.r._cursor_tail_path(('session', '/etc/passwd')))
-            self.assertIsNone(self.r._cursor_tail_path(None))
+            self.assertIsNone(self.r._cursor_tail_session(('session', '/etc/passwd')))
+            self.assertIsNone(self.r._cursor_tail_session(None))
         finally:
             os.unlink(path)
 
@@ -4144,9 +4146,9 @@ class TestLiveTail(unittest.TestCase):
             saved = self.r._TREE_MODE
             try:
                 self.r._TREE_MODE = True
-                self.assertEqual(self.r._cursor_tail_path(row_id), sess)
+                self.assertEqual(self.r._cursor_tail_session(row_id), sess)
                 self.r._TREE_MODE = False
-                self.assertEqual(self.r._cursor_tail_path(row_id), agent)
+                self.assertEqual(self.r._cursor_tail_session(row_id), agent)
             finally:
                 self.r._TREE_MODE = saved
         finally:
@@ -4163,7 +4165,7 @@ class TestSeedScopeRootItem(unittest.TestCase):
     listing with this single session would make the framework treat it as
     'already cached', so a later scope-up (``_scope_up`` →
     ``_ensure_children_fetched``) would skip the real
-    ``_list_sessions(parent)`` fetch and show only this one session instead
+    ``store_list_sessions(parent)`` fetch and show only this one session instead
     of all of the project's.
     """
 
@@ -4203,13 +4205,13 @@ class TestSeedScopeRootItem(unittest.TestCase):
             self.assertIn(sess_id, b._state._items_by_id)
             self.assertEqual(b._state._items_by_id[sess_id].kind, 'session')
             # Parent project listing left untouched — scope-up still
-            # triggers the real _list_sessions fetch (no pre-cached entry).
+            # triggers the real store_list_sessions fetch (no pre-cached entry).
             self.assertEqual(b._state._children, {})
         finally:
             os.unlink(path)
 
     def test_noop_when_item_unbuildable(self):
-        # _session_item returns None for a missing file → no seed at all.
+        # store_session_item returns None for a missing file → no seed at all.
         b = self._fake_browser()
         self.r._seed_scope_root_item(b, '/no/such/file-xyz.jsonl')
         self.assertEqual(b._state._items_by_id, {})
@@ -4286,7 +4288,7 @@ class TestViewEditSource(unittest.TestCase):
         path = self._write_jsonl(recs)
         try:
             self.r._scan_tree(path)
-            tmp = self.r._write_line_excerpts({path: [0, 2]})
+            tmp = self.r.store_source_excerpt({path: [0, 2]})
             self.assertIsNotNone(tmp)
             try:
                 with open(tmp, 'r') as f:
@@ -4302,7 +4304,7 @@ class TestViewEditSource(unittest.TestCase):
         # Without ``_TREE_CACHE`` we can't resolve offsets — bail
         # cleanly.
         path = '/tmp/nonexistent.jsonl'
-        tmp = self.r._write_line_excerpts({path: [0]})
+        tmp = self.r.store_source_excerpt({path: [0]})
         self.assertIsNone(tmp)
 
     def test_gather_umbrella_lines_recurses_same_file(self):
@@ -4534,7 +4536,7 @@ class TestViewEditSource(unittest.TestCase):
         try:
             self.r._scan_tree(path)
             # Line 99 doesn't exist; no entry should be written.
-            tmp = self.r._write_line_excerpts({path: [99]})
+            tmp = self.r.store_source_excerpt({path: [99]})
             self.assertIsNone(tmp)
         finally:
             os.unlink(path)
@@ -4567,7 +4569,7 @@ class TestSubagentRowTag(unittest.TestCase):
             ts = datetime.datetime.now().timestamp() - 3 * 3600  # 3h ago
             os.utime(agent_path, (ts, ts))
 
-            rows = self.r._list_subagents_for_session(sess_path)
+            rows = self.r.store_child_sessions(sess_path)
             self.assertEqual(len(rows), 1)
             row = rows[0]
             # Tag should still carry type and msg count, plus the time.
@@ -4698,7 +4700,7 @@ class TestSubagentUmbrellaVoice(unittest.TestCase):
         import tempfile
         with tempfile.TemporaryDirectory() as tmp:
             sess = self._build(tmp)
-            rows = self.r._list_subagents_for_session(sess)
+            rows = self.r.store_child_sessions(sess)
             self.assertEqual(len(rows), 1)
             self.assertEqual(rows[0].row_bg, 235)  # assistant stripe
 
@@ -5742,8 +5744,8 @@ class TestSessionRowVsScopeRootPreview(unittest.TestCase):
                          'content': [{'type': 'text', 'text': 'reply body'}]}},
         ])
         try:
-            out = self.r._preview_file_metadata(path)
-            self.assertIn('browse-claude', out)
+            out = self.r._preview_session_card(path)
+            self.assertIn('browse-agents-claude', out)
             self.assertIn(path, out)
             self.assertIn('s-uuid', out)
             self.assertIn('main', out)
@@ -5757,14 +5759,14 @@ class TestSessionRowVsScopeRootPreview(unittest.TestCase):
             os.unlink(path)
 
     def test_metadata_preview_no_scan_tree(self):
-        # _preview_file_metadata must NOT populate _TREE_CACHE.
+        # _preview_session_card must NOT populate _TREE_CACHE.
         path = self._write([
             {'type': 'user', 'sessionId': 's',
              'message': {'role': 'user', 'content': 'hi'}},
         ])
         try:
             self.r._TREE_CACHE.clear()
-            self.r._preview_file_metadata(path)
+            self.r._preview_session_card(path)
             self.assertNotIn(path, self.r._TREE_CACHE,
                              '_scan_tree should not have been called')
         finally:
@@ -5826,7 +5828,7 @@ class TestSessionRowVsScopeRootPreview(unittest.TestCase):
             finally:
                 self.r._BROWSER = saved
             # Scope card + cascaded body content.
-            self.assertIn('browse-claude', out)
+            self.assertIn('browse-agents-claude', out)
             self.assertIn('body-line', out)
         finally:
             os.unlink(path)
@@ -5901,7 +5903,7 @@ class TestSubagentRowLightweightPreview(unittest.TestCase):
         import tempfile
         with tempfile.TemporaryDirectory() as tmp:
             sess, agent_path = self._build(tmp)
-            out = self.r._preview_file_metadata(agent_path)
+            out = self.r._preview_session_card(agent_path)
             self.assertIn('subagent', out)
             self.assertIn('A1', out)
             self.assertIn('general-purpose', out)
@@ -6022,7 +6024,7 @@ class TestScopeCard(unittest.TestCase):
             self.r._TREE_CACHE.clear()
             td = self.r._scan_tree(path)
             card = self.r._fmt_scope_card(path, td)
-            self.assertIn('browse-claude', card)
+            self.assertIn('browse-agents-claude', card)
             self.assertIn(path, card)
             self.assertIn('s-uuid', card)
             self.assertIn('cli', card)
@@ -6103,7 +6105,7 @@ class TestScopeCard(unittest.TestCase):
             result = self.r.get_preview(('session', path))
             out = ''.join(result) if not isinstance(result, str) else result
             # Card sits at the head of the preview.
-            self.assertIn('browse-claude', out)
+            self.assertIn('browse-agents-claude', out)
             self.assertIn('s-uuid', out)
         finally:
             os.unlink(path)
@@ -6351,7 +6353,7 @@ class TestTreeSubagentBlock(unittest.TestCase):
             os.utime(os.path.join(sub_dir, 'agent-A1.jsonl'),
                      (2000000, 2000000))   # orphan is the newest file
             self.r._TREE_CACHE.clear()
-            flat = self.r._list_subagents_for_session(sess)
+            flat = self.r.store_child_sessions(sess)
             td = self.r._scan_tree(sess)
             rows = self.r._tree_subagents_for_session(sess, td)
             self.assertEqual([r.agent_id for r in rows],
@@ -7021,7 +7023,7 @@ class TestProjectOrdering(unittest.TestCase):
                 # Now nudge the active .jsonl to be the freshest signal.
                 os.utime(active_jsonl, (3000000.0, 3000000.0))
 
-                projects = self.r._list_projects()
+                projects = self.r.store_list_projects()
                 titles = [p.title for p in projects]
                 self.assertEqual(titles[0], '/home/active',
                                  f'active project should sort first, got {titles}')
@@ -8802,7 +8804,7 @@ class TestUmbrellaGenerator(unittest.TestCase):
     """#459: ``_preview_umbrella`` is a generator yielding chunks.
 
     Verifies:
-      * First yield is the scope card (when ``_scope_card_path`` resolves).
+      * First yield is the scope card (when ``_scope_card_session`` resolves).
       * Yields land in document order, one chunk per leaf.
       * Full drain reproduces the substrings the old non-generator
         implementation produced (sanity for the join-equivalence claim).
@@ -8861,7 +8863,7 @@ class TestUmbrellaGenerator(unittest.TestCase):
             first = next(gen)
             # The scope card prints the recipe banner string;
             # leaf chunks never carry it.
-            self.assertIn('browse-claude', first)
+            self.assertIn('browse-agents-claude', first)
             # Trailing separator on every chunk.
             self.assertTrue(first.endswith('\n\n'))
             # Drain to release file handles / generator state.
@@ -8901,7 +8903,7 @@ class TestUmbrellaGenerator(unittest.TestCase):
                 self.assertIn(f'PROBE_TURN_{i:04d}', full)
             # Scope card sits at the head.
             head, _, _ = full.partition('PROBE_TURN_0000')
-            self.assertIn('browse-claude', head)
+            self.assertIn('browse-agents-claude', head)
         finally:
             os.unlink(path)
 
@@ -10446,7 +10448,7 @@ class TestTeamWorkers(unittest.TestCase):
         p = self._write_worker('bbbb2222-0000-0000-0000-000000000000',
                                'w-worker')
         self.r._RUNNING_INDEX[self.LEAD_SID] = {'pid': 1, 'status': 'busy'}
-        item = self.r._session_item(p)
+        item = self.r.store_session_item(p)
         self.assertIn('w-worker · live ·', item.tag)
         self.assertEqual(item.tag_style, 'green')
         self.assertTrue(item.worker_live)
@@ -10457,14 +10459,14 @@ class TestTeamWorkers(unittest.TestCase):
         lead = self._write_lead()
         self._write_worker('bbbb2222-0000-0000-0000-000000000000',
                            'w-worker')
-        rows = self.r._list_sessions(self.proj)
+        rows = self.r.store_list_sessions(self.proj)
         self.assertEqual([it.id[1] for it in rows], [lead])
 
     def test_orphan_worker_stays_top_level(self):
         # No lead session file in this dir → the worker keeps its row.
         p = self._write_worker('bbbb2222-0000-0000-0000-000000000000',
                                'w-worker')
-        rows = self.r._list_sessions(self.proj)
+        rows = self.r.store_list_sessions(self.proj)
         self.assertEqual([it.id[1] for it in rows], [p])
         self.assertIn('w-worker ·', rows[0].tag)
 
@@ -10472,7 +10474,7 @@ class TestTeamWorkers(unittest.TestCase):
         lead = self._write_lead()
         p = self._write_worker('bbbb2222-0000-0000-0000-000000000000',
                                'w-worker')
-        subs = self.r._list_subagents_for_session(lead)
+        subs = self.r.store_child_sessions(lead)
         self.assertEqual([(it.id, it.subagent_path) for it in subs],
                          [(('agent', lead, 'w-worker'), p)])
         self.assertEqual(subs[0].kind, 'subagent')
@@ -10488,7 +10490,7 @@ class TestTeamWorkers(unittest.TestCase):
         self.r._WORKER_META_CACHE.clear()
         self.r._DIR_WORKERS_CACHE.clear()
         self.assertEqual(self.r._find_worker_jsonl(lead, 'w-worker'), new)
-        rows = self.r._list_sessions(self.proj)
+        rows = self.r.store_list_sessions(self.proj)
         # Lead + the OLD worker transcript stay; the linked (new) one folds.
         self.assertEqual(sorted(it.id[1] for it in rows),
                          sorted([lead, old]))
@@ -10599,7 +10601,7 @@ class TestTeamWorkers(unittest.TestCase):
             {'type': 'ai-title', 'aiTitle': 'Row title'},
         ])
         self.r._scan_tree(p)
-        item = self.r._session_item(p)
+        item = self.r.store_session_item(p)
         self.assertTrue(item.tag.startswith('Row title · '), item.tag)
         self.assertEqual(item.session_name, 'Row title')
 
@@ -10644,9 +10646,9 @@ class TestTeamWorkers(unittest.TestCase):
         self.assertEqual(op[0], 'mod')
         self.assertEqual(op[1], ('session', p))
         # The tag is rebuilt fresh (name cache primed by the scan), so
-        # it matches what _session_item produces right now.
+        # it matches what store_session_item produces right now.
         self.assertTrue(op[3]['tag'].startswith('Async title · '))
-        self.assertEqual(op[3]['tag'], self.r._session_item(p).tag)
+        self.assertEqual(op[3]['tag'], self.r.store_session_item(p).tag)
 
     def test_list_sessions_skips_filler_when_names_known(self):
         p = self._write_named('dddd4444-0000-0000-0000-000000000000', [
@@ -10658,7 +10660,7 @@ class TestTeamWorkers(unittest.TestCase):
         self.r._spawn_session_name_filler = (
             lambda d, e: spawned.append((d, e)))
         try:
-            rows = self.r._list_sessions(self.proj)
+            rows = self.r.store_list_sessions(self.proj)
         finally:
             self.r._spawn_session_name_filler = saved
         self.assertEqual(len(rows), 1)
@@ -10679,7 +10681,7 @@ class TestTeamWorkers(unittest.TestCase):
         self.r._spawn_session_name_filler = (
             lambda d, e: spawned.append((d, e)))
         try:
-            self.r._list_sessions(self.proj)
+            self.r.store_list_sessions(self.proj)
         finally:
             self.r._spawn_session_name_filler = saved
         self.assertEqual(spawned, [])
@@ -11915,11 +11917,11 @@ class TestMarkdownSubtrees(unittest.TestCase):
             self.assertTrue(self.r._is_cross_file_id(file_id))
             out = self.r.get_preview(file_id)
             # Routed to the md document preview (the file's text), NOT the
-            # cross-file metadata card (which prints 'browse-claude' + a
+            # cross-file metadata card (which prints 'browse-agents-claude' + a
             # 'path' row and never the body).
             self.assertIn('Findings', out)
             self.assertIn('MD-FILE-DOC-BODY', out)
-            self.assertNotIn('browse-claude', out)
+            self.assertNotIn('browse-agents-claude', out)
 
     def test_get_preview_inline_md_node_routes_to_md_node(self):
         # The inline (same-file, boundary=False) document node also routes to
@@ -11933,7 +11935,7 @@ class TestMarkdownSubtrees(unittest.TestCase):
             inline_id = _md_id(('msg', sess, 0), [])
             out = self.r.get_preview(inline_id)
             self.assertIn('Summary', out)
-            self.assertNotIn('browse-claude', out)
+            self.assertNotIn('browse-agents-claude', out)
 
     # ---- labels (#661) -------------------------------------------------
 
@@ -12002,7 +12004,7 @@ class TestMarkdownSubtrees(unittest.TestCase):
             # (missing.md) doesn't exist and it has no heading.
             base = ('msg', sess, 2)
             self.assertTrue(self.r._md_has_children(
-                self.r._read_jsonl_line(sess, 2)))     # arrow was set
+                self.r._record_at(sess, 2)))     # arrow was set
             self.assertEqual(self.r.get_children(base), [])  # build is empty
 
             fake = _FakeBrowser()
@@ -12284,7 +12286,7 @@ class TestMarkdownSubtrees(unittest.TestCase):
             sess, proj, report, appendix = self._build_project(tmp)
             base = ('msg', sess, 2)                       # the optimistic positive
             self.assertTrue(self.r._md_has_children(
-                self.r._read_jsonl_line(sess, 2)))   # arrow was set
+                self.r._record_at(sess, 2)))   # arrow was set
             self.assertEqual(self.r.get_children(base), [])  # build is empty
             saved_pending = set(self.r._AWAITING_VOICE_JUMP)
             self.addCleanup(self.r._AWAITING_VOICE_JUMP.clear)
@@ -12420,17 +12422,17 @@ class TestBoundaryMigration(unittest.TestCase):
         import tempfile
         with tempfile.TemporaryDirectory() as tmp:
             sess, agent_path = self._project_with_subagent(tmp)
-            (sub,) = self.r._list_subagents_for_session(sess)
+            (sub,) = self.r.store_child_sessions(sess)
             self.assertTrue(sub.boundary)
             self.assertEqual(sub.id[0], 'agent')
 
     def test_session_rows_are_boundary(self):
-        # Bare .jsonl session rows in _list_sessions carry boundary=True.
+        # Bare .jsonl session rows in store_list_sessions carry boundary=True.
         import tempfile
         with tempfile.TemporaryDirectory() as tmp:
             sess, _ = self._project_with_subagent(tmp)
             proj = os.path.dirname(sess)
-            rows = self.r._list_sessions(proj)
+            rows = self.r.store_list_sessions(proj)
             self.assertTrue(rows)
             for it in rows:
                 self.assertEqual(it.id[0], 'session')

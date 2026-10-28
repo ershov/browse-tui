@@ -63,6 +63,11 @@ BLUE_BG_PARAMS = '48;5;17'
 BLUE_BG = f'\x1b[{BLUE_BG_PARAMS}m'
 
 
+def _prog_name():
+    """The recipe's program name: title, error prefixes, card labels."""
+    return f'browse-agents-{store_name()}'
+
+
 def _init_color():
     """Disable ANSI when ``NO_COLOR`` is set or stdout isn't a tty.
 

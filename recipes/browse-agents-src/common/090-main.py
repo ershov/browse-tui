@@ -61,17 +61,12 @@ _message_limit = _MESSAGE_LIMIT
 
 
 def main():
-    global _message_limit, _RUNNING_ONLY, _TREE_MODE, _DETAIL_LEVEL, _BROWSER
+    global _message_limit, _TREE_MODE, _DETAIL_LEVEL, _BROWSER
     _init_color()
     _message_limit = _pop_limit_arg(_MESSAGE_LIMIT)
 
-    # Discovery flags — order doesn't matter, all extracted before the
-    # positional PROJECT arg is read.
-    session_id = _pop_value('--session')
-    pid_arg    = _pop_value('--pid', int)
-    file_arg   = _pop_value('--file')
-    item_arg   = _pop_value('--item', int)
-    _RUNNING_ONLY = _pop_flag('--running')
+    prog = _prog_name()
+    item_arg = _pop_value('--item', int)
 
     # View-mode flags (--tree wins over --no-tree if both are passed).
     tree_flag    = _pop_flag('--tree')
@@ -87,96 +82,64 @@ def main():
     # value pops as the ``False`` sentinel — report it as a usage error.
     detail_arg = _pop_value('--detail', _parse_detail_level)
     if detail_arg is False:
-        print('browse-claude: --detail must be 1-7 or one of '
+        print(f'{prog}: --detail must be 1-7 or one of '
               'summary/voice/edits/tools/detailed/all/unknown',
               file=sys.stderr)
         sys.exit(2)
     if detail_arg is not None:
         _DETAIL_LEVEL = detail_arg
 
-    # --running needs the running index regardless of which target we open;
-    # tagging sessions with PIDs also depends on it. The teams roster
-    # joins worker transcripts to their lead session + liveness.
-    _scan_running_sessions()
-    _scan_teams()
+    # The store's startup indexes, then its own target flags.
+    # ``target`` is the session to open directly, if any.
+    store_init()
+    args = store_pop_args()
+    if args['error']:
+        print(f'{prog}: {args["error"]}', file=sys.stderr)
+        sys.exit(2)
+    if item_arg is False:
+        print(f'{prog}: invalid argument value', file=sys.stderr)
+        sys.exit(2)
+    target = args['target']
 
     # The recipe's own positionals: everything left after the flag pops
     # above, minus the framework's ``--tty`` flag (and its value).
     # ``Browser.run()`` auto-detects ``--tty`` but leaves it in
     # ``sys.argv``, so reading ``sys.argv[1]`` directly would misread
-    # ``browse-claude --tty -`` / ``--tty /dev/pts/N`` as the PROJECT
-    # positional (a bogus ``('project', abspath('--tty'))`` scope).
+    # ``--tty -`` / ``--tty /dev/pts/N`` as the PROJECT positional (a
+    # bogus ``('project', abspath('--tty'))`` scope).
     pos_args = recipe_argv()
 
-    # Resolve the initial scope: --file / --session / --pid are mutually
-    # exclusive (claude-data semantics). Fall back to positional PROJECT.
-    targets = sum(1 for v in (session_id, pid_arg, file_arg) if v)
-    if targets > 1:
-        print('browse-claude: --session, --pid, and --file are mutually '
-              'exclusive', file=sys.stderr)
-        sys.exit(2)
-
     initial_scope = None
-    target_jsonl = None
-    if file_arg is False or session_id is False or pid_arg is False or \
-            item_arg is False:
-        print('browse-claude: invalid argument value', file=sys.stderr)
-        sys.exit(2)
-    if file_arg:
-        target_jsonl = os.path.abspath(file_arg)
-        if not os.path.isfile(target_jsonl):
-            print(f'browse-claude: no such file: {file_arg}', file=sys.stderr)
-            sys.exit(2)
-    elif session_id:
-        target_jsonl = _find_session_by_id(session_id)
-        if not target_jsonl:
-            print(f'browse-claude: no session with id {session_id!r}',
-                  file=sys.stderr)
-            sys.exit(2)
-    elif pid_arg:
-        target_jsonl = _find_session_by_pid(pid_arg)
-        if not target_jsonl:
-            print(f'browse-claude: no live session for pid {pid_arg}',
-                  file=sys.stderr)
-            sys.exit(2)
-    elif pos_args:
+    if target is None and pos_args:
         # Seed conversion (§4.3 — the ONLY string→id conversion): the
-        # user-typed positional PROJECT becomes the structured scope root.
-        # A .jsonl path is promoted to ``target_jsonl`` so the
-        # cursor-on-open path treats it the same as ``--file <path>``
-        # (without this, ``./browse-tui recipes/browse-claude
-        # /path/to/session.jsonl`` opens the file but leaves the cursor on
-        # the scope_root row); any other path is a project directory.
-        arg = pos_args[0]
-        arg_abs = os.path.abspath(arg)
-        if arg.endswith('.jsonl') and os.path.isfile(arg_abs):
-            target_jsonl = arg_abs
+        # user-typed positional becomes the structured scope root. The
+        # store decides whether it names a session (opened like
+        # ``--file``, cursor on the latest voice) or a project.
+        kind, key = store_resolve_positional(pos_args[0])
+        if kind == 'session':
+            target = key
         else:
-            initial_scope = ('project', arg_abs)
+            initial_scope = (kind, key)
 
-    if item_arg is not None and not target_jsonl:
-        print('browse-claude: --item requires --session/--pid/--file',
+    if item_arg is not None and not target:
+        print(f'{prog}: --item requires --session/--pid/--file',
               file=sys.stderr)
         sys.exit(2)
 
-    # Initial scope strategy when a target jsonl was resolved:
+    # Initial scope strategy when a target session was resolved:
     #
-    #   --item N:               scope INTO the jsonl, cursor on message N.
+    #   --item N:               scope INTO the session, cursor on message N.
     #
-    #   no --item:              scope INTO the jsonl in BOTH modes, cursor
+    #   no --item:              scope INTO the session in BOTH modes, cursor
     #                           on last voice (the conversation, not the
     #                           card+timeline, is what the user came for).
-    #                           Two-level scope_stack ([parent_dir, jsonl])
-    #                           so alt-up pops one logical level (file →
-    #                           project dir) instead of jumping to the
-    #                           project root.
-    # Seed conversion (§4.3): the resolved target .jsonl becomes the
-    # structured ``('session', …)`` scope id, with its parent dir as the
-    # ``('project', …)`` scope under it.
+    #                           Two-level scope_stack ([project, session])
+    #                           so alt-up pops one logical level (session →
+    #                           project) instead of jumping to the root.
     parent_scope = None
-    if target_jsonl:
-        initial_scope = ('session', target_jsonl)
-        parent_scope = ('project', os.path.dirname(target_jsonl) or '/')
+    if target:
+        initial_scope = ('session', target)
+        parent_scope = ('project', store_project_of_session(target))
 
     # 'M' always pages the preview through the external $MDCAT / mdcat.
     # 'm' toggles inline markdown coloring iff the md2ansi_lib Python module
@@ -188,10 +151,10 @@ def main():
                                    _action_toggle_md, 'none'))
 
     b = Browser(BrowserConfig(
-        title='browse-claude',
+        title=prog,
         show_children_pane=False,
         # Item ids are tagged tuples (``('project', dir)`` /
-        # ``('session', jsonl)`` / ``('msg', jsonl, n)`` / …). Their
+        # ``('session', sess)`` / ``('msg', sess, n)`` / …). Their
         # ``str()`` would be noisy ``repr`` chrome that duplicates or
         # contradicts the title, so suppress them from the row chrome —
         # the title alone identifies the row. ``y`` action still surfaces
@@ -284,14 +247,14 @@ def main():
     ))
     _BROWSER = b
 
-    # Two-level scope_stack: [('project', dir), ('session', jsonl)].
+    # Two-level scope_stack: [('project', key), ('session', key)].
     # ``initial_scope`` was set above to the session id, so the framework's
     # __init__ pushed that onto the stack as the current scope. Slot the
     # project scope UNDER it so alt-up from inside the file pops one logical
     # level (file → project dir) instead of jumping straight to the project
     # root. Direct list insert preserves the framework's _expanded_by_scope
     # bookkeeping the __init__ scope_into already established.
-    if target_jsonl and parent_scope and parent_scope != initial_scope:
+    if target and parent_scope and parent_scope != initial_scope:
         b._state.scope_stack.insert(0, parent_scope)
 
     # Seed a REAL session Item for the scope_root so the framework never
@@ -299,12 +262,12 @@ def main():
     # launch — otherwise the top scope-root preview is blank (#730).
     # Synchronous (before ``run()``), so the real Item is in the index
     # ahead of the event loop's first ``visible_items`` pass.
-    if target_jsonl and parent_scope:
-        _seed_scope_root_item(b, target_jsonl)
+    if target and parent_scope:
+        _seed_scope_root_item(b, target)
 
     # Post-construction cursor positioning:
     #
-    #   --item N:          cursor → ``('msg', jsonl, N-1)``. Scope already
+    #   --item N:          cursor → ``('msg', sess, N-1)``. Scope already
     #                      the session, so messages render on first paint.
     #
     #   no --item:         cursor → last voice in the session. Deferred
@@ -313,15 +276,15 @@ def main():
     #                      Works in both flat and tree mode — the only
     #                      difference is whether the chain needs to walk
     #                      ancestor umbrellas (tree) or not (flat).
-    if target_jsonl:
+    if target:
         if item_arg is not None:
             n0 = max(1, item_arg) - 1
-            b.cursor_to(('msg', target_jsonl, n0))
+            b.cursor_to(('msg', target, n0))
         else:
-            _focus_latest_voice_when_ready(b, target_jsonl)
+            _focus_latest_voice_when_ready(b, target)
 
-    # Live-tail worker: polls the cursor's file every 5s and folds
-    # newly-appended records into the cached _TreeData, then pushes
+    # Live-tail worker: polls the cursor's session through the store and
+    # folds newly-appended records into the cached _TreeData, then pushes
     # update_data patches for any umbrella whose visible child list
     # grew. Daemon thread so it doesn't keep the process alive on
     # its own; _TAIL_STOP signals clean shutdown before sys.exit.
@@ -329,7 +292,7 @@ def main():
     _TAIL_STOP = threading.Event()
     _TAIL_THREAD = threading.Thread(
         target=_tail_worker, args=(b,),
-        name='browse-claude-tail', daemon=True,
+        name=f'{prog}-tail', daemon=True,
     )
     _TAIL_THREAD.start()
 
