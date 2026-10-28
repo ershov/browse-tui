@@ -53,6 +53,26 @@ def _refs_id(doc):
     return ('refs', doc, ())
 
 
+def _summarise_raw(r, raw):
+    """Row summary of a raw Claude record (parsed to a ``Record`` first)."""
+    return r._summarise_message(r._parse_record(raw))
+
+
+def _parse_all(r, raw_list):
+    """Parse raw records to ``Record``s: ``[(key, raw)]`` pairs or a plain list."""
+    if raw_list and isinstance(raw_list[0], tuple):
+        return [(n, r._parse_record(raw, n)) for n, raw in raw_list]
+    return [r._parse_record(raw, n) for n, raw in enumerate(raw_list)]
+
+
+def _tool_of(r, name, inp):
+    """The parsed tool dict of an assistant record calling ``name`` with ``inp``."""
+    return r._parse_record({'type': 'assistant', 'message': {
+        'role': 'assistant', 'content': [
+            {'type': 'tool_use', 'id': 't', 'name': name, 'input': inp}]},
+    }).tool
+
+
 def _stub_browse_tui():
     """Insert a no-op ``browse_tui`` module so the recipe can import.
 
@@ -2664,14 +2684,14 @@ class TestScanTree(unittest.TestCase):
             # One turn root (u1) at top level.
             self.assertEqual(len(td.roots_in_order), 1)
             self.assertEqual(td.roots_in_order[0]['kind'], 'turn')
-            self.assertEqual(td.roots_in_order[0]['rec']['uuid'], 'u1')
+            self.assertEqual(td.roots_in_order[0]['rec'].id, 'u1')
             # u1's direct members: a1 (tool_use), a2 (text). u2 is NOT
             # here — it's paired under a1.
-            direct = [r['uuid'] for r in td.turn_direct['u1']]
+            direct = [r.id for r in td.turn_direct[0]]
             self.assertEqual(direct, ['a1', 'a2'])
             # a1 owns u2 as a tool_child.
             self.assertEqual(
-                [r['uuid'] for r in td.tool_children['a1']], ['u2'],
+                [r.id for r in td.tool_children[1]], ['u2'],
             )
         finally:
             os.unlink(path)
@@ -2692,13 +2712,13 @@ class TestScanTree(unittest.TestCase):
         try:
             td = self.r._scan_tree(path)
             self.assertEqual(len(td.roots_in_order), 2)
-            self.assertEqual(td.roots_in_order[0]['rec']['uuid'], 'u1')
-            self.assertEqual(td.roots_in_order[1]['rec']['uuid'], 'u2')
+            self.assertEqual(td.roots_in_order[0]['rec'].id, 'u1')
+            self.assertEqual(td.roots_in_order[1]['rec'].id, 'u2')
             # u1 has a1 as a direct member. u2 has no members yet.
             self.assertEqual(
-                [r['uuid'] for r in td.turn_direct['u1']], ['a1'],
+                [r.id for r in td.turn_direct[0]], ['a1'],
             )
-            self.assertEqual(td.turn_direct['u2'], [])
+            self.assertEqual(td.turn_direct[2], [])
         finally:
             os.unlink(path)
 
@@ -2715,7 +2735,7 @@ class TestScanTree(unittest.TestCase):
             td = self.r._scan_tree(path)
             self.assertEqual(len(td.roots_in_order), 1)
             self.assertEqual(td.roots_in_order[0]['kind'], 'turn')
-            self.assertEqual(td.roots_in_order[0]['rec']['uuid'], 'u1')
+            self.assertEqual(td.roots_in_order[0]['rec'].id, 'u1')
         finally:
             os.unlink(path)
 
@@ -2741,16 +2761,16 @@ class TestScanTree(unittest.TestCase):
             self.assertEqual(td.roots_in_order[0]['kind'], 'span')
             self.assertEqual(td.roots_in_order[0]['start'], 0)
             self.assertEqual(
-                [r['type'] for r in td.roots_in_order[0]['records']],
+                [r.tag for r in td.roots_in_order[0]['records']],
                 ['permission-mode'],
             )
             self.assertEqual(td.roots_in_order[1]['kind'], 'turn')
-            self.assertEqual(td.roots_in_order[1]['rec']['uuid'], 'u1')
+            self.assertEqual(td.roots_in_order[1]['rec'].id, 'u1')
             self.assertEqual(td.roots_in_order[2]['kind'], 'span')
             self.assertEqual(td.roots_in_order[2]['start'], 4)
             # u1's direct members: last-prompt + turn_duration.
             self.assertEqual(
-                [r['type'] for r in td.turn_direct['u1']],
+                [r.tag for r in td.turn_direct[1]],
                 ['last-prompt', 'system'],
             )
         finally:
@@ -2778,13 +2798,13 @@ class TestScanTree(unittest.TestCase):
             # members. No span at the top level.
             self.assertEqual(len(td.roots_in_order), 1)
             self.assertEqual(td.roots_in_order[0]['kind'], 'turn')
-            self.assertEqual(td.roots_in_order[0]['rec']['uuid'], 'u1')
-            direct_types = [r['type'] for r in td.turn_direct['u1']]
+            self.assertEqual(td.roots_in_order[0]['rec'].id, 'u1')
+            direct_types = [r.tag for r in td.turn_direct[0]]
             self.assertIn('queue-operation', direct_types)
             # The Item built for it picks up row_bg.
             queue_rec = next(r for r in td.records or []
-                             if isinstance(r, dict)
-                             and r.get('type') == 'queue-operation')
+                             if r is not None
+                             and r.tag == 'queue-operation')
             item = self.r._tree_item(path, queue_rec, td)
             self.assertEqual(getattr(item, 'row_bg', None), 17)
         finally:
@@ -2815,24 +2835,11 @@ class TestScanTree(unittest.TestCase):
         try:
             td = self.r._scan_tree(path)
             # u1 turn root, a1 direct member. u2 + hook attachment under a1.
-            self.assertEqual(td.turn_direct['u1'][0]['uuid'], 'a1')
-            tool_kids = td.tool_children['a1']
-            kinds = [r['type'] for r in tool_kids]
+            self.assertEqual(td.turn_direct[0][0].id, 'a1')
+            tool_kids = td.tool_children[1]
+            kinds = [r.tag for r in tool_kids]
             self.assertIn('user', kinds)        # tool_result
             self.assertIn('attachment', kinds)  # hook
-        finally:
-            os.unlink(path)
-
-    def test_forked_from_flagged(self):
-        path = self._write_jsonl([
-            {'type': 'user', 'uuid': 'u1', 'parentUuid': None,
-             'promptId': 'P1', 'forkedFrom': 'old-uuid-aaaa',
-             'message': {'role': 'user', 'content': 'resumed'}},
-        ])
-        try:
-            td = self.r._scan_tree(path)
-            self.assertEqual(td.by_uuid['u1'].get('_tree_forked_from'),
-                             'old-uuid-aaaa')
         finally:
             os.unlink(path)
 
@@ -2917,11 +2924,10 @@ class TestScanTree(unittest.TestCase):
 
             td = self.r._scan_tree(sess_path)
             self.assertIn('toolu_x', td.agent_link)
-            self.assertEqual(td.agent_link['toolu_x']['agent_id'], 'AGENT01')
-            self.assertEqual(td.agent_link['toolu_x']['agent_path'],
+            self.assertEqual(td.agent_link['toolu_x']['child_key'], 'AGENT01')
+            self.assertEqual(td.agent_link['toolu_x']['child_session'],
                              agent_path)
-            self.assertEqual(td.agent_link['toolu_x']['assistant_uuid'],
-                             'a1')
+            self.assertEqual(td.agent_link['toolu_x']['assistant_key'], 1)
         finally:
             import shutil
             shutil.rmtree(tmp, ignore_errors=True)
@@ -3021,10 +3027,9 @@ class TestAgentVoicePacking(unittest.TestCase):
         try:
             td = self.r._scan_tree(path)
             self.assertEqual(len(td.roots_in_order), 1)
-            self.assertEqual(td.roots_in_order[0]['rec']['uuid'], 'u1')
+            self.assertEqual(td.roots_in_order[0]['rec'].id, 'u1')
             self.assertEqual(
-                [r['uuid'] for r in td.turn_direct['u1']
-                 if r.get('uuid')],
+                [r.id for r in td.turn_direct[0] if r.id],
                 ['a1', 'n1', 'a2'],
             )
             # The reply + follow-up hang off the <prompt> umbrella.
@@ -3045,8 +3050,7 @@ class TestAgentVoicePacking(unittest.TestCase):
             td = self.r._scan_tree(path)
             self.assertEqual(len(td.roots_in_order), 1)
             self.assertEqual(
-                [r['uuid'] for r in td.turn_direct['u1']
-                 if r.get('uuid')],
+                [r.id for r in td.turn_direct[0] if r.id],
                 ['a1', 'p1', 'a2'],
             )
         finally:
@@ -3062,7 +3066,7 @@ class TestAgentVoicePacking(unittest.TestCase):
         try:
             td = self.r._scan_tree(path)
             self.assertEqual(len(td.roots_in_order), 1)
-            self.assertEqual(td.roots_in_order[0]['rec']['uuid'], 'n1')
+            self.assertEqual(td.roots_in_order[0]['rec'].id, 'n1')
             roots = self.r._list_tree_roots(path)
             self.assertTrue(roots[0].title.startswith('<reply>'))
         finally:
@@ -3080,7 +3084,7 @@ class TestAgentVoicePacking(unittest.TestCase):
             td = self.r._scan_tree(path)
             self.assertEqual(len(td.roots_in_order), 1)
             self.assertEqual(
-                [r['uuid'] for r in td.turn_direct['u1']],
+                [r.id for r in td.turn_direct[0]],
                 ['n1', 'a1'],
             )
         finally:
@@ -3108,12 +3112,12 @@ class TestAgentVoicePacking(unittest.TestCase):
             spans = sorted(td.span_records)
             self.assertEqual(spans, [3, 7])
             self.assertEqual(
-                [r['subtype'] for r in td.span_records[3]], ['x1'])
+                [r.raw['subtype'] for r in td.span_records[3]], ['x1'])
             self.assertEqual(
-                [r['subtype'] for r in td.span_records[7]], ['y1'])
+                [r.raw['subtype'] for r in td.span_records[7]], ['y1'])
             # The reply + follow-up still folded under the human turn.
             self.assertIn(
-                'n1', [r.get('uuid') for r in td.turn_direct['u1']])
+                'n1', [r.id for r in td.turn_direct[0]])
         finally:
             os.unlink(path)
 
@@ -3131,7 +3135,7 @@ class TestAgentVoicePacking(unittest.TestCase):
         try:
             td = self.r._scan_tree(path)
             self.assertEqual(
-                [e['rec']['uuid'] for e in td.roots_in_order],
+                [e['rec'].id for e in td.roots_in_order],
                 ['u1', 'u2'],
             )
         finally:
@@ -3141,21 +3145,22 @@ class TestAgentVoicePacking(unittest.TestCase):
         notify = self._agent_voice('n1', self._NOTIFY)
         peer = self._agent_voice('p1', self._PEER)
         human = self._human('u1', 'hello')
-        self.assertFalse(self.r._is_turn_root(notify))
-        self.assertFalse(self.r._is_turn_root(peer))
-        self.assertTrue(self.r._is_turn_root(human))
+        parse = self.r._parse_record
+        self.assertFalse(self.r._is_turn_root(parse(notify)))
+        self.assertFalse(self.r._is_turn_root(parse(peer)))
+        self.assertTrue(self.r._is_turn_root(parse(human)))
 
     def test_levels_summary_shows_request_and_final_responses(self):
         # Level 1 = the human request + every end_turn response; the
         # cross-agent record itself is voice tier (2).
         notify = self._agent_voice('n1', self._NOTIFY)
-        self.assertEqual(self.r._record_min_level(notify), 2)
+        self.assertEqual(self.r._min_level_of(notify), 2)
         peer = self._agent_voice('p1', self._PEER)
-        self.assertEqual(self.r._record_min_level(peer), 2)
+        self.assertEqual(self.r._min_level_of(peer), 2)
         self.assertEqual(
-            self.r._record_min_level(self._end_turn('a1', 'All good.')), 1)
+            self.r._min_level_of(self._end_turn('a1', 'All good.')), 1)
         self.assertEqual(
-            self.r._record_min_level(self._human('u1', 'hello')), 1)
+            self.r._min_level_of(self._human('u1', 'hello')), 1)
 
 
 class TestTreeListings(unittest.TestCase):
@@ -3723,7 +3728,7 @@ class TestLiveTail(unittest.TestCase):
         ])
         try:
             td = self.r._scan_tree(path)
-            self.assertEqual(len(td.turn_direct.get('u1', [])), 0)
+            self.assertEqual(len(td.turn_direct.get(0, [])), 0)
             self._append(path, [
                 {'type': 'assistant', 'uuid': 'a1',
                  'message': {'role': 'assistant', 'content': [
@@ -3733,10 +3738,10 @@ class TestLiveTail(unittest.TestCase):
             records, dirty = self.r._read_new_records(path)
             # One new record returned in file order.
             self.assertEqual(len(records), 1)
-            self.assertEqual(records[0][1].get('uuid'), 'a1')
+            self.assertEqual(records[0][1].id, 'a1')
             # Tree fold: the new leaf belongs to <prompt:0>.
             self.assertIn(('prompt', path, 0), dirty)
-            self.assertEqual(len(td.turn_direct['u1']), 1)
+            self.assertEqual(len(td.turn_direct[0]), 1)
             tail = self.r._TAIL_STATE[path]
             self.assertGreater(tail.byte_offset, 0)
             self.assertFalse(tail.error)
@@ -3947,7 +3952,7 @@ class TestLiveTail(unittest.TestCase):
             records, dirty = self.r._read_new_records(path)
             self.assertEqual(len(records), 1)
             self.assertEqual(records[0][0], 0)
-            self.assertEqual(records[0][1].get('uuid'), 'u1')
+            self.assertEqual(records[0][1].id, 'u1')
             self.assertEqual(dirty, set())
             # ``start_line`` advances even without td.records.
             self.assertEqual(self.r._TAIL_STATE[path].start_line, 1)
@@ -4059,7 +4064,7 @@ class TestLiveTail(unittest.TestCase):
                 {'type': 'user', 'uuid': 'u2',
                  'message': {'role': 'user', 'content': 'two'}},
             )]
-            self.r._push_flat_inserts(fake_b, path, records)
+            self.r._push_flat_inserts(fake_b, path, _parse_all(self.r, records))
 
             self.assertEqual(len(seen_ops), 1)
             ops = seen_ops[0]
@@ -4094,7 +4099,7 @@ class TestLiveTail(unittest.TestCase):
                          {'type': 'text', 'text': 'three'},
                      ]}}),
             ]
-            self.r._push_flat_inserts(fake_b, path, records)
+            self.r._push_flat_inserts(fake_b, path, _parse_all(self.r, records))
 
             ops = seen_ops[0]
             upserts = [op for op in ops if op[0] == 'upsert']
@@ -4589,7 +4594,7 @@ class TestAttributionAgentTag(unittest.TestCase):
         rec = {'type': 'assistant', 'attributionAgent': 'general-purpose',
                'message': {'role': 'assistant',
                            'content': [{'type': 'text', 'text': 'hi'}]}}
-        tag = self.r._row_tag('assistant', rec)
+        tag = self.r._row_tag(self.r._parse_record(rec))
         self.assertEqual(tag, 'assistant · general-purpose')
 
     def test_row_tag_user_record_unaffected(self):
@@ -4597,35 +4602,35 @@ class TestAttributionAgentTag(unittest.TestCase):
         # cause the tag to mutate.
         rec = {'type': 'user', 'attributionAgent': 'general-purpose',
                'message': {'role': 'user', 'content': 'hi'}}
-        tag = self.r._row_tag('user', rec)
+        tag = self.r._row_tag(self.r._parse_record(rec))
         self.assertEqual(tag, 'user')
 
     def test_row_tag_missing_attribution(self):
         rec = {'type': 'assistant',
                'message': {'role': 'assistant',
                            'content': [{'type': 'text', 'text': 'hi'}]}}
-        tag = self.r._row_tag('assistant', rec)
+        tag = self.r._row_tag(self.r._parse_record(rec))
         self.assertEqual(tag, 'assistant')
 
     def test_row_tag_end_turn_suffix(self):
         rec = {'type': 'assistant',
                'message': {'role': 'assistant', 'stop_reason': 'end_turn',
                            'content': [{'type': 'text', 'text': 'done.'}]}}
-        tag = self.r._row_tag('assistant', rec)
+        tag = self.r._row_tag(self.r._parse_record(rec))
         self.assertEqual(tag, 'assistant · end_turn')
 
     def test_row_tag_attribution_and_end_turn(self):
         rec = {'type': 'assistant', 'attributionAgent': 'general-purpose',
                'message': {'role': 'assistant', 'stop_reason': 'end_turn',
                            'content': [{'type': 'text', 'text': 'done.'}]}}
-        tag = self.r._row_tag('assistant', rec)
+        tag = self.r._row_tag(self.r._parse_record(rec))
         self.assertEqual(tag, 'assistant · general-purpose · end_turn')
 
     def test_row_tag_tool_use_stop_unaffected(self):
         rec = {'type': 'assistant',
                'message': {'role': 'assistant', 'stop_reason': 'tool_use',
                            'content': [{'type': 'text', 'text': 'hi'}]}}
-        tag = self.r._row_tag('assistant', rec)
+        tag = self.r._row_tag(self.r._parse_record(rec))
         self.assertEqual(tag, 'assistant')
 
     def test_list_messages_row_carries_attribution_tag(self):
@@ -6130,9 +6135,11 @@ class TestToolResultFallback(unittest.TestCase):
             }]},
         }
         # Empty tool_owner map — must still resolve via the explicit
-        # back-pointer.
-        owner = self.r._resolve_tool_owner(rec, {})
-        self.assertEqual(owner, 'uuid-asst-42')
+        # back-pointer (the id index maps it to the record key).
+        td = self.r._TreeData()
+        td.key_of_id['uuid-asst-42'] = 42
+        owner = self.r._resolve_tool_owner(self.r._parse_record(rec), {}, td)
+        self.assertEqual(owner, 42)
 
     def test_resolve_prefers_source_tool_assistant_uuid_over_tool_owner(self):
         # When both signals point at different assistants, the explicit
@@ -6145,10 +6152,12 @@ class TestToolResultFallback(unittest.TestCase):
                 'content': 'ok',
             }]},
         }
+        td = self.r._TreeData()
+        td.key_of_id['uuid-asst-explicit'] = 42
         owner = self.r._resolve_tool_owner(
-            rec, {'toolu_xyz': 'uuid-asst-via-map'},
+            self.r._parse_record(rec), {'toolu_xyz': 7}, td,
         )
-        self.assertEqual(owner, 'uuid-asst-explicit')
+        self.assertEqual(owner, 42)
 
     def test_body_falls_back_to_raw_content_when_tur_missing(self):
         body = self.r._fmt_tool_use_result(None, 'plain-string-content')
@@ -7039,7 +7048,7 @@ class TestMultilinePreservation(unittest.TestCase):
         cls.r = _load_recipe()
 
     def test_summarise_keeps_newlines(self):
-        out = self.r._summarise_message({
+        out = _summarise_raw(self.r, {
             'type': 'user',
             'message': {'role': 'user',
                         'content': 'line one\nline two\nline three'},
@@ -7060,7 +7069,7 @@ class TestMultilinePreservation(unittest.TestCase):
         # has no newlines for a multi-line user prompt.
         obj = {'type': 'user',
                'message': {'role': 'user', 'content': 'hi\nbye'}}
-        title = self.r._oneline(self.r._summarise_message(obj))
+        title = self.r._oneline(_summarise_raw(self.r, obj))
         self.assertNotIn('\n', title)
         self.assertIn('hi', title)
         self.assertIn('bye', title)
@@ -7074,7 +7083,7 @@ class TestSummariseTitles(unittest.TestCase):
         cls.r = _load_recipe()
 
     def test_assistant_tool_use_only(self):
-        out = self.r._summarise_message({
+        out = _summarise_raw(self.r, {
             'type': 'assistant',
             'message': {'role': 'assistant', 'content': [
                 {'type': 'tool_use', 'name': 'Bash',
@@ -7085,7 +7094,7 @@ class TestSummariseTitles(unittest.TestCase):
 
     def test_assistant_text_plus_tool_use(self):
         # If there's text content, fall back to text-prefix shape.
-        out = self.r._summarise_message({
+        out = _summarise_raw(self.r, {
             'type': 'assistant',
             'message': {'role': 'assistant', 'content': [
                 {'type': 'text', 'text': 'thinking aloud'},
@@ -7096,7 +7105,7 @@ class TestSummariseTitles(unittest.TestCase):
         self.assertIn('thinking aloud', out)
 
     def test_user_tool_result(self):
-        out = self.r._summarise_message({
+        out = _summarise_raw(self.r, {
             'type': 'user',
             'message': {'role': 'user', 'content': [
                 {'type': 'tool_result', 'tool_use_id': 'x',
@@ -7111,7 +7120,7 @@ class TestSummariseTitles(unittest.TestCase):
         self.assertIn('hello', out)
 
     def test_attachment_file(self):
-        out = self.r._summarise_message({
+        out = _summarise_raw(self.r, {
             'type': 'attachment',
             'attachment': {'type': 'file', 'displayPath': './foo.py',
                            'filename': '/tmp/foo.py', 'content': 'hi'},
@@ -7119,7 +7128,7 @@ class TestSummariseTitles(unittest.TestCase):
         self.assertEqual(out, '📎 file: ./foo.py')
 
     def test_attachment_hook_success(self):
-        out = self.r._summarise_message({
+        out = _summarise_raw(self.r, {
             'type': 'attachment',
             'attachment': {'type': 'hook_success', 'hookName': 'lint',
                            'hookEvent': 'PreToolUse', 'exitCode': 0,
@@ -7128,7 +7137,7 @@ class TestSummariseTitles(unittest.TestCase):
         self.assertEqual(out, '✓ hook lint (PreToolUse)')
 
     def test_attachment_hook_failure(self):
-        out = self.r._summarise_message({
+        out = _summarise_raw(self.r, {
             'type': 'attachment',
             'attachment': {'type': 'hook_success', 'hookName': 'lint',
                            'hookEvent': 'PreToolUse', 'exitCode': 1,
@@ -7137,7 +7146,7 @@ class TestSummariseTitles(unittest.TestCase):
         self.assertTrue(out.startswith('✗ hook'))
 
     def test_system_turn_duration(self):
-        out = self.r._summarise_message({
+        out = _summarise_raw(self.r, {
             'type': 'system', 'subtype': 'turn_duration',
             'durationMs': 1234, 'messageCount': 3,
         })
@@ -7145,7 +7154,7 @@ class TestSummariseTitles(unittest.TestCase):
         self.assertIn('3 msgs', out)
 
     def test_system_api_error(self):
-        out = self.r._summarise_message({
+        out = _summarise_raw(self.r, {
             'type': 'system', 'subtype': 'api_error',
         })
         self.assertIn('api_error', out)
@@ -7163,7 +7172,7 @@ class TestSummariseTitles(unittest.TestCase):
               'speculation-accept: +2.5s saved'),
         ]
         for obj, want in cases:
-            self.assertEqual(self.r._summarise_message(obj), want,
+            self.assertEqual(_summarise_raw(self.r, obj), want,
                              f'failed for {obj["type"]}')
 
     def test_new_attachment_short_forms(self):
@@ -7201,7 +7210,7 @@ class TestSummariseTitles(unittest.TestCase):
              '📚 invoked: a:b, c:d'),
         ]
         for obj, want in cases:
-            self.assertEqual(self.r._summarise_message(obj), want,
+            self.assertEqual(_summarise_raw(self.r, obj), want,
                              f'failed for {obj["attachment"]["type"]}')
 
     def test_new_system_short_forms(self):
@@ -7223,22 +7232,22 @@ class TestSummariseTitles(unittest.TestCase):
              '■ agents killed'),
         ]
         for obj, want in cases:
-            self.assertEqual(self.r._summarise_message(obj), want,
+            self.assertEqual(_summarise_raw(self.r, obj), want,
                              f'failed for {obj["subtype"]}')
 
     def test_new_top_level_short_forms(self):
         self.assertEqual(
-            self.r._summarise_message({
+            _summarise_raw(self.r, {
                 'type': 'cost-state', 'totalCostUSD': 20.252094,
                 'totalLinesAdded': 61, 'totalLinesRemoved': 0,
             }),
             '💰 $20.25 · 61+/0−')
         self.assertEqual(
-            self.r._summarise_message({'type': 'atis-latch', 'atis': ''}),
+            _summarise_raw(self.r, {'type': 'atis-latch', 'atis': ''}),
             'atis-latch')
 
     def test_user_meta_marker(self):
-        out = self.r._summarise_message({
+        out = _summarise_raw(self.r, {
             'type': 'user', 'isMeta': True,
             'message': {'role': 'user', 'content': 'sys'},
         })
@@ -7328,9 +7337,10 @@ class TestVoiceOnlyFilter(unittest.TestCase):
         # the message fall-through (both of which we route past here).
         path = '/tmp/fake-prompt.jsonl'
         td = self.r._TreeData()
-        td.records = [{'type': 'assistant', 'message': {'role': 'assistant',
-                       'content': [{'type': 'tool_use', 'id': 't',
-                                    'name': 'X', 'input': {}}]}}]
+        td.records = _parse_all(self.r, [
+            {'type': 'assistant', 'message': {'role': 'assistant',
+             'content': [{'type': 'tool_use', 'id': 't',
+                          'name': 'X', 'input': {}}]}}])
         self.r._TREE_CACHE[path] = td
         try:
             self.r._DETAIL_LEVEL = 1
@@ -7377,15 +7387,15 @@ class TestVoiceOnlyFilter(unittest.TestCase):
         # producing a specific span layout.
         path = '/tmp/fake-span.jsonl'
         td = self.r._TreeData()
-        td.span_records[0] = [
+        td.span_records[0] = _parse_all(self.r, [
             {'type': 'system', 'subtype': 'hook'},
             {'type': 'attachment', 'attachment': {'type': 'file'}},
-        ]
-        td.span_records[5] = [
+        ])
+        td.span_records[5] = _parse_all(self.r, [
             {'type': 'system', 'subtype': 'hook'},
             {'type': 'user', 'uuid': 'u',
              'message': {'role': 'user', 'content': 'hi'}},
-        ]
+        ])
         self.r._TREE_CACHE[path] = td
         try:
             self.r._DETAIL_LEVEL = 1
@@ -7652,7 +7662,7 @@ class TestVoiceOnlyFilter(unittest.TestCase):
             # In real usage the tail step appends to td.records before
             # _push_flat_inserts runs; emulate that so _passes_filter
             # has data for the new lines.
-            new_records = [
+            new_records = _parse_all(self.r, [
                 (1, {'type': 'user', 'uuid': 'u2',
                      'message': {'role': 'user', 'content': 'two'}}),
                 (2, {'type': 'assistant', 'uuid': 'a1',
@@ -7660,7 +7670,7 @@ class TestVoiceOnlyFilter(unittest.TestCase):
                          {'type': 'tool_use', 'id': 't1',
                           'name': 'X', 'input': {}},
                      ]}}),
-            ]
+            ])
             for _n, rec in new_records:
                 td.records.append(rec)
             seen_ops = []
@@ -7704,10 +7714,10 @@ class TestVoiceOnlyFilter(unittest.TestCase):
         path = '/tmp/fake-tail.jsonl'
         td = self.r._TreeData()
         # Span at line 0 now contains a voice record (transition).
-        td.span_records[0] = [
+        td.span_records[0] = _parse_all(self.r, [
             {'type': 'user', 'uuid': 'u',
              'message': {'role': 'user', 'content': 'hi'}},
-        ]
+        ])
         # Stub for get_children: returns the span's records as items.
         td.records = [td.span_records[0][0]]
         self.r._TREE_CACHE[path] = td
@@ -7825,19 +7835,19 @@ class TestVoiceOnlyFilter(unittest.TestCase):
     def test_help_text_mentions_detail_level_keys(self):
         # The in-app ``1``-``7`` detail-level keys live in the intro
         # (shown by ``?``); the old ``.`` hotkey is gone.
-        self.assertIn('1-7', self.r._HELP_INTRO,
+        self.assertIn('1-7', self.r.store_help_intro(),
                       'help intro should list the 1-7 detail-level keys')
-        self.assertNotIn(' .  ', self.r._HELP_INTRO,
+        self.assertNotIn(' .  ', self.r.store_help_intro(),
                          'the . hotkey should no longer appear')
         # The CLI flag lives in the usage block (shown only by ``--help``);
         # the removed show-all flags are gone. (Build the old flag name at
         # runtime so it doesn't linger as a literal in the source.)
-        self.assertIn('--detail', self.r._HELP_USAGE_TMPL)
-        self.assertNotIn('--' + 'show-all', self.r._HELP_USAGE_TMPL)
+        self.assertIn('--detail', self.r.store_help_usage())
+        self.assertNotIn('--' + 'show-all', self.r.store_help_usage())
         # The flags block must NOT leak into the in-app intro.
-        self.assertNotIn('Usage:', self.r._HELP_INTRO)
+        self.assertNotIn('Usage:', self.r.store_help_intro())
         # The old 'h' hotkey is gone from the help intro.
-        self.assertNotIn(' h ', self.r._HELP_INTRO,
+        self.assertNotIn(' h ', self.r.store_help_intro(),
                          "the 'h' hotkey should no longer appear")
 
     def test_detail_level_actions_registered(self):
@@ -7917,34 +7927,34 @@ class TestRecordMinLevel(unittest.TestCase):
     def test_turn_root_user_prompt_is_level_1(self):
         # Any plain user voice record is a turn root → summary tier.
         rec = {'type': 'user', 'message': {'role': 'user', 'content': 'hi'}}
-        self.assertEqual(self.r._record_min_level(rec), 1)
+        self.assertEqual(self.r._min_level_of(rec), 1)
 
     def test_assistant_end_turn_is_level_1(self):
         # The agent's final (end_turn) response is the summary tier.
         rec = {'type': 'assistant', 'message': {'role': 'assistant',
                'stop_reason': 'end_turn',
                'content': [{'type': 'text', 'text': 'done'}]}}
-        self.assertEqual(self.r._record_min_level(rec), 1)
+        self.assertEqual(self.r._min_level_of(rec), 1)
 
     def test_intermediate_assistant_voice_is_level_2(self):
         # Assistant text WITHOUT end_turn is running commentary → voice (2).
         rec = {'type': 'assistant', 'message': {'role': 'assistant',
                'content': [{'type': 'text', 'text': 'on it'}]}}
-        self.assertEqual(self.r._record_min_level(rec), 2)
+        self.assertEqual(self.r._min_level_of(rec), 2)
 
     def test_queued_enqueue_prompt_is_level_1(self):
         # A queued prompt (enqueue) the user typed while Claude worked is
         # a user prompt → summary tier.
         rec = {'type': 'queue-operation', 'operation': 'enqueue',
                'content': 'do this next'}
-        self.assertEqual(self.r._record_min_level(rec), 1)
+        self.assertEqual(self.r._min_level_of(rec), 1)
 
     def test_queue_popall_stays_voice_level_2(self):
         # A non-enqueue queue op that still carries content (popAll, the
         # consumption echo) is voice but not the user typing → voice (2).
         rec = {'type': 'queue-operation', 'operation': 'popAll',
                'content': 'flushed'}
-        self.assertEqual(self.r._record_min_level(rec), 2)
+        self.assertEqual(self.r._min_level_of(rec), 2)
 
     def test_edit_tools_are_level_3(self):
         for name in ('Edit', 'Write', 'NotebookEdit', 'MultiEdit'):
@@ -7952,26 +7962,26 @@ class TestRecordMinLevel(unittest.TestCase):
                 rec = {'type': 'assistant', 'message': {'role': 'assistant',
                        'content': [{'type': 'tool_use', 'id': 't',
                                     'name': name, 'input': {}}]}}
-                self.assertEqual(self.r._record_min_level(rec), 3)
+                self.assertEqual(self.r._min_level_of(rec), 3)
 
     def test_assistant_tool_use_is_level_4(self):
         rec = {'type': 'assistant', 'message': {'role': 'assistant',
                'content': [{'type': 'tool_use', 'id': 't', 'name': 'Bash',
                             'input': {'command': 'ls'}}]}}
-        self.assertEqual(self.r._record_min_level(rec), 4)
+        self.assertEqual(self.r._min_level_of(rec), 4)
 
     def test_user_tool_result_is_level_4(self):
         rec = {'type': 'user', 'message': {'role': 'user',
                'content': [{'type': 'tool_result', 'tool_use_id': 't',
                             'content': 'ok'}]}}
-        self.assertEqual(self.r._record_min_level(rec), 4)
+        self.assertEqual(self.r._min_level_of(rec), 4)
 
     def test_assistant_thinking_with_text_is_voice_level_2(self):
         # Thinking *with* readable text is running commentary → voice (2).
         rec = {'type': 'assistant', 'message': {'role': 'assistant',
                'content': [{'type': 'thinking', 'thinking': 'hmm'}]}}
         self.assertTrue(self.r._is_voice(rec))
-        self.assertEqual(self.r._record_min_level(rec), 2)
+        self.assertEqual(self.r._min_level_of(rec), 2)
 
     def test_assistant_thinking_with_text_never_summary_tier(self):
         # A thinking-only record has no spoken words, so it stays at
@@ -7984,7 +7994,7 @@ class TestRecordMinLevel(unittest.TestCase):
                     'role': 'assistant', 'stop_reason': stop,
                     'content': [{'type': 'thinking', 'thinking': 'hmm',
                                  'signature': 'sig'}]}}
-                self.assertEqual(self.r._record_min_level(rec), 2)
+                self.assertEqual(self.r._min_level_of(rec), 2)
 
     def test_assistant_empty_thinking_only_is_level_6(self):
         # Signature-only (redacted) thinking has no readable text — it
@@ -7992,7 +8002,7 @@ class TestRecordMinLevel(unittest.TestCase):
         rec = {'type': 'assistant', 'message': {'role': 'assistant',
                'content': [{'type': 'thinking', 'thinking': '',
                             'signature': 'ErAIC..='}]}}
-        self.assertEqual(self.r._record_min_level(rec), 6)
+        self.assertEqual(self.r._min_level_of(rec), 6)
 
     def test_assistant_empty_thinking_with_tool_use_is_level_4(self):
         # An empty thinking part alongside a real (non-edit) tool_use is
@@ -8002,16 +8012,16 @@ class TestRecordMinLevel(unittest.TestCase):
                             'signature': 'sig'},
                            {'type': 'tool_use', 'id': 't', 'name': 'Bash',
                             'input': {'command': 'ls'}}]}}
-        self.assertEqual(self.r._record_min_level(rec), 4)
+        self.assertEqual(self.r._min_level_of(rec), 4)
 
     def test_system_turn_duration_is_level_4(self):
         rec = {'type': 'system', 'subtype': 'turn_duration',
                'durationMs': 1000, 'messageCount': 3}
-        self.assertEqual(self.r._record_min_level(rec), 4)
+        self.assertEqual(self.r._min_level_of(rec), 4)
 
     def test_system_api_error_is_level_4(self):
         rec = {'type': 'system', 'subtype': 'api_error'}
-        self.assertEqual(self.r._record_min_level(rec), 4)
+        self.assertEqual(self.r._min_level_of(rec), 4)
 
     def test_l3_useful_plain_types_are_level_5(self):
         for t in ('summary', 'task-summary', 'last-prompt', 'pr-link',
@@ -8021,55 +8031,55 @@ class TestRecordMinLevel(unittest.TestCase):
                 # ``queue-operation`` with content is voice → seed it empty
                 # so it classifies as plain metadata here.
                 rec = {'type': t}
-                self.assertEqual(self.r._record_min_level(rec), 5)
+                self.assertEqual(self.r._min_level_of(rec), 5)
 
     def test_l3_useful_system_local_command_is_level_5(self):
         rec = {'type': 'system', 'subtype': 'local_command', 'content': 'ls'}
-        self.assertEqual(self.r._record_min_level(rec), 5)
+        self.assertEqual(self.r._min_level_of(rec), 5)
 
     def test_l3_useful_attachments_are_level_5(self):
         for sub in ('file', 'queued_command', 'hook_success', 'diagnostics'):
             with self.subTest(attachment=sub):
                 rec = {'type': 'attachment', 'attachment': {'type': sub}}
-                self.assertEqual(self.r._record_min_level(rec), 5)
+                self.assertEqual(self.r._min_level_of(rec), 5)
 
     def test_compact_boundary_is_level_2(self):
         # "Conversation compacted" is structural — shows when skimming
         # voice.
         rec = {'type': 'system', 'subtype': 'compact_boundary'}
-        self.assertEqual(self.r._record_min_level(rec), 2)
+        self.assertEqual(self.r._min_level_of(rec), 2)
 
     def test_model_refusal_fallback_is_level_2(self):
         # The answer was replaced by a safeguards notice — a reader
         # skimming voice must see why the turn looks off.
         rec = {'type': 'system', 'subtype': 'model_refusal_fallback'}
-        self.assertEqual(self.r._record_min_level(rec), 2)
+        self.assertEqual(self.r._min_level_of(rec), 2)
 
     def test_promoted_system_subtypes_are_level_5(self):
         for sub in ('away_summary', 'agents_killed'):
             with self.subTest(subtype=sub):
                 rec = {'type': 'system', 'subtype': sub}
-                self.assertEqual(self.r._record_min_level(rec), 5)
+                self.assertEqual(self.r._min_level_of(rec), 5)
 
     def test_promoted_attachments_are_level_5(self):
         for sub in ('hook_cancelled', 'invoked_skills'):
             with self.subTest(attachment=sub):
                 rec = {'type': 'attachment', 'attachment': {'type': sub}}
-                self.assertEqual(self.r._record_min_level(rec), 5)
+                self.assertEqual(self.r._min_level_of(rec), 5)
 
     def test_cost_state_is_level_5(self):
-        self.assertEqual(self.r._record_min_level({'type': 'cost-state'}), 5)
+        self.assertEqual(self.r._min_level_of({'type': 'cost-state'}), 5)
 
     def test_known_noise_system_subtypes_are_level_6(self):
         for sub in ('stop_hook_summary', 'scheduled_task_fire',
                     'informational'):
             with self.subTest(subtype=sub):
                 rec = {'type': 'system', 'subtype': sub}
-                self.assertEqual(self.r._record_min_level(rec), 6)
+                self.assertEqual(self.r._min_level_of(rec), 6)
 
     def test_formatter_covered_attachment_is_level_6(self):
         rec = {'type': 'attachment', 'attachment': {'type': 'skill_listing'}}
-        self.assertEqual(self.r._record_min_level(rec), 6)
+        self.assertEqual(self.r._min_level_of(rec), 6)
 
     def test_known_noise_attachments_are_level_6(self):
         for sub in ('total_tokens_reminder', 'agent_listing_delta',
@@ -8078,24 +8088,24 @@ class TestRecordMinLevel(unittest.TestCase):
                     'plan_mode', 'silent_turn_reminder', 'already_read_file'):
             with self.subTest(attachment=sub):
                 rec = {'type': 'attachment', 'attachment': {'type': sub}}
-                self.assertEqual(self.r._record_min_level(rec), 6)
+                self.assertEqual(self.r._min_level_of(rec), 6)
 
     def test_known_metadata_types_are_level_6(self):
-        self.assertEqual(self.r._record_min_level({'type': 'progress'}), 6)
-        self.assertEqual(self.r._record_min_level({'type': 'atis-latch'}), 6)
+        self.assertEqual(self.r._min_level_of({'type': 'progress'}), 6)
+        self.assertEqual(self.r._min_level_of({'type': 'atis-latch'}), 6)
         self.assertEqual(
-            self.r._record_min_level({'type': 'file-history-delta'}), 6)
+            self.r._min_level_of({'type': 'file-history-delta'}), 6)
 
     def test_unrecognised_kinds_are_level_7(self):
         # A genuinely unknown top-level type / system subtype /
         # attachment type surfaces only in the maintenance view (7).
         self.assertEqual(
-            self.r._record_min_level({'type': 'totally-new'}), 7)
+            self.r._min_level_of({'type': 'totally-new'}), 7)
         self.assertEqual(
-            self.r._record_min_level(
+            self.r._min_level_of(
                 {'type': 'system', 'subtype': 'never-seen'}), 7)
         self.assertEqual(
-            self.r._record_min_level(
+            self.r._min_level_of(
                 {'type': 'attachment',
                  'attachment': {'type': 'never-seen'}}), 7)
 
@@ -8104,10 +8114,10 @@ class TestRecordMinLevel(unittest.TestCase):
         # injected-context user record is never part of the lived turn.
         rec = {'type': 'user', 'isMeta': True,
                'message': {'role': 'user', 'content': 'injected'}}
-        self.assertEqual(self.r._record_min_level(rec), 6)
+        self.assertEqual(self.r._min_level_of(rec), 6)
 
     def test_non_dict_record_is_level_6(self):
-        self.assertEqual(self.r._record_min_level(None), 6)
+        self.assertEqual(self.r._min_level_of(None), 6)
 
 
 class TestThinkingVoiceIdentity(unittest.TestCase):
@@ -8132,31 +8142,39 @@ class TestThinkingVoiceIdentity(unittest.TestCase):
 
     def test_summary_carries_thinking_marker(self):
         rec = self._thinking_rec('Applying the fix now.')
-        s = self.r._summarise_message(rec)
+        s = _summarise_raw(self.r, rec)
         self.assertIn('🧠 thinking:', s)
         self.assertIn('Applying the fix now.', s)
 
     def test_summary_prefers_spoken_text_over_thinking(self):
         rec = self._thinking_rec(
             'pondering', extra_parts=[{'type': 'text', 'text': 'Done.'}])
-        s = self.r._summarise_message(rec)
+        s = _summarise_raw(self.r, rec)
         self.assertNotIn('🧠 thinking:', s)
         self.assertIn('Done.', s)
 
     def test_signature_only_summary_has_no_marker(self):
         rec = self._thinking_rec('')
-        self.assertNotIn('🧠 thinking:', self.r._summarise_message(rec))
+        self.assertNotIn('🧠 thinking:', _summarise_raw(self.r, rec))
 
     def test_row_tag_appends_thinking(self):
         rec = self._thinking_rec('hmm')
-        self.assertEqual(self.r._row_tag('assistant', rec),
+        self.assertEqual(self.r._row_tag(self.r._parse_record(rec)),
                          'assistant · thinking')
 
     def test_row_tag_plain_assistant_unchanged(self):
         rec = {'type': 'assistant', 'message': {
             'role': 'assistant',
             'content': [{'type': 'text', 'text': 'hi'}]}}
-        self.assertEqual(self.r._row_tag('assistant', rec), 'assistant')
+        self.assertEqual(self.r._row_tag(self.r._parse_record(rec)), 'assistant')
+
+    def test_row_tag_text_with_thinking_appends_thinking(self):
+        # Spoken text wins the summary, but the row still flags the
+        # readable thinking it carries (not an end_turn row).
+        rec = self._thinking_rec(
+            'pondering', extra_parts=[{'type': 'text', 'text': 'Done.'}])
+        self.assertEqual(self.r._row_tag(self.r._parse_record(rec)),
+                         'assistant · thinking')
 
     def test_preview_renders_thinking_text(self):
         import re as _re
@@ -8299,14 +8317,14 @@ class TestPassesFilterByLevel(unittest.TestCase):
         # span 1: includes a turn-root user voice (min level 1).
         path = '/tmp/fake-span-levels.jsonl'
         td = self.r._TreeData()
-        td.span_records[0] = [
+        td.span_records[0] = _parse_all(self.r, [
             {'type': 'system', 'subtype': 'hook'},     # level 6
             {'type': 'tag', 'tag': 'x'},               # level 5
-        ]
-        td.span_records[1] = [
+        ])
+        td.span_records[1] = _parse_all(self.r, [
             {'type': 'system', 'subtype': 'hook'},     # level 6
             {'type': 'user', 'message': {'role': 'user', 'content': 'hi'}},
-        ]
+        ])
         self.r._TREE_CACHE[path] = td
         try:
             self.assertEqual(
@@ -8323,9 +8341,10 @@ class TestPassesFilterByLevel(unittest.TestCase):
         # when the underlying record is a pure tool_use.
         path = '/tmp/fake-prompt-levels.jsonl'
         td = self.r._TreeData()
-        td.records = [{'type': 'assistant', 'message': {'role': 'assistant',
-                       'content': [{'type': 'tool_use', 'id': 't',
-                                    'name': 'X', 'input': {}}]}}]
+        td.records = _parse_all(self.r, [
+            {'type': 'assistant', 'message': {'role': 'assistant',
+             'content': [{'type': 'tool_use', 'id': 't',
+                          'name': 'X', 'input': {}}]}}])
         self.r._TREE_CACHE[path] = td
         try:
             self.assertEqual(self._visible_at(('prompt', path, 0), td),
@@ -9515,18 +9534,19 @@ class TestSendMessage(unittest.TestCase):
     # -- one-liner ---------------------------------------------------------
 
     def test_tool_use_one_line_send(self):
-        line = self.r._tool_use_one_line('SendMessage', self._input())
+        line = self.r._tool_use_one_line(
+            _tool_of(self.r, 'SendMessage', self._input()))
         self.assertEqual(line, '→ worker-7: Address review nits')
 
     def test_tool_use_one_line_send_to_fallback(self):
         line = self.r._tool_use_one_line(
-            'SendMessage', self._input(with_to=True))
+            _tool_of(self.r, 'SendMessage', self._input(with_to=True)))
         self.assertEqual(line, '→ worker-7: Address review nits')
 
     def test_summarise_message_send(self):
         # The assistant-with-only-tool_use path routes through the
         # one-liner: 🔧 SendMessage(→ worker-7: Address review nits).
-        out = self.r._summarise_message(self._send_rec())
+        out = _summarise_raw(self.r, self._send_rec())
         self.assertIn('🔧 SendMessage', out)
         self.assertIn('→ worker-7: Address review nits', out)
 
@@ -9637,20 +9657,20 @@ class TestSendMessage(unittest.TestCase):
     # -- _kind_of ----------------------------------------------------------
 
     def test_kind_of_agent_send(self):
-        self.assertEqual(self.r._kind_of(self._send_rec()), 'agent-send')
+        self.assertEqual(self.r._row_label(self._send_rec()), 'agent-send')
 
     def test_kind_of_plain_assistant_unchanged(self):
         rec = {'type': 'assistant',
                'message': {'role': 'assistant',
                            'content': [{'type': 'text', 'text': 'hi'}]}}
-        self.assertEqual(self.r._kind_of(rec), 'assistant')
+        self.assertEqual(self.r._row_label(rec), 'assistant')
 
     def test_kind_of_bash_tool_use_unchanged(self):
         rec = {'type': 'assistant',
                'message': {'role': 'assistant', 'content': [{
                    'type': 'tool_use', 'name': 'Bash',
                    'input': {'command': 'ls'}}]}}
-        self.assertEqual(self.r._kind_of(rec), 'assistant')
+        self.assertEqual(self.r._row_label(rec), 'assistant')
 
     # -- stripe / tag style registration -----------------------------------
 
@@ -9749,10 +9769,10 @@ class TestTaskNotification(unittest.TestCase):
     # -- _kind_of ----------------------------------------------------------
 
     def test_kind_of_agent_reply(self):
-        self.assertEqual(self.r._kind_of(self._notify_rec()), 'agent-reply')
+        self.assertEqual(self.r._row_label(self._notify_rec()), 'agent-reply')
 
     def test_kind_of_human_user_unchanged(self):
-        self.assertEqual(self.r._kind_of(self._human_rec()), 'user')
+        self.assertEqual(self.r._row_label(self._human_rec()), 'user')
 
     # -- _is_voice (unchanged path) ----------------------------------------
 
@@ -9763,18 +9783,18 @@ class TestTaskNotification(unittest.TestCase):
 
     def test_agent_reply_stripe_matches_assistant(self):
         # Inter-agent voice shares the assistant stripe (235), NOT human's 17.
-        kind = self.r._kind_of(self._notify_rec())
+        kind = self.r._row_label(self._notify_rec())
         self.assertEqual(self.r._ROW_BG_FOR_KIND.get(kind), 235)
         self.assertIn('agent-reply', self.r._TAG_STYLE_FOR_KIND)
 
     def test_human_user_stripe_still_user(self):
-        kind = self.r._kind_of(self._human_rec())
+        kind = self.r._row_label(self._human_rec())
         self.assertEqual(self.r._ROW_BG_FOR_KIND.get(kind), 17)
 
     # -- _summarise_message ------------------------------------------------
 
     def test_summarise_one_liner(self):
-        out = self.r._summarise_message(self._notify_rec())
+        out = _summarise_raw(self.r, self._notify_rec())
         self.assertIn('←', out)
         self.assertIn('a4276aa253ce276ab', out)
         self.assertIn('completed', out)
@@ -9784,7 +9804,7 @@ class TestTaskNotification(unittest.TestCase):
         self.assertNotIn('<result>', out)
 
     def test_summarise_human_unchanged(self):
-        out = self.r._summarise_message(self._human_rec())
+        out = _summarise_raw(self.r, self._human_rec())
         self.assertIn('Just a normal prompt.', out)
 
     # -- full preview (_render_user) ---------------------------------------
@@ -9901,7 +9921,7 @@ class TestAgentPeerMessage(unittest.TestCase):
     def test_detect_teammate_wrapper_legacy(self):
         # LEGACY <teammate-message> spelling: no origin, no isMeta.
         self.assertTrue(self.r._is_agent_message(self._teammate_rec()))
-        self.assertEqual(self.r._kind_of(self._teammate_rec()), 'agent-peer')
+        self.assertEqual(self.r._row_label(self._teammate_rec()), 'agent-peer')
 
     def test_parse_teammate_wrapper_legacy(self):
         sender, body = self.r._parse_agent_message(self._teammate_rec())
@@ -9913,7 +9933,7 @@ class TestAgentPeerMessage(unittest.TestCase):
     # -- _kind_of / stripe / tag style ---------------------------------------
 
     def test_kind_of_agent_peer(self):
-        self.assertEqual(self.r._kind_of(self._peer_rec()), 'agent-peer')
+        self.assertEqual(self.r._row_label(self._peer_rec()), 'agent-peer')
 
     def test_stripe_and_tag_style_registered(self):
         # Dark green (22) — distinct from human (17) and assistant (235).
@@ -9923,16 +9943,16 @@ class TestAgentPeerMessage(unittest.TestCase):
     # -- detail level ---------------------------------------------------------
 
     def test_min_level_voice_despite_is_meta(self):
-        self.assertEqual(self.r._record_min_level(self._peer_rec()), 2)
+        self.assertEqual(self.r._min_level_of(self._peer_rec()), 2)
 
     def test_plain_meta_still_buried(self):
         rec = self._peer_rec(origin=False, wrapped=False)
-        self.assertEqual(self.r._record_min_level(rec), 6)
+        self.assertEqual(self.r._min_level_of(rec), 6)
 
     # -- _summarise_message ---------------------------------------------------
 
     def test_summarise_one_liner(self):
-        out = self.r._summarise_message(self._peer_rec())
+        out = _summarise_raw(self.r, self._peer_rec())
         self.assertIn('←', out)
         self.assertIn('md-menu-reviewer', out)
         self.assertIn('Review finished.', out)
@@ -10085,26 +10105,26 @@ class TestJsonPreviews(unittest.TestCase):
     def test_row_summary_idle_compact(self):
         idle = ('{"type":"idle_notification","from":"rev",'
                 '"idleReason":"available","summary":"[to main] done"}')
-        out = self.r._summarise_message(self._peer_body_rec(idle))
+        out = _summarise_raw(self.r, self._peer_body_rec(idle))
         self.assertEqual(out, '← rev: idle · available · [to main] done')
 
     def test_row_summary_other_json_type_line(self):
-        out = self.r._summarise_message(
+        out = _summarise_raw(self.r, 
             self._peer_body_rec('{"type":"task_update","detail":"x"}'))
         self.assertEqual(out, '← rev: {task_update}')
 
     def test_row_summary_json_no_type_first_key(self):
-        out = self.r._summarise_message(
+        out = _summarise_raw(self.r, 
             self._peer_body_rec('{"status": "ok", "n": 3}'))
         self.assertEqual(out, '← rev: {status: …}')
 
     def test_row_summary_malformed_json_raw(self):
-        out = self.r._summarise_message(
+        out = _summarise_raw(self.r, 
             self._peer_body_rec('{"type": "oops", broken'))
         self.assertEqual(out, '← rev: {"type": "oops", broken')
 
     def test_row_summary_markdown_body_unchanged(self):
-        out = self.r._summarise_message(
+        out = _summarise_raw(self.r, 
             self._peer_body_rec('## Review\nall fine'))
         self.assertEqual(out, '← rev: ## Review\nall fine')
 
@@ -10231,41 +10251,41 @@ class TestQueuedAgentVoice(unittest.TestCase):
     def test_queued_peer_classifies_agent_peer(self):
         rec = self._queue_rec(self._PEER)
         self.assertTrue(self.r._is_agent_message(rec))
-        self.assertEqual(self.r._kind_of(rec), 'agent-peer')
+        self.assertEqual(self.r._row_label(rec), 'agent-peer')
 
     def test_queued_notification_classifies_agent_reply(self):
         rec = self._queue_rec(self._NOTIFY)
         self.assertTrue(self.r._is_task_notification(rec))
-        self.assertEqual(self.r._kind_of(rec), 'agent-reply')
+        self.assertEqual(self.r._row_label(rec), 'agent-reply')
 
     def test_queued_agent_voice_is_voice_tier_not_prompt(self):
         # The human-enqueue promotion (level 1) must not apply.
         self.assertEqual(
-            self.r._record_min_level(self._queue_rec(self._PEER)), 2)
+            self.r._min_level_of(self._queue_rec(self._PEER)), 2)
         self.assertEqual(
-            self.r._record_min_level(self._queue_rec(self._NOTIFY)), 2)
+            self.r._min_level_of(self._queue_rec(self._NOTIFY)), 2)
 
     def test_plain_queued_prompt_unchanged(self):
         rec = self._queue_rec('please also fix the docs')
-        self.assertEqual(self.r._kind_of(rec), 'queue-operation')
-        self.assertEqual(self.r._record_min_level(rec), 1)
+        self.assertEqual(self.r._row_label(rec), 'queue-operation')
+        self.assertEqual(self.r._min_level_of(rec), 1)
         self.assertIn('queue enqueue: please also fix the docs',
-                      self.r._summarise_message(rec))
+                      _summarise_raw(self.r, rec))
 
     def test_dequeue_without_content_unchanged(self):
         rec = self._queue_rec('', op='dequeue')
-        self.assertEqual(self.r._kind_of(rec), 'queue-operation')
+        self.assertEqual(self.r._row_label(rec), 'queue-operation')
         self.assertFalse(self.r._is_agent_message(rec))
 
     def test_queued_peer_summary_parses_wrapper(self):
-        out = self.r._summarise_message(self._queue_rec(self._PEER))
+        out = _summarise_raw(self.r, self._queue_rec(self._PEER))
         self.assertIn('← peer-pack-reviewer:', out)
         self.assertIn('Review of c963794..HEAD', out)
         self.assertNotIn('<agent-message', out)
         self.assertNotIn('queue enqueue', out)
 
     def test_queued_notification_summary_parses_wrapper(self):
-        out = self.r._summarise_message(self._queue_rec(self._NOTIFY))
+        out = _summarise_raw(self.r, self._queue_rec(self._NOTIFY))
         self.assertIn('←', out)
         self.assertIn('a123', out)
         self.assertIn('worker done', out)
@@ -10712,8 +10732,8 @@ class TestTeamWorkers(unittest.TestCase):
                                'w-worker')
         td = self.r._scan_tree(lead)
         self.assertIn('t1', td.agent_link)
-        self.assertEqual(td.agent_link['t1']['agent_id'], 'w-worker')
-        self.assertEqual(td.agent_link['t1']['agent_path'], p)
+        self.assertEqual(td.agent_link['t1']['child_key'], 'w-worker')
+        self.assertEqual(td.agent_link['t1']['child_session'], p)
 
     def test_resolve_agent_jsonl_falls_back_to_worker(self):
         lead = self._write_lead()
@@ -10823,9 +10843,9 @@ class TestInProcessTeammates(unittest.TestCase):
         p = self._write_agent('aw-worker-0123abcd', meta=self._meta())
         td = self.r._scan_tree(lead)
         self.assertIn('t1', td.agent_link)
-        self.assertEqual(td.agent_link['t1']['agent_id'],
+        self.assertEqual(td.agent_link['t1']['child_key'],
                          'aw-worker-0123abcd')
-        self.assertEqual(td.agent_link['t1']['agent_path'], p)
+        self.assertEqual(td.agent_link['t1']['child_session'], p)
         # The filename-derived key makes the top-block diff match the
         # row listing — no orphan tag on the linked agent.
         rows = self.r._tree_subagents_for_session(lead, td)
@@ -10858,7 +10878,7 @@ class TestInProcessTeammates(unittest.TestCase):
                           meta=self._meta(team='session-99999999'),
                           mtime=now)
         td = self.r._scan_tree(lead)
-        self.assertEqual(td.agent_link['t1']['agent_path'], want)
+        self.assertEqual(td.agent_link['t1']['child_session'], want)
 
     def test_inprocess_respawn_newest_wins(self):
         lead = self._write_lead()
@@ -10868,9 +10888,9 @@ class TestInProcessTeammates(unittest.TestCase):
         new = self._write_agent('aw-worker-4567beef', meta=self._meta(),
                                 mtime=now)
         td = self.r._scan_tree(lead)
-        self.assertEqual(td.agent_link['t1']['agent_id'],
+        self.assertEqual(td.agent_link['t1']['child_key'],
                          'aw-worker-4567beef')
-        self.assertEqual(td.agent_link['t1']['agent_path'], new)
+        self.assertEqual(td.agent_link['t1']['child_session'], new)
 
     def test_inprocess_metaless_fallback_hex_guard(self):
         # No meta.json: the filename convention still links, but only a
@@ -10880,9 +10900,9 @@ class TestInProcessTeammates(unittest.TestCase):
         p = self._write_agent('aw-worker-0123abcd')
         self._write_agent('aw-worker-foo-4567beef')
         td = self.r._scan_tree(lead)
-        self.assertEqual(td.agent_link['t1']['agent_id'],
+        self.assertEqual(td.agent_link['t1']['child_key'],
                          'aw-worker-0123abcd')
-        self.assertEqual(td.agent_link['t1']['agent_path'], p)
+        self.assertEqual(td.agent_link['t1']['child_session'], p)
 
     def _write_sibling_worker(self, name='w-worker'):
         import json as _json
@@ -10902,8 +10922,8 @@ class TestInProcessTeammates(unittest.TestCase):
         lead = self._write_lead()
         p = self._write_sibling_worker()
         td = self.r._scan_tree(lead)
-        self.assertEqual(td.agent_link['t1']['agent_id'], 'w-worker')
-        self.assertEqual(td.agent_link['t1']['agent_path'], p)
+        self.assertEqual(td.agent_link['t1']['child_key'], 'w-worker')
+        self.assertEqual(td.agent_link['t1']['child_session'], p)
 
     def test_oldshape_spawn_never_claims_inprocess_file(self):
         # Legacy-shaped result (no ``name``/``team_name``): the name
@@ -10916,8 +10936,8 @@ class TestInProcessTeammates(unittest.TestCase):
                           meta=self._meta(team='session-99999999'))
         p = self._write_sibling_worker()
         td = self.r._scan_tree(lead)
-        self.assertEqual(td.agent_link['t1']['agent_id'], 'w-worker')
-        self.assertEqual(td.agent_link['t1']['agent_path'], p)
+        self.assertEqual(td.agent_link['t1']['child_key'], 'w-worker')
+        self.assertEqual(td.agent_link['t1']['child_session'], p)
 
 
 class TestPostTurnContinuations(unittest.TestCase):
@@ -11083,7 +11103,7 @@ class TestPostTurnContinuations(unittest.TestCase):
         td = self.r._scan_tree(lead)
         self.assertEqual(td.parent_id_of[2], ('prompt', lead, 0))
         self.assertIn(rec['uuid'],
-                      [r.get('uuid') for r in td.turn_direct['u1']])
+                      [r.id for r in td.turn_direct[0]])
         self.assertEqual([it['kind'] for it in td.roots_in_order],
                          ['turn'])
 
@@ -11261,12 +11281,12 @@ class TestMarkdownSubtrees(unittest.TestCase):
     def test_detection_heading_message(self):
         rec = {'message': {'content': [
             {'type': 'text', 'text': '# Heading\n\nbody'}]}}
-        self.assertTrue(self.r._md_has_children(rec))
+        self.assertTrue(self.r._md_has_children(self.r._parse_record(rec)))
 
     def test_detection_ref_message_prose(self):
         rec = {'message': {'content': [
             {'type': 'text', 'text': 'I wrote it to docs/report.md today'}]}}
-        self.assertTrue(self.r._md_has_children(rec))
+        self.assertTrue(self.r._md_has_children(self.r._parse_record(rec)))
 
     def test_detection_ref_message_tool_path(self):
         # The ref lives in a tool_use input, not prose — the string-leaf walk
@@ -11274,12 +11294,12 @@ class TestMarkdownSubtrees(unittest.TestCase):
         rec = {'message': {'content': [
             {'type': 'tool_use', 'name': 'Read',
              'input': {'file_path': 'notes.md'}}]}}
-        self.assertTrue(self.r._md_has_children(rec))
+        self.assertTrue(self.r._md_has_children(self.r._parse_record(rec)))
 
     def test_detection_plain_message_false(self):
         rec = {'message': {'content': [
             {'type': 'text', 'text': 'no heading, no reference at all'}]}}
-        self.assertFalse(self.r._md_has_children(rec))
+        self.assertFalse(self.r._md_has_children(self.r._parse_record(rec)))
 
     def test_detection_code_fence_hash_triggers_optimistically(self):
         # A ``#`` only inside a fenced code block fires the cheap regex gate
@@ -11287,7 +11307,7 @@ class TestMarkdownSubtrees(unittest.TestCase):
         # intended optimism; the build later self-heals.
         rec = {'message': {'content': [
             {'type': 'text', 'text': '```\n# not a heading\n```'}]}}
-        self.assertTrue(self.r._md_has_children(rec))
+        self.assertTrue(self.r._md_has_children(self.r._parse_record(rec)))
 
     def test_detection_quote_not_a_ref(self):
         # ``.md`` inside a JSON-ish quoted token does not pollute the match:
@@ -11295,7 +11315,7 @@ class TestMarkdownSubtrees(unittest.TestCase):
         # negative; assert a quote-only string with no real path is False.
         rec = {'message': {'content': [
             {'type': 'text', 'text': 'discuss markdown in general'}]}}
-        self.assertFalse(self.r._md_has_children(rec))
+        self.assertFalse(self.r._md_has_children(self.r._parse_record(rec)))
 
     def test_detection_graceful_noop_when_md_doc_none(self):
         # Force the feature off; detection must be a hard no-op even for a
@@ -13784,3 +13804,34 @@ class TestChainExpandTrimsToScope(unittest.TestCase):
 
 if __name__ == '__main__':
     unittest.main()
+
+
+class TestSpanTitleLabels(unittest.TestCase):
+    """``<system>`` span titles count the finer per-record labels
+    (``att:<type>`` / ``sys:<subtype>``), not the bare row tags."""
+
+    @classmethod
+    def setUpClass(cls):
+        cls.r = _load_recipe()
+
+    def test_span_title_uses_attachment_and_system_sublabels(self):
+        import json as _json
+        import tempfile
+        f = tempfile.NamedTemporaryFile('w', suffix='.jsonl', delete=False)
+        for rec in (
+            {'type': 'system', 'subtype': 'hook'},
+            {'type': 'attachment', 'attachment': {'type': 'file'}},
+            {'type': 'attachment', 'attachment': {'type': 'file'}},
+            {'type': 'last-prompt', 'lastPrompt': 'x'},
+        ):
+            f.write(_json.dumps(rec) + '\n')
+        f.close()
+        try:
+            roots = self.r._list_tree_roots(f.name)
+            self.assertEqual(len(roots), 1)
+            self.assertEqual(roots[0].title,
+                             '<system>  2× att:file, sys:hook, last-prompt')
+        finally:
+            self.r._TREE_CACHE.pop(f.name, None)
+            os.unlink(f.name)
+

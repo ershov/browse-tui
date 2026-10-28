@@ -83,8 +83,12 @@ commit as the parts that changed them.
 ## Store contract
 
 `common/030-model` lists the contract as plain module-level function names;
-each agent's `025-store` and `045-tail` define them and common code calls
-them by name. `common/` never touches agent paths, line numbers or SQL.
+each agent's `025-store`, `035-parse` and `045-tail` define them and common
+code calls them by name. `common/` never touches agent paths, line numbers,
+SQL or raw record shapes: records reach it as `Record` instances (next
+section). The parser that builds them (Claude: `_parse_record(raw, key)`)
+is internal to the agent's `035-parse`, not a contract function; common
+only sees its output through `store_tail_open` / `store_tail_poll`.
 
 Keys: `project_key`, `session_key` and `child_key` are opaque to common
 code (hashable, orderable within their kind, stable across runs; for Claude
@@ -98,12 +102,14 @@ to keep the ordinals dense (Claude: blank or unparsable lines).
 
 Listings return ready `Item`s (title, tag, `boundary`, per-row attrs such
 as `agent_id` / `mtime`), not plain dicts: the session and child rows are
-presentation the store owns for now. #1268 revisits this with the record
-model.
+presentation the store owns. Common only marks a child row it could not
+link to a dispatch site (`is_orphan`, `tag_style='dim'`) and asks the
+store to re-tag it (`store_mark_orphan`).
 
 | Function | Returns |
 |---|---|
 | `store_name()` | `'claude' \| 'codex' \| 'opencode'`; `browse-agents-<name>` is the program name in the title, error prefixes and the tail thread name |
+| `store_help_intro()` / `store_help_usage()` | the in-app `?` intro and the `--help` usage block (the agent's flags and key hints) |
 | `store_init()` | startup indexes (Claude: live pids, team rosters); called once before `store_pop_args` |
 | `store_pop_args()` | pops the agent's target flags from the argv (Claude `--session`, `--pid`, `--file`, `--running`); `{'target': session_key or None, 'error': message or None}` |
 | `store_resolve_positional(arg)` | `('session', key)` or `('project', key)` for the positional argument |
@@ -119,10 +125,11 @@ model.
 | `store_session_cwd_and_root(session_key)` | `(cwd, project_root)` anchors for the markdown reference resolver |
 | `store_context_dirs(project_key, session_key)` | `[(role, path)]` with roles `project` / `cwd` / `workspace` for the directory actions; `session_key` may be `None` |
 | `store_child_sessions(session_key)` | child (subagent / worker) `Item`s with ids `('agent', session_key, child_key)`; never returned by `store_list_sessions` |
+| `store_mark_orphan(item)` | re-tags a child `Item` the fold found no dispatch site for (common has already set `is_orphan` and `tag_style`) |
 | `store_child_session(session_key, child_key)` | the child's `session_key`, or `None` when it has no transcript |
 | `store_child_source_path(session_key, child_key)` | the path a child transcript would live at, existing or not (error reporting) |
 | `store_parent_of_child(session_key)` | `(parent_session_key, child_key)` when the session is a child transcript, else `None` |
-| `store_resolve_spawned_child(session_key, tool_result, tool_input)` | `(child_key, child_session_key)` for a spawn tool result, or `None`; used by the tree fold to link `('agent', …)` rows to their dispatch site |
+| `store_resolve_spawned_child(session_key, call, result)` | `(child_key, child_session_key)` for a canon `spawn` tool dict `call` and the `Record` of its result, or `None`; used by the tree fold to link `('agent', …)` rows to their dispatch site |
 | `store_source_path(session_key)` | filesystem path holding the whole transcript (may be a temp file the store wrote) |
 | `store_source_locator(session_key, record_key)` | `(path, line)`; `line` 1-based or `None` |
 
@@ -131,8 +138,8 @@ Tail (`045-tail`):
 | Function | Returns |
 |---|---|
 | `store_tailable(session_key)` | `bool`; whether the worker should follow this session |
-| `store_tail_open(session_key)` | `(records, state)`: every record so far as `[(record_key, record_or_None), …]` plus an opaque state whose watermark sits at the end of that read; `([], None)` when the session cannot be read. This is the one bulk read of a session |
-| `store_tail_poll(session_key, state)` | `(new, changed)`: `new` is a list of `(record_key, record)` appended since the watermark, `changed` a list of records whose body changed in place (same key); updates the watermark |
+| `store_tail_open(session_key)` | `(records, state)`: every record so far as `[(record_key, Record_or_None), …]` plus an opaque state whose watermark sits at the end of that read; `([], None)` when the session cannot be read. This is the one bulk read of a session |
+| `store_tail_poll(session_key, state)` | `(new, changed)`: `new` is a list of `(record_key, Record)` appended since the watermark, `changed` a list of records whose body changed in place (same key); updates the watermark |
 | `store_tail_interval()` | poll period in seconds (Claude and Codex 5.0, OpenCode 1.0) |
 | `store_source_excerpt({session_key: [record_key, …]})` | a temp file holding exactly those records in order (caller unlinks), or `None`; lives next to the reader because it reuses its per-record locators |
 
@@ -147,39 +154,76 @@ Identity tuples in the tree are `('project', project_key)`,
 
 ## Normalized record model
 
-A record is a dict created by `new_record(kind, key, **fields)` in
-`common/030-model`, which fills defaults.
+A record is a `Record` (`common/030-model`, a `__slots__` class) built by
+the agent's `_parse_record(raw, key)` in `035-parse`, one per raw record.
+Common code reads only its fields; `raw` is for the agent's own preview
+renderers (#1287 keys them on `tool.canon`) and the source view.
 
 | Field | Type | Meaning |
 |---|---|---|
 | `key` | int | dense 0-based ordinal into the session's cached record list; the store maps it to its native locator (see Store contract). Ordinals stay stable only while in-place growth happens at the tail of the session (the streaming assistant row is the last message); a new content element in an earlier message would shift every later ordinal (#1270) |
 | `kind` | str | one of the kinds below |
+| `raw` | any | the source object |
+| `id` | str or `None` | the agent's record id (Claude `uuid`); resolves `caller_id` back-pointers |
 | `ts` | float or `None` | epoch seconds |
-| `turn_id` | str or `None` | explicit turn id when the store has one; `None` lets the fold derive turns from `user_prompt` records |
-| `text` | str | plain body: prompt, assistant text, thinking, system text; markdown allowed |
-| `tool` | dict or `None` | `canon`, `name`, `call_id`, `input` (dict or str), `output` (str or `None`), `diff` (unified diff str or `None`), `is_error` (bool) |
-| `links` | list | `('session', session_key, label)` or `('record', session_key, record_key, label)`; drives cross-link markers and Enter jumps |
-| `meta` | dict | small facts for the chrome footer: `model`, `tokens`, `cost`, `duration_ms`, `agent`, `encrypted` |
-| `tag` | str or `None` | row tag override; `None` means the kind label |
+| `turn_id` | str or `None` | explicit turn id when the store has one |
+| `tag` | str | row label; the agent's own type name (Claude `user`, `attachment`, `agent-send`, `last-prompt`, …), defaults to the kind |
+| `tag_style`, `row_bg` | str or `None`, int or `None` | row presentation: tag colour name and the 256-colour voice stripe. `None` means the per-kind default (`_DEFAULT_TAG_STYLE` / `_DEFAULT_ROW_BG`, the stripe for voice records only); Claude sets both from its own label maps |
+| `text` | str | plain body: prompt, assistant text, thinking, system text, inbound message body; markdown allowed |
+| `summary` | str or `None` | row title the parser supplies when the generic one (below) would lose the salient fact; `None` = derive from kind, text and tool |
+| `tools` | list of dict | tool calls (a record that calls tools) or results (a `tool_result` record), see below; `rec.tool` is the first or `None` |
+| `call_id` | str or `None` | for a record that is neither a call nor a result but belongs to one (Claude hook output): that call's id |
+| `caller_id` | str or `None` | `id` of the record that issued the call this record answers, when the agent stamps it (Claude `sourceToolAssistantUUID`) |
+| `agent_voice` | str or `None` | inbound inter-agent voice: `reply` (a spawned worker's task result), `peer` (another session's message), `idle` (a worker's automatic idle notice) |
+| `peer` | str or `None` | sender of inbound agent voice |
+| `is_voice` | bool | carries speech (stripe, voice jumps, latest-voice landing); not derivable from kind (Claude counts AskUserQuestion / SendMessage calls as voice) |
+| `is_meta` | bool | injected context, never typed or spoken (Claude `isMeta`, Codex `developer`, OpenCode `synthetic`) |
+| `end_turn` | bool | an assistant record that concluded its turn |
 | `min_level` | int or `None` | lowest detail level that shows the record; `None` means the per-kind default |
-| `raw` | any | the source object, shown at the highest detail level and by the source view |
+| `meta` | dict | small facts: `agent` (attribution), `title` + `title_by` (`user`/`agent`: a session title stated by this record), `duration_ms`, `encrypted`, `thinking` (the record also carries readable thinking → `· thinking` row tag), `span_label` (finer label for `<system>` span titles, Claude `att:<type>` / `sys:<subtype>`); #1287 adds `model`, `tokens`, `cost` for the chrome footer |
+
+Common does not consume `ts` or `turn_id` yet: the fold derives turns from
+`user_prompt` / `turn_end` records and the chrome footer (#1287) will read
+`ts`; both are filled now so Codex, which has explicit turns and
+timestamps, maps onto the same shape.
+
+Tool dicts come from `new_tool(**fields)` with every key present:
+`canon`, `name`, `call_id`, `input` (dict or str), `output` (str or `None`),
+`glance` (short result text for the row title, `None` = `output`; Claude
+derives it from `toolUseResult`), `diff` (unified diff of an edit result or
+`None`), `is_error`, plus `peer` (canon `message`: recipient; canon `spawn`:
+teammate name) and `text` (canon `message`: body). The generic one-liner reads `input` keys
+`command`, `file_path`, `pattern`, `subagent_type`, `skill`, `summary` by
+canon; a parser whose native shape differs normalises `input` or sets
+`summary`.
 
 Kinds and default detail level (1 summary, 2 voice, 3 edits, 4 tools,
-5 detailed, 6 all, 7 unknown):
+5 detailed, 6 all, 7 unknown); the Claude parser sets `min_level`
+explicitly on every record (its tiers are finer than the defaults):
 
 | kind | default level | notes |
 |---|---|---|
-| `user_prompt` | 1 | starts a turn when `turn_id` is `None` |
-| `assistant_text` | 2 | final or intermediate assistant text |
-| `thinking` | 2 | shown with the thinking tint; empty `text` plus `meta.encrypted` renders a placeholder |
-| `tool_call` | 3 for canon `edit`/`write`, else 4 | paired with its result by `tool.call_id` |
-| `tool_result` | same as its call | folded under the tool umbrella |
+| `user_prompt` | 1 | a fresh human prompt (`is_voice`, not `is_meta`, no `agent_voice`) opens a turn; inbound agent voice re-opens the last human turn |
+| `assistant_text` | 2 | spoken assistant text; may also carry `tools` (mixed text + call), then it is wrapped in a `<tool:>` umbrella like a `tool_call` |
+| `thinking` | 2 | readable thinking in `text`; empty `text` plus `meta.encrypted` renders a placeholder (level 6) |
+| `tool_call` | 3 for canon `edit`/`write`, else 4 | paired with its results by `call_id` |
+| `tool_result` | 4 | folded under the call's umbrella |
 | `turn_start` | 5 | explicit turn boundary |
-| `turn_end` | 5 | carries `meta.tokens`, `meta.cost`, `meta.duration_ms` |
-| `compaction` | 5 | context compaction summary in `text` |
-| `system` | 5 | agent/system text not spoken by either side |
-| `meta` | 6 | bookkeeping rows; `tag` carries the agent's own type name |
+| `turn_end` | 5 (Claude 4) | closes the open turn; carries `meta.duration_ms` |
+| `compaction` | 5 (Claude 2) | context compaction summary in `text` |
+| `system` | 5 | agent/system text not spoken by either side; Claude `system/*` and `attachment` records |
+| `meta` | 6 | bookkeeping rows; `tag` carries the agent's own type name; Claude `queue-operation` is a voice `meta` |
 | `unknown` | 7 | anything the parser did not recognise; `raw` kept |
+
+Common classification on records (`030-model`): `_record_min_level`,
+`_is_turn_root`, `_is_turn_close`, `_is_continuation_activity`,
+`_is_inbound_agent_voice`, `_issues_tool_call`; row text:
+`_summarise_message`, `_row_tag`, `_tool_use_one_line`,
+`_tool_result_one_line`. The fold (`040-tree`) keys every index by record
+key (`turn_direct`, `tool_children`, `agent_link[call_id] = {child_key,
+child_session, assistant_key}`), so agents without record ids work; the
+cross-link map (`070-links`) joins canon `message` / `spawn` tools with
+`agent_voice == 'peer'` records by `peer` and `text`.
 
 Tool canon names and the per-agent name map:
 
@@ -206,12 +250,13 @@ Tool canon names and the per-agent name map:
 `globals().get(name)` and falls back to the generic path when absent or when
 the hook returns `None`.
 
-Provisional, finalized in #1268. Listed are the hooks the Claude fork
-demonstrably needs; others are added only when an agent needs them.
+Provisional, finalized in #1287. Listed are the hooks the Claude fork
+demonstrably needs; others are added only when an agent needs them. There
+is no common parser: each agent's `_parse_record` classifies its own raw
+objects, so `extras_classify` is not needed and is dropped.
 
 | Hook | Called | Returns |
 |---|---|---|
-| `extras_classify(raw)` | before the common parser maps a raw object | a record, or `None` to continue |
 | `extras_render(rec)` | preview body for `system`/`meta`/`unknown` records | ANSI str or `None` |
 | `extras_chrome(rec)` | footer of a record preview | list of str facts |
 | `extras_actions()` | Browser construction | list of `Action` |
@@ -226,15 +271,15 @@ selection events.
 * `store_tail_open` / `store_tail_poll` yield records in display order;
   `key` is a dense ordinal, unique within a session.
 * `ts` is non-decreasing except for records the store marks `changed`.
-* A `tool_call` is followed by at most one `tool_result` with the same
-  `tool.call_id`; an unmatched call renders as pending.
-* Voice records (`user_prompt`, `assistant_text`, `thinking`) have `text`
-  filled; the voice jumps and the markdown subtree operate on them only.
-* `turn_start`/`turn_end` are optional; when absent the fold opens a turn at
-  each `user_prompt` and closes it at the next.
-* `links` targets are keys the store can resolve with
-  `store_session_exists` / `store_tail_open`.
-* `raw` is kept but only read at level 6–7 and by `store_source_locator`.
+* Each call in a record's `tools` is followed by at most one result with
+  the same `call_id`; an unmatched call renders as pending.
+* Voice records (`is_voice`) have `text` filled; the voice jumps and the
+  markdown subtree operate on `text` (plus result `output`).
+* `turn_end` is optional; the fold opens a turn at each fresh
+  `user_prompt` and closes it at the next `turn_end` or prompt.
+* `raw` is read only by the agent's own renderers, the markdown `.md`
+  reference scan (a string-leaf walk, no field names) and
+  `store_source_locator`.
 
 ## Per-agent format notes
 
@@ -252,9 +297,15 @@ selection events.
   `permission-mode`, `queue-operation`, `file-history-snapshot`, …) → `meta`.
 * `message.content[]` blocks: `text`, `thinking`, `tool_use{id,name,input}`,
   `tool_result{tool_use_id,content,is_error}`; `toolUseResult` on the user
-  record carries structured results (`structuredPatch` for edits).
+  record carries structured results (`structuredPatch` for edits → `diff`,
+  `agentId` for spawns, `stdout` for Bash → the row glance).
 * Thinking is plaintext. Turn boundaries derive from user records;
-  `stop_reason == end_turn` closes the turn.
+  `system/turn_duration` → `turn_end`, `system/compact_boundary` →
+  `compaction`, other `system/*` and `attachment` → `system`, bookkeeping
+  types → `meta`. Inter-agent voice: `SendMessage` → canon `message`
+  (tag `agent-send`), a `<task-notification>` user record → `agent_voice
+  'reply'`, a `<teammate-message>` / `<agent-message>` / `origin.kind ==
+  peer` user record → `'peer'` (`'idle'` for an idle-notification body).
 * Tail: file append; byte offset per file, partial last line kept.
 
 ### Codex CLI

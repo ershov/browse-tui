@@ -653,7 +653,7 @@ def _action_toggle_tree(ctx):
     """Flip flat ↔ tree view; preserve cursor on the same message id.
 
     Flat→tree: the cursor's message may end up several levels deep
-    inside a turn-root that's collapsed by default. Walk the ``parentUuid``
+    inside a turn-root that's collapsed by default. Walk the ancestor
     chain from the target up to root, add each ancestor to the
     framework's ``expanded`` set, then ``refresh()`` (which refetches the
     root + every expanded parent) and ``cursor_to`` the original id.

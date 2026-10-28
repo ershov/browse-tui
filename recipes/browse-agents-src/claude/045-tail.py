@@ -59,8 +59,9 @@ def store_tailable(session_key):
 def _read_tail_lines(f, state, *, strict):
     """Read complete lines from ``f`` at ``state.byte_offset``.
 
-    Returns ``[(line_no, rec_or_None), …]``; ``rec`` is ``None`` for blank
-    lines and non-dict JSON. With ``strict`` a malformed line latches
+    Returns ``[(line_no, record_or_None), …]``; a ``Record`` parsed by
+    ``_parse_record`` for each JSON object, ``None`` for blank lines and
+    non-dict JSON. With ``strict`` a malformed line latches
     ``state.error`` and stops the read (live-tail semantics); without it
     the line yields ``None`` and the read goes on (bulk read).
     """
@@ -80,8 +81,8 @@ def _read_tail_lines(f, state, *, strict):
                     state.error = True
                     break
                 rec = None
-            if not isinstance(rec, dict):
-                rec = None
+            rec = (_parse_record(rec, state.start_line)
+                   if isinstance(rec, dict) else None)
         out.append((state.start_line, rec))
         state.byte_offset = f.tell()
         state.line_offsets.append(state.byte_offset)

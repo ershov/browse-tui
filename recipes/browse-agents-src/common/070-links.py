@@ -119,46 +119,49 @@ def _ancestor_ids_for(item_id):
 #                                           forward link, the group row).
 #
 # The send-direction order join skips auto-generated idle notifications
-# (they aren't sent via SendMessage, so they'd shift the join); an order
-# join that runs past the end — or a reply whose text matches no send —
-# falls back to the subagent group row (no reverse half — the group row's
-# backlink is the session-level pair).
+# (``agent_voice == 'idle'``: they aren't sent via a message tool, so
+# they'd shift the join); an order join that runs past the end — or a
+# reply whose text matches no send — falls back to the subagent group
+# row (no reverse half — the group row's backlink is the session-level
+# pair).
+#
+# Everything here reads normalized records: an outbound message is a
+# tool of canon ``message`` (``peer`` = recipient, ``text`` = body), a
+# spawn is canon ``spawn`` (``peer`` = teammate name), and an inbound
+# peer message is a ``user_prompt`` with ``agent_voice == 'peer'``
+# (``peer`` = sender, ``text`` = body).
 
 
-def _is_idle_notification(body):
-    """True for a teammate's auto-generated idle notice (not a real reply)."""
-    body = body.lstrip()
-    if not body.startswith('{'):
-        return False
-    try:
-        return json.loads(body).get('type') == 'idle_notification'
-    except Exception:
-        return False
+def _message_sends(rec):
+    """``(recipient, body)`` per outbound message call in ``rec``."""
+    if rec is None or not _issues_tool_call(rec):
+        return []
+    return [(t['peer'], t['text'] or '') for t in rec.tools
+            if t['canon'] == 'message']
+
+
+def _is_peer_message(rec):
+    """A delivered inbound peer message (not a queued echo or idle notice)."""
+    return (rec is not None and rec.kind == 'user_prompt'
+            and rec.agent_voice == 'peer')
 
 
 def _spawn_use_name(rec, tu_id):
-    """``input.name`` of the Agent/Task tool_use part ``tu_id`` in ``rec``."""
-    msg = rec.get('message') if isinstance(rec, dict) else None
-    content = msg.get('content') if isinstance(msg, dict) else None
-    if not isinstance(content, list):
-        return None
-    for p in content:
-        if (isinstance(p, dict) and p.get('type') == 'tool_use'
-                and p.get('id') == tu_id):
-            return (p.get('input') or {}).get('name')
+    """Teammate name of the spawn call ``tu_id`` in ``rec``."""
+    for t in rec.tools:
+        if t['call_id'] == tu_id:
+            return t['peer']
     return None
 
 
 def _inbound_lines(std):
-    """Lines of delivered inbound teammate messages, in order.
+    """Keys of delivered inbound teammate messages, in order.
 
     The 1st is the spawn prompt delivery; idle notices are excluded so
-    the order join stays aligned with the leader's SendMessage list.
+    the order join stays aligned with the leader's message list.
     """
     return [wn for wn, wrec in enumerate(std.records)
-            if isinstance(wrec, dict) and wrec.get('type') == 'user'
-            and _is_agent_message(wrec)
-            and not _is_idle_notification(_parse_agent_message(wrec)[1])]
+            if _is_peer_message(wrec)]
 
 
 def _link_map(path):
@@ -193,30 +196,16 @@ def _link_map(path):
     rev = {}
     agent_counts = {}
 
-    # One master pass: SendMessage dispatch lines per recipient and
-    # inbound teammate-message reply ``(line, body)`` per sender (idle
-    # notices and queue-operation echoes excluded — only delivered
-    # ``user`` records join).
+    # One master pass: message dispatch lines per recipient and inbound
+    # peer reply ``(line, body)`` per sender (idle notices and queued
+    # echoes excluded — only delivered records join).
     sends_to = {}
     replies_from = {}
     for n, rec in enumerate(td.records):
-        if not isinstance(rec, dict):
-            continue
-        rtype = rec.get('type')
-        if rtype == 'assistant':
-            msg = rec.get('message') or {}
-            content = msg.get('content') if isinstance(msg, dict) else None
-            if isinstance(content, list):
-                for p in content:
-                    if (isinstance(p, dict) and p.get('type') == 'tool_use'
-                            and p.get('name') == 'SendMessage'):
-                        recipient, _s, _m = _send_message_fields(
-                            p.get('input'))
-                        sends_to.setdefault(recipient, []).append(n)
-        elif rtype == 'user' and _is_agent_message(rec):
-            sender, body = _parse_agent_message(rec)
-            if sender and not _is_idle_notification(body):
-                replies_from.setdefault(sender, []).append((n, body))
+        for recipient, _body in _message_sends(rec):
+            sends_to.setdefault(recipient, []).append(n)
+        if _is_peer_message(rec) and rec.peer:
+            replies_from.setdefault(rec.peer, []).append((n, rec.text))
 
     # Spawn sites + teammate name join. A respawn reuses the name; the
     # latest spawn (by line) owns the send/reply order joins.
@@ -224,9 +213,9 @@ def _link_map(path):
     for tu_id, info in sorted(
             td.agent_link.items(),
             key=lambda kv: td.agent_to_assistant_line.get(
-                kv[1].get('agent_id'), -1)):
-        aid = info.get('agent_id')
-        agent_path = info.get('agent_path')
+                kv[1]['child_key'], -1)):
+        aid = info['child_key']
+        agent_path = info['child_session']
         spawn_line = td.agent_to_assistant_line.get(aid)
         if spawn_line is None or not agent_path:
             continue
@@ -251,27 +240,15 @@ def _link_map(path):
 
     for name, (aid, agent_path, std, spawn_line, inbound) in by_name.items():
         group_id = ('agent', path, aid)
-        # Teammate-side SendMessage lines with their message text. A
-        # reply joins the send whose text it delivered — stripped, as
-        # ``_parse_agent_message`` strips the body. No recipient filter:
-        # the name a worker addresses ("main", "team-lead", …) need not
-        # match the name the leader goes by, and sends to OTHER peers
-        # simply never match a leader-side reply body.
-        wsends = []
-        for wn, wrec in enumerate(std.records):
-            if not (isinstance(wrec, dict)
-                    and wrec.get('type') == 'assistant'):
-                continue
-            msg = wrec.get('message') or {}
-            content = msg.get('content') if isinstance(msg, dict) else None
-            if not isinstance(content, list):
-                continue
-            for p in content:
-                if (isinstance(p, dict) and p.get('type') == 'tool_use'
-                        and p.get('name') == 'SendMessage'):
-                    _r, _s, wmsg = _send_message_fields(p.get('input'))
-                    wsends.append(
-                        (wn, wmsg.strip() if isinstance(wmsg, str) else ''))
+        # Teammate-side message lines with their body. A reply joins the
+        # send whose text it delivered — stripped, as the parser strips
+        # the delivered body. No recipient filter: the name a worker
+        # addresses ("main", "team-lead", …) need not match the name the
+        # leader goes by, and sends to OTHER peers simply never match a
+        # leader-side reply body.
+        wsends = [(wn, body.strip())
+                  for wn, wrec in enumerate(std.records)
+                  for _r, body in _message_sends(wrec)]
         # Only traffic AFTER the owning spawn joins — an earlier
         # incarnation of a reused name exchanged its own messages, and
         # walking those into this transcript would link them to the
@@ -352,7 +329,7 @@ def _link_label(target_id):
     _src, line = store_source_locator(sess, n)
     td = _scan_tree(sess)
     rec = td.records[n] if 0 <= n < len(td.records) else None
-    what = _oneline(_summarise_message(rec)) if rec else f'line {line}'
+    what = _oneline(_summarise_message(rec)) if rec is not None else f'line {line}'
     if len(what) > 60:
         what = what[:59] + '…'
     return f'↗ {name}:{line}  {what}'

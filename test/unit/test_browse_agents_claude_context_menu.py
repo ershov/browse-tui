@@ -1192,7 +1192,11 @@ class TestCrossLinkJumpVoiceRace(unittest.TestCase):
                      {'type': 'text', 'text': 'AGENT_NEWEST'}]}}) + '\n')
         self.r._DETAIL_LEVEL = 6
         self.target = ('msg', self.ap, 1)
-        self.last_ancestor = ('span', self.ap, 1)
+        # The agent's inbound spawn prompt opens a ``<peer>`` turn; the
+        # target's ``<tool>`` umbrella and the appended voice both sit
+        # under it, so that prompt is the ancestor whose latest voice
+        # (the appended record) competes with the jump target.
+        self.last_ancestor = ('prompt', self.ap, 0)
 
     def tearDown(self):
         b = getattr(self, 'b', None)

@@ -1404,9 +1404,7 @@ def store_child_sessions(session_jsonl_path):
             # Voice stripe: the dispatching assistant call is voice, so
             # the subagent umbrella that represents it carries the
             # assistant-row background colour.
-            bg = _ROW_BG_FOR_KIND.get('subagent')
-            if bg is not None:
-                item.row_bg = bg
+            item.row_bg = _ROW_BG_SPAWN
             out.append(item)
     # Legacy team workers: on the old backend, named agents spawned via
     # the Agent tool run as sibling *sessions*, not agent-*.jsonl files
@@ -1451,13 +1449,17 @@ def store_child_sessions(session_jsonl_path):
         item.subagent_path = agent_path
         item.line_count = count
         item.mtime = st.st_mtime
-        bg = _ROW_BG_FOR_KIND.get('subagent')
-        if bg is not None:
-            item.row_bg = bg
+        item.row_bg = _ROW_BG_SPAWN
         out.append(item)
     # Newest-first ordering matches the rest of the recipe.
     out.sort(key=lambda it: -it.mtime)
     return out
+
+
+def store_mark_orphan(item):
+    """Re-tag a child row the fold could not link to a dispatch site."""
+    item.tag = (f'{item.agent_type} · {item.line_count} msg · orphan · '
+                f'{_human_time(item.mtime)}')
 
 
 _NAME_FILL_LOCK = threading.Lock()
@@ -1564,6 +1566,70 @@ def _session_path_for_sid(sid):
             _SESSION_PATH_BY_SID[sid] = candidate
             return candidate
     return None
+
+
+_HELP_USAGE_TMPL = """\
+Usage: browse-agents-claude [OPTIONS] [PROJECT]
+  -n NUMBER       Cap messages enumerated per session (default: {default}).
+  --session ID    Open the .jsonl for that sessionId directly.
+  --pid PID       Open the .jsonl owned by the running Claude PID.
+  --file PATH     Open an arbitrary .jsonl file directly.
+  --running       Filter projects/sessions to those with a live PID.
+  --item N        After --session/--pid/--file, position the cursor on
+                  line N (1-based) of the resolved transcript.
+  --tree          Show sessions as a tree, grouped by turn (default).
+                  Subagents list in a top block, newest first.
+  --no-tree       Show sessions as a flat reverse-time list.
+  --detail LEVEL  Detail level (default: 1). LEVEL is 1-7 or a word:
+                  1=summary (user prompts + end_turn responses),
+                  2=voice (all speech), 3=edits (+ Edit/Write/NotebookEdit),
+                  4=tools (+ all tool calls), 5=detailed (+ useful
+                  metadata), 6=all (every known record kind),
+                  7=unknown (+ unrecognised record kinds — maintenance
+                  view). Change it live with the '1'-'7' keys.
+  PROJECT         Project directory name under ~/.claude/projects/ to
+                  drill into on launch. Ignored when --session / --pid /
+                  --file is given.\
+"""
+
+
+_HELP_INTRO = """\
+browse-agents-claude — Claude Code project / session / message browser.
+
+Walks ~/.claude/projects/ to surface a four-level tree: projects ->
+sessions -> messages (or subagents) -> subagent messages. Drill into
+a transcript with Right/Alt-Down; preview shows the rendered turn.
+
+  v / V   page the preview (v) / the source .jsonl (V) via $PAGER.
+  e / E   open the preview (e) / the source .jsonl (E) in $EDITOR.
+  m       toggle inline markdown coloring of voice content (only bound
+          when the md2ansi_lib Python module is importable).
+  M       render the preview via $MDCAT / mdcat (external).
+  J / K   jump cursor to next / previous user-or-assistant voice.
+  t       toggle flat / tree view.
+  1-7     detail level: 1 summary, 2 voice, 3 edits, 4 tools,
+          5 detailed, 6 all, 7 unknown (adds unrecognised kinds).
+  Enter   follow a row's [↗] cross-link — every link is two-way: the
+          spawn site pairs with the subagent row, message rows pair
+          with their counterpart in the other transcript; a row with
+          several links opens a menu of targets.
+
+Right-click a row (or the backslash / F1 keys) for a menu: message and
+turn / tool / span umbrella rows offer the source actions above
+(edit / view / id, plus mdcat / toggle on a message); session and subagent
+rows open the transcript and show their path / id. Every row also surfaces a
+directory cluster over its project / cwd / worktree dirs — open in browse-fs,
+run a shell there, browse the git history (a submenu of commits / branches /
+status / stashes / reflog), or browse its .PLAN.md.\
+"""
+
+
+def store_help_usage():
+    return _HELP_USAGE_TMPL.format(default=_MESSAGE_LIMIT)
+
+
+def store_help_intro():
+    return _HELP_INTRO
 
 
 def store_name():
@@ -1694,13 +1760,16 @@ def store_parent_of_child(session_key):
     return sess_path, aid
 
 
-def store_resolve_spawned_child(session_key, tur, tool_input):
+def store_resolve_spawned_child(session_key, call, result):
     """Join an Agent/Task spawn result to its transcript.
 
-    ``tur`` is the user record's ``toolUseResult``, ``tool_input`` the
-    spawning ``tool_use`` part's input. Returns ``(child_key,
-    child_session_key)`` or ``None`` when nothing on disk matches.
+    ``call`` is the spawning tool dict (canon ``spawn``), ``result`` the
+    normalized tool_result record; the join reads the raw user record's
+    ``toolUseResult``. Returns ``(child_key, child_session_key)`` or
+    ``None`` when nothing on disk matches.
     """
+    tur = result.raw.get('toolUseResult')
+    tool_input = call['input']
     if not isinstance(tur, dict):
         return None
     agent_id = tur.get('agentId')
@@ -1843,12 +1912,12 @@ def store_project_preview(project_key):
 #
 # The view code in common/ never touches an agent's storage. Everything it
 # needs comes through the plain module-level functions below, which each
-# agent's 025-store / 045-tail define (DESIGN.md "Store contract" is the
-# normative description). Keys are opaque here except for ``record_key``,
-# a dense 0-based ordinal in transcript order that indexes the cached
-# ``_TreeData.records`` list.
+# agent's 025-store / 035-parse / 045-tail define (DESIGN.md "Store
+# contract" is the normative description). Keys are opaque here except
+# for ``record_key``, a dense 0-based ordinal in transcript order that
+# indexes the cached ``_TreeData.records`` list.
 #
-#   identity      store_name()
+#   identity      store_name()  store_help_intro()  store_help_usage()
 #   startup       store_init()  store_pop_args()  store_resolve_positional(arg)
 #                 store_reset()
 #   projects      store_list_projects()  store_list_sessions(project_key)
@@ -1857,31 +1926,282 @@ def store_project_preview(project_key):
 #   sessions      store_session_exists(session_key)  store_session_item(session_key)
 #                 store_session_info(session_key)  store_session_cwd_and_root(session_key)
 #                 store_context_dirs(project_key, session_key)
-#   children      store_child_sessions(session_key)
+#   children      store_child_sessions(session_key)  store_mark_orphan(item)
 #                 store_child_session(session_key, child_key)
 #                 store_child_source_path(session_key, child_key)
 #                 store_parent_of_child(session_key)
-#                 store_resolve_spawned_child(session_key, tool_result, tool_input)
+#                 store_resolve_spawned_child(session_key, call, result)
 #   source        store_source_path(session_key)
 #                 store_source_locator(session_key, record_key)
 #                 store_source_excerpt({session_key: [record_key, …]})
 #   tail          store_tailable(session_key)  store_tail_open(session_key)
 #                 store_tail_poll(session_key, state)  store_tail_interval()
+#
+# The tail functions yield ``Record`` instances (below); the agent's
+# 035-parse maps its raw objects to them.
+
+
+# ---- normalized record model ---------------------------------------------
+#
+# Every record the view handles is a ``Record``. The agent parser fills
+# the kind, the row presentation hints and the facts the fold / filter /
+# summaries need; ``raw`` keeps the source object for the agent's own
+# preview renderers and the source view.
+
+_KINDS = frozenset([
+    'user_prompt', 'assistant_text', 'thinking', 'tool_call', 'tool_result',
+    'turn_start', 'turn_end', 'compaction', 'system', 'meta', 'unknown',
+])
+
+_TOOL_CANONS = frozenset([
+    'bash', 'read', 'edit', 'write', 'grep', 'glob', 'spawn', 'message',
+    'question', 'webfetch', 'websearch', 'skill', 'mcp', 'other',
+])
+
+# Lowest detail level that shows a record of each kind when the parser
+# leaves ``min_level`` unset. A ``tool_call`` of canon edit/write is 3.
+_DEFAULT_MIN_LEVEL = {
+    'user_prompt': 1, 'assistant_text': 2, 'thinking': 2,
+    'tool_call': 4, 'tool_result': 4,
+    'turn_start': 5, 'turn_end': 5, 'compaction': 5, 'system': 5,
+    'meta': 6, 'unknown': 7,
+}
+_EDIT_CANONS = frozenset(['edit', 'write'])
+
+# Row presentation per kind when the parser leaves ``tag_style`` /
+# ``row_bg`` unset (``None``). The stripe applies to voice records only.
+_DEFAULT_TAG_STYLE = {
+    'user_prompt': 'cyan', 'assistant_text': 'green', 'thinking': 'green',
+    'tool_call': 'green', 'tool_result': '', 'system': 'gray', 'meta': 'dim',
+}
+_DEFAULT_ROW_BG = {
+    'user_prompt': 17, 'assistant_text': 235, 'thinking': 235, 'tool_call': 235,
+}
+
+# Row stripe shared by subagent child rows and the ``<tool:>`` umbrella
+# that dispatched them (the assistant stripe).
+_ROW_BG_SPAWN = 235
+
+
+def new_tool(**fields):
+    """A tool call or result dict with every key present."""
+    tool = {
+        'canon': 'other',   # one of _TOOL_CANONS
+        'name': None,       # the agent's own tool name
+        'call_id': None,    # pairs a result with its call
+        'input': None,      # call arguments (dict or str)
+        'output': None,     # result text
+        'glance': None,     # short result text for the row title; None = output
+        'diff': None,       # unified diff of an edit result
+        'is_error': False,
+        'peer': None,       # canon message: recipient; canon spawn: teammate name
+        'text': None,       # canon message: the message body
+    }
+    tool.update(fields)
+    return tool
+
+
+class Record:
+    """One transcript record in the agent-independent shape."""
+
+    __slots__ = (
+        'key',          # dense ordinal in the session (``None`` outside a session)
+        'kind',         # one of _KINDS
+        'raw',          # the agent's source object
+        'id',           # the agent's record id, when it has one
+        'ts',           # epoch seconds or None
+        'turn_id',      # explicit turn id or None (the fold derives turns)
+        'tag',          # row label; defaults to the kind
+        'tag_style',    # row tag style name; None = kind default, '' = plain
+        'row_bg',       # 256-colour row stripe; None = kind default for voice rows
+        'text',         # plain body: prompt, assistant text, thinking, …
+        'summary',      # parser-supplied row title, or None for the kind default
+        'tools',        # tool call / result dicts (``new_tool``); calls for an
+                        # assistant record, results for a result record
+        'call_id',      # for a record that annotates a call without being a
+                        # call or result (hook output): that call's id
+        'caller_id',    # id of the record that issued the call this record
+                        # answers, when the agent stamps it
+        'peer',         # sender name of inbound agent voice
+        'agent_voice',  # inbound inter-agent voice: 'reply' (a worker's task
+                        # result), 'peer' (another session's message), 'idle'
+                        # (a worker's automatic idle notice); else None
+        'is_voice',     # the record carries speech (drives stripes and jumps)
+        'is_meta',      # injected context, never typed or spoken
+        'end_turn',     # an assistant record that concluded its turn
+        'min_level',    # explicit detail level, or None for the kind default
+        'meta',         # small facts: agent, title, title_by, duration_ms,
+                        # thinking (record also carries readable thinking),
+                        # span_label (finer label for <system> span titles), …
+    )
+
+    def __init__(self, kind, raw, key=None, **fields):
+        self.key = key
+        self.kind = kind
+        self.raw = raw
+        self.id = None
+        self.ts = None
+        self.turn_id = None
+        self.tag = kind
+        self.tag_style = None
+        self.row_bg = None
+        self.text = ''
+        self.summary = None
+        self.tools = []
+        self.call_id = None
+        self.caller_id = None
+        self.peer = None
+        self.agent_voice = None
+        self.is_voice = False
+        self.is_meta = False
+        self.end_turn = False
+        self.min_level = None
+        self.meta = {}
+        for k, v in fields.items():
+            setattr(self, k, v)
+
+    @property
+    def tool(self):
+        """The first tool call / result, or ``None``."""
+        return self.tools[0] if self.tools else None
+
+    def __repr__(self):
+        return f'Record({self.kind!r}, key={self.key!r}, tag={self.tag!r})'
+
+
+# ---- classification on normalized records --------------------------------
+
+
+def _record_min_level(rec):
+    """Minimum detail level (1-7) at which ``rec`` is visible."""
+    if rec.min_level is not None:
+        return rec.min_level
+    if (rec.kind == 'tool_call' and rec.tool is not None
+            and rec.tool['canon'] in _EDIT_CANONS):
+        return 3
+    return _DEFAULT_MIN_LEVEL.get(rec.kind, 7)
+
+
+def _record_tag_style(rec):
+    if rec.tag_style is not None:
+        return rec.tag_style
+    return _DEFAULT_TAG_STYLE.get(rec.kind, '')
+
+
+def _record_row_bg(rec):
+    if rec.row_bg is not None:
+        return rec.row_bg
+    return _DEFAULT_ROW_BG.get(rec.kind) if rec.is_voice else None
+
+
+def _is_inbound_agent_voice(rec):
+    """A worker's reply, a peer session's message or an idle notice."""
+    return rec.agent_voice is not None
+
+
+def _issues_tool_call(rec):
+    """True iff ``rec`` carries tool calls (it is wrapped in a ``<tool:>`` umbrella)."""
+    return bool(rec.tools) and rec.kind != 'tool_result'
+
+
+def _is_turn_root(rec):
+    """A fresh human prompt opens a turn; inbound agent voice does not
+    (``_fold_record`` re-opens the last human turn for it)."""
+    return (rec.kind == 'user_prompt' and rec.is_voice and not rec.is_meta
+            and rec.agent_voice is None)
+
+
+def _is_turn_close(rec):
+    return rec.kind == 'turn_end'
+
+
+def _is_continuation_activity(rec):
+    """Assistant activity (or a tool result) after a turn closed with no
+    new prompt — it belongs to the request that started it."""
+    if rec.kind in ('assistant_text', 'thinking', 'tool_call'):
+        return True
+    return rec.kind == 'tool_result' and not rec.is_meta
+
+
+# ---- row summaries -------------------------------------------------------
+
+
+def _row_tag(rec):
+    """Row tag: the label plus ``· <agent>`` / ``· end_turn`` / ``· thinking``
+    suffixes on assistant rows."""
+    tag = rec.tag
+    if rec.kind in ('assistant_text', 'thinking', 'tool_call'):
+        agent = rec.meta.get('agent')
+        if agent:
+            tag = f'{tag} · {agent}'
+        if rec.end_turn:
+            tag = f'{tag} · end_turn'
+        elif rec.meta.get('thinking'):
+            tag = f'{tag} · thinking'
+    return tag
+
+
+def _summarise_message(rec):
+    """One-line row title (newlines kept; callers ``_oneline`` it)."""
+    if rec.summary is not None:
+        return rec.summary
+    kind = rec.kind
+    if kind == 'tool_call':
+        tool = rec.tool
+        name = tool['name'] or '?'
+        extra = _tool_use_one_line(tool)
+        return f'🔧 {name}({extra})' if extra else f'🔧 {name}'
+    if kind == 'tool_result':
+        return f'↳ tool_result: {_tool_result_one_line(rec.tool)}'
+    if kind == 'thinking' and rec.text:
+        return f'🧠 thinking: {_trim(rec.text, 5000)}'
+    text = _trim(rec.text, 5000)
+    if kind in ('user_prompt', 'assistant_text', 'thinking'):
+        label = f'{rec.tag}/meta' if rec.is_meta else rec.tag
+        return f'{label}: {text}' if text else label
+    return text or rec.tag
+
+
+def _tool_use_one_line(tool):
+    """Compact one-line summary of a call's input, by canon."""
+    inp = tool['input'] if isinstance(tool['input'], dict) else {}
+    canon = tool['canon']
+    if canon == 'bash':
+        return _trim(inp.get('command', ''), 5000)
+    if canon in ('read', 'edit', 'write'):
+        return inp.get('file_path', '')
+    if canon == 'grep':
+        return f'/{inp.get("pattern", "")}/'
+    if canon == 'glob':
+        return inp.get('pattern', '')
+    if canon == 'spawn':
+        return inp.get('subagent_type', '?')
+    if canon == 'skill':
+        return inp.get('skill', '?')
+    if canon == 'message':
+        return f'→ {tool["peer"] or "?"}: {inp.get("summary", "")}'
+    return ''
+
+
+def _tool_result_one_line(tool):
+    """One-liner peek at a result for the row title: its glance, else output."""
+    text = tool['glance'] if tool['glance'] is not None else tool['output']
+    return _trim(text or '', 5000)
 # }}} # SOURCE END: common/030-model.py
 
 # SOURCE START: claude/035-parse.py {{{
-# ---- message classification + summary ------------------------------------
+# ---- raw Claude record → normalized Record -------------------------------
 #
 # Claude Code .jsonl files mix several record shapes:
-#   1. ``type=last-prompt``     — bookmark for the most recent prompt.
-#   2. ``type=permission-mode`` — permission-mode change events.
-#   3. ``type=user``            — user turn (string or content-list).
-#   4. ``type=assistant``       — assistant turn (always content-list).
-#   5. anything else            — fall back to ``message``.
+#   1. ``type=user`` / ``type=assistant`` — the conversation (string or
+#      content-list ``message.content``; tool_use / tool_result parts).
+#   2. ``type=system`` / ``type=attachment`` — framing and injected context.
+#   3. bookkeeping types (``last-prompt``, ``ai-title``, …) → ``meta``.
+#   4. anything else → ``unknown``.
 #
-# The summary is one line, capped at 80 chars, and is intentionally lossy:
-# the preview pane shows the full pretty-printed JSON, so we optimise the
-# title for fast visual scanning.
+# ``_parse_record`` maps one raw object to one ``Record``. Row labels keep
+# the raw type names (``tag``); the summary is one line, intentionally
+# lossy (the preview shows the full record), optimised for scanning.
 
 
 _TAG_STYLE_FOR_KIND = {
@@ -1890,8 +2210,6 @@ _TAG_STYLE_FOR_KIND = {
     'assistant':           'green',
     'attachment':          'blue',
     'system':              'gray',
-    'tool_use':            'yellow',
-    'tool_result':         'yellow',
     # Inter-agent voice: leader → worker SendMessage (send), the
     # worker → leader task-notification reply (reply), and an inbound
     # peer message from another session (peer).
@@ -1942,11 +2260,6 @@ _ROW_BG_FOR_KIND = {
     # talking" even though they slot into the open turn rather than
     # opening a new one.
     'queue-operation':  17,
-    # Subagent umbrella rows: the dispatching assistant ``Agent`` /
-    # ``Task`` call IS voice (it's how the assistant tells the
-    # subagent what to do), so the umbrella inherits the assistant
-    # stripe.
-    'subagent':        235,
     # Outbound leader→worker SendMessage: agent-to-agent traffic shares
     # the assistant stripe — the whole point is to keep it off the human
     # stripe (17).
@@ -1959,6 +2272,30 @@ _ROW_BG_FOR_KIND = {
     # from both the human stripe (17) and the assistant stripe (235).
     'agent-peer':       22,
 }
+
+
+_CANON_BY_TOOL = {
+    'Bash': 'bash',
+    'Read': 'read',
+    'Edit': 'edit', 'MultiEdit': 'edit', 'NotebookEdit': 'edit',
+    'Write': 'write',
+    'Grep': 'grep',
+    'Glob': 'glob',
+    'Agent': 'spawn', 'Task': 'spawn',
+    'SendMessage': 'message',
+    'AskUserQuestion': 'question',
+    'WebFetch': 'webfetch',
+    'WebSearch': 'websearch',
+    'Skill': 'skill',
+}
+
+
+def _tool_canon(name):
+    if name in _CANON_BY_TOOL:
+        return _CANON_BY_TOOL[name]
+    if isinstance(name, str) and name.startswith('mcp__'):
+        return 'mcp'
+    return 'other'
 
 
 def _is_voice(obj):
@@ -2051,7 +2388,7 @@ _L3_USEFUL = frozenset([
 
 
 # Recognised-but-noise record kinds, pinned at level 6 (all). Level 7
-# (unknown) is a maintenance view: ``_record_min_level``'s fallthrough
+# (unknown) is a maintenance view: ``_min_level_of``'s fallthrough
 # returns 7 only for a type / system subtype / attachment type the
 # recipe does not recognise anywhere — neither in a tier above, nor
 # here, nor in ``_ATTACH_FORMATTERS`` / ``_METADATA_TYPES`` (the
@@ -2087,12 +2424,11 @@ def _is_empty_thinking_only(rec):
 
     Signature-only (redacted/encrypted) thinking blocks store a
     ``signature`` but no readable ``thinking`` text. A turn made up
-    solely of such parts has nothing to render — ``_extract_text`` skips
-    thinking, so it summarises as the bare ``<N parts>`` shape — so
-    ``_record_min_level`` sinks it to the ``all`` (6) tier. A thinking
-    part with actual text, or any other part (tool_use / tool_result /
-    text) alongside, fails the test — readable thinking is voice
-    (level 2), other machinery stays at level 4 (3 for an edit tool).
+    solely of such parts has nothing to render, so ``_min_level_of``
+    sinks it to the ``all`` (6) tier. A thinking part with actual text,
+    or any other part (tool_use / tool_result / text) alongside, fails
+    the test — readable thinking is voice (level 2), other machinery
+    stays at level 4 (3 for an edit tool).
     """
     msg = rec.get('message') if isinstance(rec.get('message'), dict) else {}
     content = msg.get('content')
@@ -2160,7 +2496,15 @@ def _is_edit_tool_record(rec):
     )
 
 
-def _record_min_level(rec):
+def _is_fresh_prompt(rec):
+    """A human-typed prompt: user voice that is neither injected context
+    nor inbound agent voice."""
+    return (isinstance(rec, dict) and rec.get('type') == 'user'
+            and not rec.get('isMeta') and _is_voice(rec)
+            and not (_is_task_notification(rec) or _is_agent_message(rec)))
+
+
+def _min_level_of(rec):
     """Minimum detail level at which ``rec`` becomes visible (1-7).
 
     Whitelist semantics: only records we recognise are promoted to a
@@ -2197,7 +2541,7 @@ def _record_min_level(rec):
     # stamped ``isMeta`` (the gate below would bury them) and queued
     # deliveries are ``queue-operation`` records (the enqueue rule
     # below would promote them to the human prompt tier).
-    if _is_inbound_agent_voice(rec):
+    if _is_task_notification(rec) or _is_agent_message(rec):
         return 2
     # Injected context is never part of the lived conversation — it
     # outranks even its own type, so check it first.
@@ -2213,7 +2557,7 @@ def _record_min_level(rec):
         # ``enqueue`` is a prompt the user typed while Claude was busy,
         # so it belongs with the prompts (its ``popAll`` consumption
         # echo stays at voice to avoid a dupe).
-        if (_is_turn_root(rec)
+        if (_is_fresh_prompt(rec)
                 or (_is_end_turn(rec) and _has_spoken_text(rec))
                 or (rec.get('type') == 'queue-operation'
                     and rec.get('operation') == 'enqueue')):
@@ -2260,89 +2604,17 @@ def _record_min_level(rec):
     return 7
 
 
-def _passes_filter(item_id, td=None):
-    """True iff ``item_id`` should be visible at the current detail level.
+def _row_label(obj):
+    """Row label for one raw record: its ``type`` / message role, refined
+    for the inter-agent voice channel.
 
-    Used by every Item builder to derive ``hidden`` and by the live-tail
-    worker to detect when a hidden umbrella has crossed the visibility
-    threshold. A row is shown iff its *minimum* level (the lowest
-    ``_DETAIL_LEVEL`` it becomes visible at) is ``<= _DETAIL_LEVEL``.
-
-    Predicate body, by id tag:
-      * ``('msg', jsonl, n)``    → ``_record_min_level(td.records[n])``
-      * ``('prompt', jsonl, n)`` → always (turns open at a turn-root
-                                    user prompt, level 1)
-      * ``('tool', jsonl, n)``   → its assistant record's min level
-                                    (a bare tool_use is level 4, an
-                                    edit/write tool level 3), but
-                                    promoted to the voice tier (level 2)
-                                    when the umbrella wraps a resolvable
-                                    subagent (same rule as
-                                    ``_tool_umbrella_item``)
-      * ``('span', jsonl, n)``   → min level over the span's members
-      * ``('agent', …)``         → always (subagent umbrella; we don't
-                                    peek into other files at filter time)
-      * any other id             → always (be permissive; framework
-                                    error rows and ``('trunc', …)``
-                                    fillers stay visible)
-    """
-    if _DETAIL_LEVEL >= 7:
-        return True
-    if not isinstance(item_id, tuple) or not item_id:
-        return True
-    tag = item_id[0]
-    if tag == 'agent':
-        return True
-    if tag not in ('msg', 'prompt', 'tool', 'span'):
-        return True
-    path, n = item_id[1], item_id[2]
-    if td is None:
-        td = _TREE_CACHE.get(path)
-    if td is None:
-        return True
-    if tag == 'prompt':
-        return True
-    if tag == 'tool':
-        if 0 <= n < len(td.records):
-            rec = td.records[n]
-            if isinstance(rec, dict):
-                # A ``<tool:Agent>`` umbrella that dispatches a
-                # resolvable subagent reads as voice-tier (level 2) —
-                # dispatch sites keep the same tier as the subagent
-                # rows in the top block, same rule that gives them
-                # their row stripe in ``_tool_umbrella_item``.
-                # Otherwise it carries its assistant record's own min
-                # level (a bare tool_use is level 4; an edit/write
-                # tool is level 3).
-                if _tool_umbrella_wraps_subagent(rec, td):
-                    return _DETAIL_LEVEL >= 2
-                return _record_min_level(rec) <= _DETAIL_LEVEL
-        return True
-    if tag == 'span':
-        for rec in td.span_records.get(n, []):
-            if isinstance(rec, dict) and _record_min_level(rec) <= _DETAIL_LEVEL:
-                return True
-        return False
-    # tag == 'msg'
-    if 0 <= n < len(td.records):
-        rec = td.records[n]
-        if isinstance(rec, dict):
-            return _record_min_level(rec) <= _DETAIL_LEVEL
-    return True
-
-
-def _kind_of(obj):
-    """Best-effort classifier for one JSONL record.
-
-    Most records map to their raw ``type`` / message role. Three
-    refinements for the inter-agent voice channel: an assistant record
-    whose salient content is a ``SendMessage`` tool_use is the leader
-    voicing a worker (``agent-send``); a ``<task-notification>`` is the
-    worker's reply back (``agent-reply``); a peer session's message is
-    ``agent-peer``. The inbound two match both the delivered ``user``
-    record and its queued ``queue-operation`` echo. Each drives its own
-    stripe + tag style — without this, inbound agent voice would
-    inherit the human stripe and be mis-attributed.
+    An assistant record whose salient content is a ``SendMessage``
+    tool_use is the leader voicing a worker (``agent-send``); a
+    ``<task-notification>`` is the worker's reply back (``agent-reply``);
+    a peer session's message is ``agent-peer``. The inbound two match
+    both the delivered ``user`` record and its queued ``queue-operation``
+    echo. Each drives its own stripe + tag style — without this, inbound
+    agent voice would inherit the human stripe and be mis-attributed.
     """
     if _is_send_message(obj):
         return 'agent-send'
@@ -2359,51 +2631,322 @@ def _kind_of(obj):
     return 'message'
 
 
-def _row_tag(kind, rec):
-    """Row tag for ``rec``.
-
-    Adds ``· <attributionAgent>`` to assistant rows inside subagent
-    transcripts so the user can see which sub-type produced the turn
-    (e.g. ``assistant · general-purpose``), ``· end_turn`` to the
-    turn-concluding responses so the final word(s) of a turn stand out
-    in the row list, and ``· thinking`` to running-commentary rows
-    (readable thinking). Other record kinds get the bare kind label.
-    """
-    tag = kind
-    if kind == 'assistant' and isinstance(rec, dict):
-        attr = rec.get('attributionAgent')
-        if attr:
-            tag = f'{tag} · {attr}'
-        if _is_end_turn(rec):
-            tag = f'{tag} · end_turn'
-        elif _thinking_text(rec):
-            tag = f'{tag} · thinking'
-    return tag
+def _iso_epoch(iso):
+    """Epoch seconds of an ISO-8601 stamp, or ``None``."""
+    if not iso:
+        return None
+    try:
+        dt = datetime.datetime.fromisoformat(str(iso).replace('Z', '+00:00'))
+    except (ValueError, TypeError):
+        return None
+    if dt.tzinfo is None:
+        dt = dt.replace(tzinfo=datetime.timezone.utc)
+    try:
+        return dt.timestamp()
+    except (OverflowError, OSError, ValueError):
+        return None
 
 
-def _summarise_message(obj):
-    """One-line summary of a JSONL entry, capped at 400 chars.
+def _text_parts(content):
+    """Every non-empty ``text`` part (or the bare string), joined."""
+    if isinstance(content, str):
+        return content
+    if not isinstance(content, list):
+        return ''
+    return '\n\n'.join(
+        p['text'] for p in content
+        if isinstance(p, dict) and p.get('type') == 'text' and p.get('text')
+    )
 
-    Per-type formatters peel off the salient field without re-parsing
-    the record — every input field comes from ``obj`` directly so this
-    stays O(line) inside ``_list_messages``.
-    """
-    t = obj.get('type', '')
 
-    # Inbound agent voice — delivered (``user`` record) or queued
-    # (``queue-operation``) — summarises off the parsed wrapper fields,
-    # not the raw XML. Checked ahead of the per-type formatters so the
-    # queued echo reads like the delivered record.
-    if _is_task_notification(obj):
-        d = _parse_task_notification(_inbound_voice_text(obj) or '')
+def _tool_result_output(content):
+    """Text of a tool_result part's ``content`` (string or text sub-parts)."""
+    if isinstance(content, str):
+        return content
+    if isinstance(content, list):
+        return '\n'.join(
+            p.get('text') or '' for p in content
+            if isinstance(p, dict) and p.get('type') == 'text'
+        )
+    return None
+
+
+def _tool_result_glance(tur):
+    """Structured ``toolUseResult`` glance for the row title, or ``None``
+    to fall back to the raw output text."""
+    if isinstance(tur, dict):
+        if 'stdout' in tur:
+            return _trim(tur.get('stdout', ''), 5000) or '(no output)'
+        if 'numFiles' in tur:
+            return f'{tur["numFiles"]} files'
+        if 'agentType' in tur:
+            return f'{tur["agentType"]} → {tur.get("status", "?")}'
+        if 'taskId' in tur:
+            sc = tur.get('statusChange') or {}
+            return f'#{tur["taskId"]} {sc.get("from", "?")}→{sc.get("to", "?")}'
+        if 'commandName' in tur:
+            return tur['commandName']
+        return None
+    if isinstance(tur, str):
+        return _trim(tur, 5000)
+    return None
+
+
+def _tur_diff(tur):
+    """Unified diff of an edit result's ``structuredPatch``, or ``None``."""
+    if not (isinstance(tur, dict) and isinstance(tur.get('structuredPatch'), list)):
+        return None
+    try:
+        return _structured_patch_to_unified(
+            tur['structuredPatch'], tur.get('filePath') or '')
+    except Exception:
+        return None
+
+
+def _parse_record(raw, key=None):
+    """Map one raw Claude record to a ``Record``."""
+    label = _row_label(raw)
+    rec = Record(
+        'unknown', raw, key,
+        tag=label,
+        tag_style=_TAG_STYLE_FOR_KIND.get(label, ''),
+        id=raw.get('uuid') or None,
+        ts=_iso_epoch(raw.get('timestamp')),
+        is_voice=_is_voice(raw),
+        is_meta=bool(raw.get('isMeta')),
+        min_level=_min_level_of(raw),
+    )
+    if rec.is_voice:
+        rec.row_bg = _ROW_BG_FOR_KIND.get(label)
+
+    # Inbound agent voice (delivered ``user`` record or queued echo):
+    # summary from the parsed wrapper, body as text.
+    if _is_task_notification(raw):
+        text = _inbound_voice_text(raw) or ''
+        d = _parse_task_notification(text)
+        rec.agent_voice = 'reply'
+        rec.text = d['result'] or text
         bits = [b for b in (d['task_id'], d['status'], d['summary']) if b]
-        return '← ' + ' · '.join(bits) if bits else '← task-notification'
-    if _is_agent_message(obj):
-        sender, body = _parse_agent_message(obj)
-        body = _summarise_json_body(body) or _trim(body, 5000)
-        return f'← {sender}: {body}' if sender else f'← {body}'
+        rec.summary = '← ' + ' · '.join(bits) if bits else '← task-notification'
+    elif _is_agent_message(raw):
+        sender, body = _parse_agent_message(raw)
+        rec.agent_voice = 'idle' if _is_idle_notification(body) else 'peer'
+        rec.peer = sender or None
+        rec.text = body
+        short = _summarise_json_body(body) or _trim(body, 5000)
+        rec.summary = f'← {sender}: {short}' if sender else f'← {short}'
 
-    # Metadata records — surface the salient field.
+    t = raw.get('type')
+    msg = raw.get('message') if isinstance(raw.get('message'), dict) else {}
+    content = msg.get('content', '')
+    parts = [p for p in content if isinstance(p, dict)] \
+        if isinstance(content, list) else []
+
+    if t == 'user':
+        rec.caller_id = raw.get('sourceToolAssistantUUID') or None
+        rec.call_id = raw.get('sourceToolUseID') or None
+        results = [p for p in parts if p.get('type') == 'tool_result']
+        if results:
+            rec.kind = 'tool_result'
+            tur = raw.get('toolUseResult')
+            diff = _tur_diff(tur)
+            for p in results:
+                rec.tools.append(new_tool(
+                    call_id=p.get('tool_use_id'),
+                    output=_tool_result_output(p.get('content')),
+                    is_error=bool(p.get('is_error')),
+                    diff=diff,
+                ))
+            glance = _tool_result_glance(tur)
+            for tool in rec.tools:
+                tool['glance'] = glance
+            rec.text = _text_parts(content)
+        else:
+            rec.kind = 'user_prompt'
+            if rec.agent_voice is None:
+                rec.text = _text_parts(content)
+        return rec
+
+    if t == 'assistant':
+        rec.end_turn = msg.get('stop_reason') == 'end_turn'
+        if raw.get('attributionAgent'):
+            rec.meta['agent'] = raw['attributionAgent']
+        for p in parts:
+            if p.get('type') != 'tool_use':
+                continue
+            name = p.get('name')
+            inp = p.get('input') or {}
+            tool = new_tool(canon=_tool_canon(name), name=name,
+                            call_id=p.get('id'), input=inp)
+            if tool['canon'] == 'message':
+                recipient, _s, message = _send_message_fields(inp)
+                tool['peer'] = recipient
+                tool['text'] = message if isinstance(message, str) else ''
+            elif tool['canon'] == 'spawn' and isinstance(inp, dict):
+                tool['peer'] = inp.get('name') or None
+            rec.tools.append(tool)
+        spoken = _text_parts(content)
+        think = _thinking_text(raw)
+        if think:
+            rec.meta['thinking'] = True
+        if spoken.strip():
+            rec.kind = 'assistant_text'
+            rec.text = spoken
+        elif think:
+            rec.kind = 'thinking'
+            rec.text = think
+        elif rec.tools:
+            rec.kind = 'tool_call'
+        elif _is_empty_thinking_only(raw):
+            rec.kind = 'thinking'
+            rec.meta['encrypted'] = True
+        else:
+            rec.kind = 'assistant_text'
+        return rec
+
+    if t == 'system':
+        sub = raw.get('subtype', '')
+        body = raw.get('content') or ''
+        if sub == 'compact_boundary':
+            rec.kind = 'compaction'
+        elif sub == 'turn_duration':
+            rec.kind = 'turn_end'
+            rec.meta['duration_ms'] = raw.get('durationMs', 0)
+        else:
+            rec.kind = 'system'
+        rec.text = body if isinstance(body, str) else ''
+        rec.summary = _system_summary(raw, sub)
+        rec.meta['span_label'] = f'sys:{sub}' if sub else 'system'
+        return rec
+
+    if t == 'attachment':
+        a = raw.get('attachment') if isinstance(raw.get('attachment'), dict) else {}
+        rec.kind = 'system'
+        rec.call_id = a.get('toolUseID') or None
+        rec.summary = _attachment_summary(a)
+        rec.meta['span_label'] = f'att:{a.get("type", "")}'
+        return rec
+
+    if t == 'queue-operation':
+        rec.kind = 'meta'
+        rec.text = raw.get('content') or ''
+        if rec.summary is None:
+            rec.summary = f'queue {raw.get("operation", "?")}: {_trim(rec.text, 5000)}'
+        return rec
+
+    if t in _METADATA_TYPES or t in _KNOWN_TYPE_NOISE:
+        rec.kind = 'meta'
+        rec.summary = _metadata_summary(raw, t)
+        if t == 'ai-title':
+            rec.meta['title'] = raw.get('aiTitle')
+            rec.meta['title_by'] = 'agent'
+        elif t == 'custom-title':
+            rec.meta['title'] = raw.get('customTitle')
+            rec.meta['title_by'] = 'user'
+        return rec
+
+    # Unrecognised: keep whatever text it carries.
+    text = _extract_text(content) if content else ''
+    role = msg.get('role') or raw.get('role') or t or ''
+    rec.text = text
+    if role and text:
+        rec.summary = f'{role}: {_trim(text, 5000)}'
+    elif not role and not text:
+        rec.summary = '(empty)'
+    return rec
+
+
+def _system_summary(obj, sub):
+    if sub == 'turn_duration':
+        ms = obj.get('durationMs', 0)
+        return f'⏱ turn {ms/1000:.2f}s · {obj.get("messageCount", 0)} msgs'
+    if sub == 'api_error':
+        return f'‼ api_error'
+    if sub == 'local_command':
+        cmd = _trim(obj.get('content') or obj.get('command', ''), 5000)
+        return f'$ {cmd}' if cmd else 'local_command'
+    if sub == 'compact_boundary':
+        trig = (obj.get('compactMetadata') or {}).get('trigger', '')
+        base = obj.get('content') or 'Conversation compacted'
+        return f'♻ {base}' + (f' ({trig})' if trig else '')
+    if sub == 'model_refusal_fallback':
+        return f'⚠ refusal fallback: {_trim(obj.get("content", ""), 5000)}'
+    if sub == 'away_summary':
+        return f'away: {_trim(obj.get("content", ""), 5000)}'
+    if sub == 'informational':
+        return f'ℹ {_trim(obj.get("content", ""), 5000)}'
+    if sub == 'agents_killed':
+        return '■ agents killed'
+    return f'system: {sub}' if sub else 'system'
+
+
+def _attachment_summary(a):
+    """Row title for an attachment: the most salient field per subtype."""
+    sub = a.get('type', '?')
+    if sub == 'file':
+        return f'📎 file: {a.get("displayPath", a.get("filename", ""))}'
+    if sub == 'queued_command':
+        p = _trim(a.get('prompt', ''), 5000)
+        return f'📥 queued: {p}'
+    if sub == 'hook_success':
+        ok = a.get('exitCode', 0) == 0
+        return (f'{"✓" if ok else "✗"} hook {a.get("hookName", "?")} '
+                f'({a.get("hookEvent", "?")})')
+    if sub == 'hook_additional_context':
+        return f'+ ctx from {a.get("hookName", "?")}'
+    if sub == 'task_reminder':
+        return f'🔔 reminder ({a.get("itemCount", 0)})'
+    if sub == 'skill_listing':
+        return f'📚 skills: {a.get("skillCount", 0)}'
+    if sub == 'mcp_instructions_delta':
+        return (f'mcp Δ: +{len(a.get("addedNames") or [])}'
+                f' -{len(a.get("removedNames") or [])}')
+    if sub == 'deferred_tools_delta':
+        return (f'tools Δ: +{len(a.get("addedNames") or [])}'
+                f' -{len(a.get("removedNames") or [])}')
+    if sub == 'date_change':
+        return f'📅 date: {a.get("newDate", "?")}'
+    if sub == 'diagnostics':
+        n = len(a.get('files') or [])
+        return f'diagnostics: {n} files'
+    if sub == 'command_permissions':
+        return f'allowed: {", ".join(a.get("allowedTools") or [])}'
+    if sub == 'ultrathink_effort':
+        return '🧠 ultrathink'
+    if sub == 'total_tokens_reminder':
+        n = _total_tokens_left(a)
+        return (f'⛽ {_human_count(n)} tokens left' if n is not None
+                else '⛽ tokens left')
+    if sub == 'agent_listing_delta':
+        return (f'agents Δ: +{len(a.get("addedTypes") or [])}'
+                f' -{len(a.get("removedTypes") or [])}')
+    if sub == 'batching_reminder_sent':
+        return '🔔 batching reminder'
+    if sub == 'bash_output_audience_note':
+        return 'bash output audience note'
+    if sub == 'nested_memory':
+        return f'📎 memory: {a.get("displayPath", a.get("path", ""))}'
+    if sub == 'read_truncation_notice':
+        return f'✂ {_trim(a.get("banner", ""), 5000)}'
+    if sub in ('auto_mode', 'plan_mode'):
+        return f'⇆ {sub.replace("_", " ")}'
+    if sub == 'silent_turn_reminder':
+        return f'🔔 {_trim(a.get("text", ""), 5000)}'
+    if sub == 'already_read_file':
+        return (f'📎 already read: '
+                f'{a.get("displayPath", a.get("filename", ""))}')
+    if sub == 'hook_cancelled':
+        return (f'✗ hook {a.get("hookName", "?")} cancelled '
+                f'({a.get("hookEvent", "?")})')
+    if sub == 'invoked_skills':
+        names = [s.get('name', '?') for s in a.get('skills') or []
+                 if isinstance(s, dict)]
+        return f'📚 invoked: {", ".join(names)}'
+    return f'📎 {sub}'
+
+
+def _metadata_summary(obj, t):
+    """Row title for a bookkeeping record: the salient field per type."""
     if t == 'last-prompt':
         prompt = _trim(obj.get('lastPrompt', ''), 5000)
         return f'last-prompt: {prompt}' if prompt else 'last-prompt'
@@ -2442,9 +2985,6 @@ def _summarise_message(obj):
     if t == 'speculation-accept':
         ms = obj.get('timeSavedMs', 0)
         return f'speculation-accept: +{ms/1000:.1f}s saved'
-    if t == 'queue-operation':
-        c = _trim(obj.get('content', ''), 5000)
-        return f'queue {obj.get("operation", "?")}: {c}'
     if t == 'file-history-snapshot':
         snap = obj.get('snapshot') or {}
         n = len(snap) if isinstance(snap, dict) else '?'
@@ -2469,185 +3009,7 @@ def _summarise_message(obj):
         cost = obj.get('totalCostUSD') or 0
         return (f'💰 ${cost:.2f} · {obj.get("totalLinesAdded", 0)}+'
                 f'/{obj.get("totalLinesRemoved", 0)}−')
-    if t == 'atis-latch':
-        return 'atis-latch'
-
-    # System events.
-    if t == 'system':
-        sub = obj.get('subtype', '')
-        if sub == 'turn_duration':
-            ms = obj.get('durationMs', 0)
-            return f'⏱ turn {ms/1000:.2f}s · {obj.get("messageCount", 0)} msgs'
-        if sub == 'api_error':
-            return f'‼ api_error'
-        if sub == 'local_command':
-            cmd = _trim(obj.get('content') or obj.get('command', ''), 5000)
-            return f'$ {cmd}' if cmd else 'local_command'
-        if sub == 'compact_boundary':
-            trig = (obj.get('compactMetadata') or {}).get('trigger', '')
-            base = obj.get('content') or 'Conversation compacted'
-            return f'♻ {base}' + (f' ({trig})' if trig else '')
-        if sub == 'model_refusal_fallback':
-            return f'⚠ refusal fallback: {_trim(obj.get("content", ""), 5000)}'
-        if sub == 'away_summary':
-            return f'away: {_trim(obj.get("content", ""), 5000)}'
-        if sub == 'informational':
-            return f'ℹ {_trim(obj.get("content", ""), 5000)}'
-        if sub == 'agents_killed':
-            return '■ agents killed'
-        return f'system: {sub}' if sub else 'system'
-
-    # Attachment — pick the most salient field per subtype.
-    if t == 'attachment':
-        a = obj.get('attachment') if isinstance(obj.get('attachment'), dict) else {}
-        sub = a.get('type', '?')
-        if sub == 'file':
-            return f'📎 file: {a.get("displayPath", a.get("filename", ""))}'
-        if sub == 'queued_command':
-            p = _trim(a.get('prompt', ''), 5000)
-            return f'📥 queued: {p}'
-        if sub == 'hook_success':
-            ok = a.get('exitCode', 0) == 0
-            return (f'{"✓" if ok else "✗"} hook {a.get("hookName", "?")} '
-                    f'({a.get("hookEvent", "?")})')
-        if sub == 'hook_additional_context':
-            return f'+ ctx from {a.get("hookName", "?")}'
-        if sub == 'task_reminder':
-            return f'🔔 reminder ({a.get("itemCount", 0)})'
-        if sub == 'skill_listing':
-            return f'📚 skills: {a.get("skillCount", 0)}'
-        if sub == 'mcp_instructions_delta':
-            return (f'mcp Δ: +{len(a.get("addedNames") or [])}'
-                    f' -{len(a.get("removedNames") or [])}')
-        if sub == 'deferred_tools_delta':
-            return (f'tools Δ: +{len(a.get("addedNames") or [])}'
-                    f' -{len(a.get("removedNames") or [])}')
-        if sub == 'date_change':
-            return f'📅 date: {a.get("newDate", "?")}'
-        if sub == 'diagnostics':
-            n = len(a.get('files') or [])
-            return f'diagnostics: {n} files'
-        if sub == 'command_permissions':
-            return f'allowed: {", ".join(a.get("allowedTools") or [])}'
-        if sub == 'ultrathink_effort':
-            return '🧠 ultrathink'
-        if sub == 'total_tokens_reminder':
-            n = _total_tokens_left(a)
-            return (f'⛽ {_human_count(n)} tokens left' if n is not None
-                    else '⛽ tokens left')
-        if sub == 'agent_listing_delta':
-            return (f'agents Δ: +{len(a.get("addedTypes") or [])}'
-                    f' -{len(a.get("removedTypes") or [])}')
-        if sub == 'batching_reminder_sent':
-            return '🔔 batching reminder'
-        if sub == 'bash_output_audience_note':
-            return 'bash output audience note'
-        if sub == 'nested_memory':
-            return f'📎 memory: {a.get("displayPath", a.get("path", ""))}'
-        if sub == 'read_truncation_notice':
-            return f'✂ {_trim(a.get("banner", ""), 5000)}'
-        if sub in ('auto_mode', 'plan_mode'):
-            return f'⇆ {sub.replace("_", " ")}'
-        if sub == 'silent_turn_reminder':
-            return f'🔔 {_trim(a.get("text", ""), 5000)}'
-        if sub == 'already_read_file':
-            return (f'📎 already read: '
-                    f'{a.get("displayPath", a.get("filename", ""))}')
-        if sub == 'hook_cancelled':
-            return (f'✗ hook {a.get("hookName", "?")} cancelled '
-                    f'({a.get("hookEvent", "?")})')
-        if sub == 'invoked_skills':
-            names = [s.get('name', '?') for s in a.get('skills') or []
-                     if isinstance(s, dict)]
-            return f'📚 invoked: {", ".join(names)}'
-        return f'📎 {sub}'
-
-    # User / assistant — peek into content for salient fragment.
-    msg = obj.get('message') if isinstance(obj.get('message'), dict) else {}
-    role = msg.get('role') or obj.get('role') or t or ''
-    content = msg.get('content', obj.get('content', ''))
-
-    # Assistant with only tool_use parts → format as the tool call.
-    if role == 'assistant' and isinstance(content, list):
-        only_tool = [p for p in content
-                     if isinstance(p, dict) and p.get('type') == 'tool_use']
-        any_text = any(isinstance(p, dict) and p.get('type') == 'text'
-                       and (p.get('text') or '').strip()
-                       for p in content)
-        # Readable thinking with no spoken text → running commentary;
-        # surface it under the thinking marker (spoken text wins).
-        if not any_text:
-            think = _thinking_text(obj)
-            if think:
-                return f'🧠 thinking: {_trim(think, 5000)}'
-        if only_tool and not any_text:
-            tu = only_tool[0]
-            name = tu.get('name', '?')
-            inp = tu.get('input') or {}
-            extra = _tool_use_one_line(name, inp)
-            return f'🔧 {name}({extra})' if extra else f'🔧 {name}'
-
-    # User with tool_result → distinct prefix + a glance at the output.
-    if role == 'user' and isinstance(content, list):
-        for p in content:
-            if isinstance(p, dict) and p.get('type') == 'tool_result':
-                return f'↳ tool_result: {_tool_result_one_line(obj, p)}'
-
-    text = _extract_text(content)
-    text = _trim(text, 5000)
-    if obj.get('isMeta') and role:
-        role = f'{role}/meta'
-    if role:
-        return f'{role}: {text}' if text else role
-    return text or '(empty)'
-
-
-def _tool_use_one_line(name, inp):
-    """Compact one-line summary of a tool's input for the row title."""
-    if name == 'Bash':
-        return _trim(inp.get('command', ''), 5000)
-    if name in ('Read', 'Edit', 'Write'):
-        return inp.get('file_path', '')
-    if name == 'Grep':
-        return f'/{inp.get("pattern", "")}/'
-    if name == 'Glob':
-        return inp.get('pattern', '')
-    if name in ('Agent', 'Task'):
-        return inp.get('subagent_type', '?')
-    if name == 'Skill':
-        return inp.get('skill', '?')
-    if name == 'SendMessage':
-        recipient, summary, _ = _send_message_fields(inp)
-        return f'→ {recipient}: {summary}'
-    return ''
-
-
-def _tool_result_one_line(obj, part):
-    """One-liner peek at a tool_result for the row title."""
-    tur = obj.get('toolUseResult')
-    if isinstance(tur, dict):
-        if 'stdout' in tur:
-            return _trim(tur.get('stdout', ''), 5000) or '(no output)'
-        if 'numFiles' in tur:
-            return f'{tur["numFiles"]} files'
-        if 'agentType' in tur:
-            return f'{tur["agentType"]} → {tur.get("status", "?")}'
-        if 'taskId' in tur:
-            sc = tur.get('statusChange') or {}
-            return f'#{tur["taskId"]} {sc.get("from", "?")}→{sc.get("to", "?")}'
-        if 'commandName' in tur:
-            return tur['commandName']
-    if isinstance(tur, str):
-        return _trim(tur, 5000)
-    # Fall back to the raw content text.
-    content = part.get('content')
-    if isinstance(content, str):
-        return _trim(content, 5000)
-    if isinstance(content, list):
-        for p in content:
-            if isinstance(p, dict) and p.get('type') == 'text':
-                return _trim(p.get('text', ''), 5000)
-    return ''
+    return t
 
 
 def _extract_text(content):
@@ -2685,6 +3047,202 @@ def _extract_text(content):
     if content is None:
         return ''
     return str(content)
+
+
+def _send_message_fields(inp):
+    """``(recipient, summary, message)`` from a ``SendMessage`` input.
+
+    The tool duplicates its fields: prefer ``recipient``/``message``,
+    fall back to ``to``/``content``. ``summary`` is a short label.
+    """
+    inp = inp if isinstance(inp, dict) else {}
+    recipient = inp.get('recipient') or inp.get('to') or '?'
+    summary = inp.get('summary', '')
+    message = inp.get('message')
+    if not message:
+        message = inp.get('content', '')
+    return recipient, summary, message
+
+
+def _is_send_message(rec):
+    """True iff ``rec`` is an assistant record whose salient content is a
+    ``SendMessage`` tool_use (mirrors the AskUserQuestion voice branch)."""
+    if not isinstance(rec, dict):
+        return False
+    msg = rec.get('message') if isinstance(rec.get('message'), dict) else {}
+    if (rec.get('type') or msg.get('role')) != 'assistant':
+        return False
+    content = msg.get('content')
+    if not isinstance(content, list):
+        return False
+    for p in content:
+        if (isinstance(p, dict) and p.get('type') == 'tool_use'
+                and p.get('name') == 'SendMessage'):
+            return True
+    return False
+
+
+_TASK_NOTIFY_PREFIX = '<task-notification>'
+
+# Map the wrapper's hyphenated tags onto the dict keys we surface.
+_TASK_NOTIFY_TAGS = {
+    'task-id': 'task_id',
+    'tool-use-id': 'tool_use_id',
+    'output-file': 'output_file',
+    'status': 'status',
+    'summary': 'summary',
+    'result': 'result',
+}
+
+
+def _parse_task_notification(text):
+    """Peel a ``<task-notification>`` wrapper into its tagged fields.
+
+    Returns ``{task_id, tool_use_id, output_file, status, summary,
+    result}`` — every key present, missing tags resolving to ``''``.
+    ``result`` is kept as raw markdown (rendered later via ``_md_voice``).
+    A single non-greedy regex per tag, not a full XML parse: the payload
+    is machine-emitted with a fixed shape and ``result`` is free-form
+    markdown that would choke a strict parser.
+    """
+    text = text or ''
+    out = {v: '' for v in _TASK_NOTIFY_TAGS.values()}
+    for tag, key in _TASK_NOTIFY_TAGS.items():
+        m = re.search(rf'<{tag}>(.*?)</{tag}>', text, re.DOTALL)
+        if m:
+            out[key] = m.group(1).strip()
+    return out
+
+
+def _inbound_voice_text(rec):
+    """Text payload used for inbound-agent-voice detection, or None.
+
+    Two record shapes can carry an inbound agent message: a ``user``
+    record (the delivered turn — text in ``message.content``) and a
+    ``queue-operation`` record (the same payload queued while the
+    session was busy — raw text in ``content``; queue records never
+    carry an ``origin`` field, so detection there is text-shape only).
+    """
+    if not isinstance(rec, dict):
+        return None
+    if rec.get('type') == 'queue-operation':
+        return rec.get('content') or ''
+    msg = rec.get('message') if isinstance(rec.get('message'), dict) else {}
+    if (rec.get('type') or msg.get('role')) != 'user':
+        return None
+    return _extract_text(msg.get('content', ''))
+
+
+def _is_task_notification(rec):
+    """True iff ``rec`` carries a ``<task-notification>`` wrapper (the
+    worker→leader inbound reply) — as a delivered ``user`` record or a
+    queued ``queue-operation`` echo.
+
+    Mirrors ``_is_send_message`` for the outbound half: detection is by
+    the wrapper prefix on the record's text content, tolerant of the
+    bare-string and single-text-part content shapes.
+    """
+    text = _inbound_voice_text(rec)
+    return text is not None and text.lstrip().startswith(_TASK_NOTIFY_PREFIX)
+
+
+# Injected preamble + wrapper of an inbound peer message (another
+# session's SendMessage delivered into this one as a ``user`` record).
+# The wrapper tag has two known spellings: ``<agent-message from="…">``
+# and the older ``<teammate-message teammate_id="…">``.
+_AGENT_MSG_PREAMBLE = 'Another Claude session sent a message:'
+_AGENT_MSG_RE = re.compile(
+    r'<(agent-message|teammate-message)\b([^>]*)>\n?(.*?)\n?</\1>',
+    re.DOTALL)
+_AGENT_MSG_FROM_RE = re.compile(r'\b(?:from|teammate_id)="([^"]*)"')
+
+
+def _is_agent_message(rec):
+    """True iff ``rec`` carries an inbound peer message (another
+    session's SendMessage → this one) — as a delivered ``user`` record
+    or a queued ``queue-operation`` echo.
+
+    Primary signal for delivered records: the structured ``origin``
+    field — ``{"kind": "peer", "from": <sender>, ...}``. The text-shape
+    check (fixed preamble / ``<agent-message>`` / ``<teammate-message>``
+    wrapper) is the only signal for queue records (they never carry
+    ``origin``) and the LEGACY fallback for ``user`` records written
+    before ``origin`` existed — narrow it back to queue records once
+    pre-``origin`` transcripts stop mattering.
+    """
+    if isinstance(rec, dict):
+        origin = rec.get('origin')
+        if isinstance(origin, dict) and origin.get('kind') == 'peer':
+            return True
+    text = _inbound_voice_text(rec)
+    if text is None:
+        return False
+    text = text.lstrip()
+    return (text.startswith(_AGENT_MSG_PREAMBLE)
+            or text.startswith('<agent-message')
+            or text.startswith('<teammate-message'))
+
+
+def _parse_agent_message(rec):
+    """Peel an inbound peer message into ``(sender, body)``.
+
+    Sender comes from ``origin.from`` when present, else from the
+    wrapper's ``from="…"`` / ``teammate_id="…"`` attribute. Body is the
+    markdown inside the wrapper; a record with neither wrapper nor
+    preamble falls back to its whole text.
+    """
+    text = _inbound_voice_text(rec) or ''
+    origin = rec.get('origin')
+    sender = origin.get('from', '') if isinstance(origin, dict) else ''
+    m = _AGENT_MSG_RE.search(text)
+    if m:
+        if not sender:
+            fm = _AGENT_MSG_FROM_RE.search(m.group(2))
+            sender = fm.group(1) if fm else ''
+        body = m.group(3).strip()
+    else:
+        body = text.strip()
+        if body.startswith(_AGENT_MSG_PREAMBLE):
+            body = body[len(_AGENT_MSG_PREAMBLE):].strip()
+    return sender, body
+
+
+def _summarise_json_body(body):
+    """Compact row one-liner for a JSON-object peer-message body, or
+    ``None`` (non-JSON, malformed almost-JSON and non-object JSON keep
+    the raw text — the preview renders objects field-wise and still
+    pretty-prints other JSON).
+
+    Known shapes summarise off their salient fields (idle_notification
+    → reason + summary); any other object gets a short type/first-key
+    marker instead of a full raw-JSON line.
+    """
+    if not body.lstrip().startswith('{'):
+        return None
+    try:
+        parsed = json.loads(body)
+    except (TypeError, ValueError):
+        return None
+    if not isinstance(parsed, dict) or not parsed:
+        return None
+    if parsed.get('type') == 'idle_notification':
+        bits = [b for b in ('idle', parsed.get('idleReason'),
+                            parsed.get('summary')) if b]
+        return _trim(' · '.join(str(b) for b in bits), 5000)
+    t = parsed.get('type')
+    if isinstance(t, str) and t:
+        return f'{{{t}}}'
+    return f'{{{next(iter(parsed))}: …}}'
+
+def _is_idle_notification(body):
+    """True for a teammate's auto-generated idle notice (not a real reply)."""
+    body = body.lstrip()
+    if not body.startswith('{'):
+        return False
+    try:
+        return json.loads(body).get('type') == 'idle_notification'
+    except Exception:
+        return False
 
 
 # ---- preview rendering ---------------------------------------------------
@@ -2943,9 +3501,9 @@ def _render_tool_umbrella(item_id):
     if not (0 <= assistant_line < len(td.records)):
         return None
     rec = td.records[assistant_line]
-    if not isinstance(rec, dict):
+    if rec is None:
         return None
-    msg = rec.get('message') or {}
+    msg = rec.raw.get('message') or {}
     content = msg.get('content') if isinstance(msg, dict) else None
     if not isinstance(content, list):
         return None
@@ -2960,9 +3518,8 @@ def _render_tool_umbrella(item_id):
     # result record carries one (occasionally more) tool_result content
     # part; map id -> (tur, raw_content, is_error) for O(1) pairing.
     results = {}
-    for child in td.tool_children.get(rec.get('uuid'), []):
-        if not isinstance(child, dict):
-            continue
+    for child_rec in td.tool_children.get(assistant_line, []):
+        child = child_rec.raw
         c_msg = child.get('message') or {}
         c_content = c_msg.get('content') if isinstance(c_msg, dict) else None
         if not isinstance(c_content, list):
@@ -3746,192 +4303,6 @@ def _fmt_aq_one(q, answer, annotation):  # noqa: ARG001 — annotation reserved
 
 def _fmt_tool_use_ask_user_question(inp):
     return _md_voice(_fmt_ask_user_question(inp.get('questions')))
-
-
-def _send_message_fields(inp):
-    """``(recipient, summary, message)`` from a ``SendMessage`` input.
-
-    The tool duplicates its fields: prefer ``recipient``/``message``,
-    fall back to ``to``/``content``. ``summary`` is a short label.
-    """
-    inp = inp if isinstance(inp, dict) else {}
-    recipient = inp.get('recipient') or inp.get('to') or '?'
-    summary = inp.get('summary', '')
-    message = inp.get('message')
-    if not message:
-        message = inp.get('content', '')
-    return recipient, summary, message
-
-
-def _is_send_message(rec):
-    """True iff ``rec`` is an assistant record whose salient content is a
-    ``SendMessage`` tool_use (mirrors the AskUserQuestion voice branch)."""
-    if not isinstance(rec, dict):
-        return False
-    msg = rec.get('message') if isinstance(rec.get('message'), dict) else {}
-    if (rec.get('type') or msg.get('role')) != 'assistant':
-        return False
-    content = msg.get('content')
-    if not isinstance(content, list):
-        return False
-    for p in content:
-        if (isinstance(p, dict) and p.get('type') == 'tool_use'
-                and p.get('name') == 'SendMessage'):
-            return True
-    return False
-
-
-_TASK_NOTIFY_PREFIX = '<task-notification>'
-
-# Map the wrapper's hyphenated tags onto the dict keys we surface.
-_TASK_NOTIFY_TAGS = {
-    'task-id': 'task_id',
-    'tool-use-id': 'tool_use_id',
-    'output-file': 'output_file',
-    'status': 'status',
-    'summary': 'summary',
-    'result': 'result',
-}
-
-
-def _parse_task_notification(text):
-    """Peel a ``<task-notification>`` wrapper into its tagged fields.
-
-    Returns ``{task_id, tool_use_id, output_file, status, summary,
-    result}`` — every key present, missing tags resolving to ``''``.
-    ``result`` is kept as raw markdown (rendered later via ``_md_voice``).
-    A single non-greedy regex per tag, not a full XML parse: the payload
-    is machine-emitted with a fixed shape and ``result`` is free-form
-    markdown that would choke a strict parser.
-    """
-    text = text or ''
-    out = {v: '' for v in _TASK_NOTIFY_TAGS.values()}
-    for tag, key in _TASK_NOTIFY_TAGS.items():
-        m = re.search(rf'<{tag}>(.*?)</{tag}>', text, re.DOTALL)
-        if m:
-            out[key] = m.group(1).strip()
-    return out
-
-
-def _inbound_voice_text(rec):
-    """Text payload used for inbound-agent-voice detection, or None.
-
-    Two record shapes can carry an inbound agent message: a ``user``
-    record (the delivered turn — text in ``message.content``) and a
-    ``queue-operation`` record (the same payload queued while the
-    session was busy — raw text in ``content``; queue records never
-    carry an ``origin`` field, so detection there is text-shape only).
-    """
-    if not isinstance(rec, dict):
-        return None
-    if rec.get('type') == 'queue-operation':
-        return rec.get('content') or ''
-    msg = rec.get('message') if isinstance(rec.get('message'), dict) else {}
-    if (rec.get('type') or msg.get('role')) != 'user':
-        return None
-    return _extract_text(msg.get('content', ''))
-
-
-def _is_task_notification(rec):
-    """True iff ``rec`` carries a ``<task-notification>`` wrapper (the
-    worker→leader inbound reply) — as a delivered ``user`` record or a
-    queued ``queue-operation`` echo.
-
-    Mirrors ``_is_send_message`` for the outbound half: detection is by
-    the wrapper prefix on the record's text content, tolerant of the
-    bare-string and single-text-part content shapes.
-    """
-    text = _inbound_voice_text(rec)
-    return text is not None and text.lstrip().startswith(_TASK_NOTIFY_PREFIX)
-
-
-# Injected preamble + wrapper of an inbound peer message (another
-# session's SendMessage delivered into this one as a ``user`` record).
-# The wrapper tag has two known spellings: ``<agent-message from="…">``
-# and the older ``<teammate-message teammate_id="…">``.
-_AGENT_MSG_PREAMBLE = 'Another Claude session sent a message:'
-_AGENT_MSG_RE = re.compile(
-    r'<(agent-message|teammate-message)\b([^>]*)>\n?(.*?)\n?</\1>',
-    re.DOTALL)
-_AGENT_MSG_FROM_RE = re.compile(r'\b(?:from|teammate_id)="([^"]*)"')
-
-
-def _is_agent_message(rec):
-    """True iff ``rec`` carries an inbound peer message (another
-    session's SendMessage → this one) — as a delivered ``user`` record
-    or a queued ``queue-operation`` echo.
-
-    Primary signal for delivered records: the structured ``origin``
-    field — ``{"kind": "peer", "from": <sender>, ...}``. The text-shape
-    check (fixed preamble / ``<agent-message>`` / ``<teammate-message>``
-    wrapper) is the only signal for queue records (they never carry
-    ``origin``) and the LEGACY fallback for ``user`` records written
-    before ``origin`` existed — narrow it back to queue records once
-    pre-``origin`` transcripts stop mattering.
-    """
-    if isinstance(rec, dict):
-        origin = rec.get('origin')
-        if isinstance(origin, dict) and origin.get('kind') == 'peer':
-            return True
-    text = _inbound_voice_text(rec)
-    if text is None:
-        return False
-    text = text.lstrip()
-    return (text.startswith(_AGENT_MSG_PREAMBLE)
-            or text.startswith('<agent-message')
-            or text.startswith('<teammate-message'))
-
-
-def _parse_agent_message(rec):
-    """Peel an inbound peer message into ``(sender, body)``.
-
-    Sender comes from ``origin.from`` when present, else from the
-    wrapper's ``from="…"`` / ``teammate_id="…"`` attribute. Body is the
-    markdown inside the wrapper; a record with neither wrapper nor
-    preamble falls back to its whole text.
-    """
-    text = _inbound_voice_text(rec) or ''
-    origin = rec.get('origin')
-    sender = origin.get('from', '') if isinstance(origin, dict) else ''
-    m = _AGENT_MSG_RE.search(text)
-    if m:
-        if not sender:
-            fm = _AGENT_MSG_FROM_RE.search(m.group(2))
-            sender = fm.group(1) if fm else ''
-        body = m.group(3).strip()
-    else:
-        body = text.strip()
-        if body.startswith(_AGENT_MSG_PREAMBLE):
-            body = body[len(_AGENT_MSG_PREAMBLE):].strip()
-    return sender, body
-
-
-def _summarise_json_body(body):
-    """Compact row one-liner for a JSON-object peer-message body, or
-    ``None`` (non-JSON, malformed almost-JSON and non-object JSON keep
-    the raw text — the preview renders objects field-wise and still
-    pretty-prints other JSON).
-
-    Known shapes summarise off their salient fields (idle_notification
-    → reason + summary); any other object gets a short type/first-key
-    marker instead of a full raw-JSON line.
-    """
-    if not body.lstrip().startswith('{'):
-        return None
-    try:
-        parsed = json.loads(body)
-    except (TypeError, ValueError):
-        return None
-    if not isinstance(parsed, dict) or not parsed:
-        return None
-    if parsed.get('type') == 'idle_notification':
-        bits = [b for b in ('idle', parsed.get('idleReason'),
-                            parsed.get('summary')) if b]
-        return _trim(' · '.join(str(b) for b in bits), 5000)
-    t = parsed.get('type')
-    if isinstance(t, str) and t:
-        return f'{{{t}}}'
-    return f'{{{next(iter(parsed))}: …}}'
 
 
 def _fmt_tool_use_send_message(inp):
@@ -4812,7 +5183,7 @@ def _turn_root_ts(path, n):
     if not (0 <= root_line < len(td.records)):
         return None
     root = td.records[root_line]
-    return root.get('timestamp') if isinstance(root, dict) else None
+    return root.raw.get('timestamp') if root is not None else None
 
 
 def _fmt_chrome(obj, turn_root_ts=None):
@@ -4889,31 +5260,28 @@ _RENDERERS = {
 # ---- tree builder (#299) -------------------------------------------------
 #
 # Tree mode rebuilds the in-session children listing as an actual tree
-# instead of a reverse-time flat list. The structure follows ``parentUuid``
-# (the only field that gives reliable chain integrity across every
-# record type — see /promptId investigation notes), with one wrinkle:
-# user prompts get their own ``promptId``; when a child's
-# ``inheritedPromptId`` (= own pid OR parent's pid) differs from its
-# parent's, the parent link is broken and the child becomes a turn-root
-# at the top level. That nests each turn cleanly under its prompt while
-# keeping all the non-voice metadata records as siblings at root.
+# instead of a reverse-time flat list: a flat sequence of turns (opened
+# by a ``user_prompt`` record, closed by the next ``turn_end`` or the
+# next prompt) interleaved with ``<system>`` spans of out-of-turn
+# records; inside a turn each record that issues tool calls owns the
+# results and annotations that pair with it by call id.
 #
 # The scan is cached; subsequent calls within one session are O(1).
 # Cache eviction is explicit — ``get_children(None)`` (Ctrl-R /
 # ``ctx.refresh()``) clears ``_TREE_CACHE`` + ``_TAIL_STATE``; the
 # live-tail worker keeps the cached ``_TreeData`` in sync with the
-# file as it grows, so no time-based invalidation is needed.
+# session as it grows, so no time-based invalidation is needed.
 
 
-_TREE_CACHE = {}   # path → TreeData
+_TREE_CACHE = {}   # session_key → _TreeData
 
-# Per-path mutex so two threads (children worker + preview worker) can't
+# Per-session mutex so two threads (children worker + preview worker) can't
 # both fully-scan the same huge transcript concurrently. Without this,
 # the cursor-on-open path's chain has to wait for whichever scan finishes
 # *last* under GIL contention — empirically ~doubles the wait on a 77MB
 # file. With the mutex, the first thread runs the scan, the second
 # blocks briefly, then sees the populated _TREE_CACHE and returns.
-_SCAN_LOCKS = {}            # path → threading.Lock
+_SCAN_LOCKS = {}            # session_key → threading.Lock
 _SCAN_LOCKS_LOCK = threading.Lock()
 _TREE_MODE = True  # default; --no-tree CLI flag or 't' action flips it.
 # Detail level: a record is visible iff its *minimum* level (see
@@ -4925,146 +5293,61 @@ _TREE_MODE = True  # default; --no-tree CLI flag or 't' action flips it.
 _DETAIL_LEVEL = 1
 
 
-_TREE_METADATA_TYPES = frozenset([
-    # records that show up as their own roots — they carry no
-    # parentUuid and don't participate in the conversation chain.
-    'summary', 'ai-title', 'custom-title', 'last-prompt', 'task-summary',
-    'tag', 'agent-name', 'agent-color', 'agent-setting', 'pr-link',
-    'mode', 'permission-mode', 'worktree-state', 'content-replacement',
-    'file-history-snapshot', 'attribution-snapshot', 'speculation-accept',
-    'queue-operation', 'marble-origami-commit', 'marble-origami-snapshot',
-    'progress',
-])
-
-
 class _TreeData:
     """Cached tree-structure view of one session transcript.
 
-    The shape is span-based and ignores ``parentUuid`` for structure.
-    ``parentUuid`` is just a write-time linked-list back-pointer (see
-    ``sessionStorage.ts:1066`` in claude-code: ``parentUuid =
-    message.uuid`` after every chain-participant append). Using it
-    literally as a tree parent produces 15-deep cascades of attachments
-    under tool_results under attachments. The actual conversation
-    structure is way flatter:
+    Records are ``Record`` instances (``None`` for placeholders) and every
+    index is keyed by record key:
 
-      * The session is a flat sequence of "turns" interleaved with
-        runs of out-of-turn metadata.
-      * A turn opens at a "user voice" record (user record carrying
-        text content, not a tool_result; not ``isMeta``) and closes at
-        the next ``system/turn_duration`` record (or at the next user
-        voice, whichever comes first).
-      * Everything between open/close is a turn member.
-      * Anything outside a turn — preamble, gaps between turns, file
-        tail — gets folded into a synthetic ``<system>`` umbrella span
-        so the top level doesn't blow up with one row per metadata
-        record.
-
-    Inside a turn, one semantic relationship is nested:
-
-      * tool execution group: an assistant record with a ``tool_use``
-        content part becomes the parent of (a) the matching user
-        tool_result (paired via ``tool_use_id``) and (b) any attachment
-        records carrying a matching ``toolUseID`` (PreToolUse/
-        PostToolUse hook outputs).
-
-    Fields:
-
-    * ``records``         — parsed records in file order, indices
-                            align with line numbers.
-    * ``by_uuid``         — ``{uuid: record}``.
-    * ``line_of``         — ``{uuid: line_number}``.
-    * ``roots_in_order``  — list of root-entry dicts in file order:
-                            ``{'kind':'turn','rec':<r>,'line':n}`` or
-                            ``{'kind':'span','start':n,'records':[…]}``.
-    * ``turn_direct``     — ``{turn_root_uuid: [recs]}`` — turn members
-                            that render directly under the turn (i.e.,
-                            NOT records that got re-parented under a
-                            tool_use as part of the tool execution group).
-    * ``tool_children``   — ``{assistant_uuid: [recs]}`` — the
-                            tool_result + hook attachments + isMeta
-                            back-pointers that pair with this assistant
-                            record's tool_use part. Drives the second
-                            layer of nesting inside a turn.
-    * ``span_records``    — ``{span_start_line: [recs]}`` — members of
-                            each ``<system>`` umbrella.
-    * ``agent_link``      — ``{tool_use_id: {agent_id, agent_path,
-                            assistant_uuid}}`` for every Agent/Task
-                            tool_use whose tool_result resolved a
-                            subagent transcript on disk.
-    * ``assistant_has_tool_use`` — ``{assistant_uuid}`` set; True iff the
-                            assistant record at this line carries a
-                            ``tool_use`` content part (i.e. it should be
-                            wrapped in a ``<tool:Name>`` umbrella).
-    * ``tool_to_turn_root_line`` — ``{assistant_line: turn_root_line}``
-                            — maps a ``<tool:>`` umbrella to its
-                            containing ``<prompt>`` umbrella.
-    * ``agent_to_assistant_line`` — ``{agent_id: assistant_line}`` —
-                            maps a ``<subagent>`` group to its
-                            dispatch site (the dispatching
-                            assistant's line).
-    * ``tool_use_name_of`` — ``{assistant_uuid: tool_name}`` — first
-                            tool_use part's name (for the umbrella
-                            title prefix).
-
-    Per-record attrs:
-      * ``rec['_tree_forked_from']`` — record explicitly forked from
-        an earlier uuid (``forkedFrom`` field).
+    * ``records``         — records in transcript order, index = key.
+    * ``key_of_id``       — ``{record.id: key}`` for records with an id.
+    * ``roots_in_order``  — root entries in order:
+                            ``{'kind':'turn','rec':<r>,'line':key}`` or
+                            ``{'kind':'span','start':key,'records':[…]}``.
+    * ``turn_direct``     — ``{turn_root_key: [recs]}``: turn members that
+                            render directly under the turn (not the ones
+                            re-parented under a tool-call record).
+    * ``tool_children``   — ``{call_record_key: [recs]}``: the results and
+                            annotations paired with that record's calls.
+    * ``span_records``    — ``{span_start_key: [recs]}``.
+    * ``agent_link``      — ``{call_id: {child_key, child_session,
+                            assistant_key}}`` for every spawn call whose
+                            result resolved a child transcript.
+    * ``parent_id_of``    — ``{key: parent umbrella id}`` for leaf rows.
+    * ``tool_to_turn_root_line`` — ``{call_record_key: turn_root_key}``.
+    * ``agent_to_assistant_line`` — ``{child_key: call_record_key}``: a
+                            child row's dispatch site.
     """
 
-    __slots__ = ('records', 'by_uuid', 'line_of', 'roots_in_order',
+    __slots__ = ('records', 'key_of_id', 'roots_in_order',
                  'turn_direct', 'tool_children', 'span_records',
-                 'agent_link', 'records_line', 'parent_id_of',
-                 'assistant_has_tool_use', 'tool_to_turn_root_line',
-                 'agent_to_assistant_line', 'tool_use_name_of',
+                 'agent_link', 'parent_id_of',
+                 'tool_to_turn_root_line', 'agent_to_assistant_line',
                  'voice_count', 'latest_voice_line',
                  'ai_title', 'custom_title', 'link_map')
 
     def __init__(self):
         self.records = []
-        self.by_uuid = {}
-        self.line_of = {}
+        self.key_of_id = {}
         self.roots_in_order = []
         self.turn_direct = {}
         self.tool_children = {}
         self.span_records = {}
         self.agent_link = {}
-        # id(rec) → line_no — looking up the line of a record without
-        # needing a uuid (metadata records often have none).
-        self.records_line = {}
-        # line_no → parent_id — the parent **umbrella** id for that
-        # line's leaf row. One of: ``('prompt', sess, n)``,
-        # ``('tool', sess, n)``, or ``('span', sess, n)``. Top-level
-        # rows (the umbrellas themselves) are absent — their parent
-        # link lives in tool_to_turn_root_line / agent_to_assistant_line
-        # or is None.
         self.parent_id_of = {}
-        # Assistant records that carry at least one tool_use content
-        # part. Drives the ``<tool:Name>`` umbrella wrapping.
-        self.assistant_has_tool_use = set()
-        # ``<tool:>`` → its containing ``<prompt>`` umbrella.
         self.tool_to_turn_root_line = {}
-        # ``<subagent>`` → its dispatching assistant's line (the
-        # dispatch site; drives top-block ordering).
         self.agent_to_assistant_line = {}
-        # assistant_uuid → name of first tool_use content part, for the
-        # ``<tool:Name>`` umbrella's title prefix.
-        self.tool_use_name_of = {}
         # Cached count of voice-bearing records — populated lazily by
         # ``_fmt_scope_card`` and invalidated by tail appends that
         # bring in new voice records.
         self.voice_count = None
-        # Line number of the most-recent voice record seen during the
-        # scan (None if no voice record yet). Updated eagerly inside
-        # the scan loop so consumers don't have to re-walk records[].
-        # Used by the cursor-on-open path to land on the latest voice
-        # without an upfront synchronous full-file pass on the main
-        # thread.
+        # Key of the most-recent voice record seen during the scan
+        # (None if no voice record yet); the cursor-on-open path lands
+        # on it without re-walking records[].
         self.latest_voice_line = None
-        # Session titles, captured during the fold (ai-title records
-        # are re-generated as the session grows — the last one wins;
-        # custom-title is the user's explicit rename). Tail appends
-        # keep them current.
+        # Session titles captured during the fold (the agent's title is
+        # re-generated as the session grows — the last one wins; the
+        # user's title outranks it). Tail appends keep them current.
         self.ai_title = None
         self.custom_title = None
         # Lazy cross-link map (built by ``_link_map`` on first use,
@@ -5072,94 +5355,31 @@ class _TreeData:
         self.link_map = None
 
 
-def _is_inbound_agent_voice(rec):
-    """True iff ``rec`` is inbound agent voice — a worker's
-    ``<task-notification>`` reply or a peer session's message. Both are
-    ``user``-shaped records that nobody typed."""
-    return _is_task_notification(rec) or _is_agent_message(rec)
-
-
-def _is_turn_root(rec):
-    """A turn root is a fresh user prompt — text content, not synthetic.
-
-    Inbound agent voice is excluded even though it is user-shaped voice:
-    a worker's reply or a peer's message belongs to the human request
-    that spawned it, so ``_fold_record`` re-opens the last human turn
-    for it instead of letting it masquerade as a new prompt (falling
-    back to rooting only when the file has no prior turn).
-    """
-    if not isinstance(rec, dict):
-        return False
-    if rec.get('type') != 'user':
-        return False
-    if rec.get('isMeta'):
-        return False
-    return _is_voice(rec) and not _is_inbound_agent_voice(rec)
-
-
-def _is_turn_close(rec):
-    """``system/turn_duration`` is the post-turn marker."""
-    return (isinstance(rec, dict)
-            and rec.get('type') == 'system'
-            and rec.get('subtype') == 'turn_duration')
-
-
-def _is_continuation_activity(rec):
-    """Leader activity that can follow a ``turn_duration`` close.
-
-    Newer leaders keep working after the turn closes (autonomous
-    continuations, marked by ``atis-latch`` records) with no new user
-    prompt; ``turn_duration`` can even land between a tool_use and its
-    tool_result. Such activity — an assistant record, or a user record
-    carrying tool_result parts — belongs to the request that started
-    it, so ``_fold_record`` re-opens the last turn for it. Pure
-    metadata records (mode, last-prompt, atis-latch, ai-title,
-    file-history-snapshot, ...) are not activity and keep folding into
-    between-turn spans.
-    """
-    t = rec.get('type')
-    if t == 'assistant':
-        return True
-    if t != 'user' or rec.get('isMeta'):
-        return False
-    msg = rec.get('message')
-    content = msg.get('content') if isinstance(msg, dict) else None
-    if not isinstance(content, list):
-        return False
-    return any(isinstance(p, dict) and p.get('type') == 'tool_result'
-               for p in content)
-
-
 class _ScanCursor:
-    """Mutable per-file state-machine cursor for the bulk + tail fold.
+    """Mutable per-session state-machine cursor for the bulk + tail fold.
 
     Holds the open-turn / open-span context plus the per-turn
-    ``tool_use_id → assistant_uuid`` registry so each newly-arrived
-    record can be classified online (no second pass over a buffered
-    turn). Persists in ``_TAIL_STATE`` between worker ticks so a
-    record arriving in tick 2 sees the same registry the bulk scan
-    or tick 1 was building.
+    ``call_id → call record key`` registry so each newly-arrived record
+    can be classified online (no second pass over a buffered turn).
+    Persists in ``_TAIL_STATE`` between worker ticks so a record
+    arriving in tick 2 sees the same registry the bulk scan or tick 1
+    was building.
     """
 
-    __slots__ = ('turn_open_uuid', 'tool_owner', 'span_start',
-                 'last_turn_uuid')
+    __slots__ = ('turn_open', 'tool_owner', 'span_start', 'last_turn')
 
     def __init__(self):
-        self.turn_open_uuid = None
-        # tool_use_id → owning assistant_uuid (within the open turn).
-        # Cleared on turn close.
-        self.tool_owner = {}
-        # Line number of the first record of the currently-open span,
-        # or None when not inside a span.
-        self.span_start = None
-        # uuid of the most recent turn root — survives turn close so
-        # inbound agent voice or continuation activity arriving between
-        # turns can re-open it.
-        self.last_turn_uuid = None
+        self.turn_open = None       # key of the open turn's root
+        self.tool_owner = {}        # call_id → owning record key; cleared on turn close
+        self.span_start = None      # key of the open span's first record
+        # Most recent turn root — survives turn close so inbound agent
+        # voice or continuation activity arriving between turns can
+        # re-open it.
+        self.last_turn = None
 
 
 def _fold_record(td, cur, rec, n, path):
-    """Fold one record at line ``n`` into ``td`` using ``cur``.
+    """Fold one record with key ``n`` into ``td`` using ``cur``.
 
     Returns a set of parent umbrella ids whose visible child list grew
     (caller turns these into ``update_data`` patches). Bulk scan
@@ -5168,139 +5388,101 @@ def _fold_record(td, cur, rec, n, path):
     dirty = set()
     if rec is None:
         return dirty
-    if not isinstance(rec, dict):
-        return dirty
 
-    # Basic record bookkeeping (parallels the bulk scan's first pass).
-    td.records_line[id(rec)] = n
-    uuid = rec.get('uuid')
-    if uuid:
-        td.by_uuid[uuid] = rec
-        td.line_of[uuid] = n
-    if rec.get('forkedFrom'):
-        rec['_tree_forked_from'] = rec['forkedFrom']
-    # Session titles — fold order is file order, so the last one wins.
-    if rec.get('type') == 'ai-title':
-        td.ai_title = rec.get('aiTitle')
-    elif rec.get('type') == 'custom-title':
-        td.custom_title = rec.get('customTitle')
+    if rec.id:
+        td.key_of_id[rec.id] = n
+    title = rec.meta.get('title')
+    if title:
+        if rec.meta.get('title_by') == 'user':
+            td.custom_title = title
+        else:
+            td.ai_title = title
 
     is_root = _is_turn_root(rec)
 
     # --- inbound agent voice with no open turn: the reply belongs to
     # the human request that spawned it, so re-open the last turn — the
-    # reply AND the leader's handling of it (until the next
-    # turn_duration) fold under that prompt. Post-``turn_duration``
-    # continuation activity (``_is_continuation_activity``) re-opens
-    # the same way. A file with no prior turn (resumed/truncated
-    # transcript) falls back: voice roots itself, keeping the
-    # <reply>/<peer> umbrella; activity falls through to the span path.
-    if (not is_root and cur.turn_open_uuid is None
+    # reply AND the leader's handling of it (until the next turn_end)
+    # fold under that prompt. Post-close continuation activity
+    # (``_is_continuation_activity``) re-opens the same way. A file with
+    # no prior turn (resumed/truncated transcript) falls back: voice
+    # roots itself, keeping the <reply>/<peer> umbrella; activity falls
+    # through to the span path.
+    if (not is_root and cur.turn_open is None
             and (_is_inbound_agent_voice(rec)
                  or _is_continuation_activity(rec))):
-        if (cur.last_turn_uuid is not None
-                and cur.last_turn_uuid in td.turn_direct):
+        if cur.last_turn is not None and cur.last_turn in td.turn_direct:
             # Close any open between-turns span (mirrors the turn-root
             # branch) — otherwise it would leak across the re-opened
             # turn and swallow post-turn records into one umbrella.
             cur.span_start = None
-            cur.turn_open_uuid = cur.last_turn_uuid
+            cur.turn_open = cur.last_turn
             cur.tool_owner = {}
         elif _is_inbound_agent_voice(rec):
             is_root = True
 
     # --- turn root: opens a new <prompt> umbrella, closes any open span.
     if is_root:
-        if cur.span_start is not None:
-            # Span closed by this turn root; the records list stored
-            # in td.span_records is live-shared with td.roots_in_order
-            # so no copy needed here.
-            cur.span_start = None
-        cur.turn_open_uuid = uuid
-        cur.last_turn_uuid = uuid
+        cur.span_start = None
+        cur.turn_open = n
+        cur.last_turn = n
         cur.tool_owner = {}
-        if uuid is not None:
-            td.turn_direct[uuid] = []
+        td.turn_direct[n] = []
         td.roots_in_order.append({'kind': 'turn', 'rec': rec, 'line': n})
         td.parent_id_of[n] = ('prompt', path, n)
         dirty.add(('session', path))   # new root-level umbrella
         return dirty
 
     # --- record inside an open turn.
-    if cur.turn_open_uuid is not None:
-        turn_root_line = td.line_of.get(cur.turn_open_uuid)
-        turn_uuid = cur.turn_open_uuid
+    if cur.turn_open is not None:
+        turn_key = cur.turn_open
 
-        # (a) Assistant with one or more tool_use parts. Register each
-        # tool_use id → assistant uuid, mark the assistant as
-        # ``<tool>``-wrapped, and place it as a direct child of the
-        # turn (the umbrella around it lives at the listing layer).
-        if rec.get('type') == 'assistant':
-            msg = rec.get('message') or {}
-            content = msg.get('content') if isinstance(msg, dict) else None
-            has_tool_use = False
-            if isinstance(content, list):
-                for p in content:
-                    if (isinstance(p, dict)
-                            and p.get('type') == 'tool_use'
-                            and p.get('id')):
-                        cur.tool_owner[p['id']] = uuid
-                        if uuid:
-                            td.assistant_has_tool_use.add(uuid)
-                            td.tool_use_name_of.setdefault(
-                                uuid, p.get('name') or 'tool')
-                        has_tool_use = True
-            if has_tool_use:
-                td.turn_direct[turn_uuid].append(rec)
-                td.parent_id_of[n] = ('tool', path, n)
-                if turn_root_line is not None:
-                    td.tool_to_turn_root_line[n] = turn_root_line
-                    dirty.add(('prompt', path, turn_root_line))
-                if _is_turn_close(rec):
-                    cur.turn_open_uuid = None
-                    cur.tool_owner = {}
-                return dirty
+        # (a) A record issuing tool calls: register each call id → this
+        # record, and place it as a direct child of the turn (the
+        # ``<tool:>`` umbrella around it lives at the listing layer).
+        if _issues_tool_call(rec):
+            for tool in rec.tools:
+                if tool['call_id']:
+                    cur.tool_owner[tool['call_id']] = n
+            td.turn_direct[turn_key].append(rec)
+            td.parent_id_of[n] = ('tool', path, n)
+            td.tool_to_turn_root_line[n] = turn_key
+            dirty.add(('prompt', path, turn_key))
+            return dirty
 
-        # (b) Tool-child resolution: tool_result / hook attachment /
-        # sourceToolUseID back-pointers.
-        owner = _resolve_tool_owner(rec, cur.tool_owner)
+        # (b) Tool-child resolution: results and annotations pair with
+        # the record that issued the call.
+        owner = _resolve_tool_owner(rec, cur.tool_owner, td)
 
         if owner is not None:
-            owner_line = td.line_of.get(owner)
             td.tool_children.setdefault(owner, []).append(rec)
-            if owner_line is not None:
-                td.parent_id_of[n] = ('tool', path, owner_line)
-                dirty.add(('tool', path, owner_line))
-            # Subagent-link check: a tool_result whose
-            # toolUseResult.agentId resolves a child transcript.
-            # A new link means a new row in the session's top block —
-            # dirty the root so it gets re-listed.
+            td.parent_id_of[n] = ('tool', path, owner)
+            dirty.add(('tool', path, owner))
+            # A spawn result resolving a child transcript adds a row to
+            # the session's top block — dirty the root so it re-lists.
             if _maybe_link_subagent(td, rec, owner, path):
                 dirty.add(('session', path))
         else:
-            td.turn_direct[turn_uuid].append(rec)
-            if turn_root_line is not None:
-                td.parent_id_of[n] = ('prompt', path, turn_root_line)
-                dirty.add(('prompt', path, turn_root_line))
+            td.turn_direct[turn_key].append(rec)
+            td.parent_id_of[n] = ('prompt', path, turn_key)
+            dirty.add(('prompt', path, turn_key))
 
         if _is_turn_close(rec):
-            cur.turn_open_uuid = None
+            cur.turn_open = None
             cur.tool_owner = {}
         return dirty
 
     # --- outside any turn: span member. Subagent linking is
-    # turn-independent — a spawn tool_result landing here (no prior
-    # turn to re-open, e.g. a truncated transcript) still links via
-    # its ``sourceToolAssistantUUID`` back-pointer. Placement stays
-    # span.
-    owner = _resolve_tool_owner(rec, cur.tool_owner)
+    # turn-independent — a spawn result landing here (no prior turn to
+    # re-open, e.g. a truncated transcript) still links via its explicit
+    # caller back-pointer. Placement stays span.
+    owner = _resolve_tool_owner(rec, cur.tool_owner, td)
     if owner is not None and _maybe_link_subagent(td, rec, owner, path):
         dirty.add(('session', path))   # new row in the subagents block
     if cur.span_start is None:
         cur.span_start = n
-        # Initialise a live-shared span records list so further
-        # appends from this same call AND from future tail ticks are
-        # both visible to the umbrella's preview without a copy step.
+        # Live-shared span records list: appends from this call AND from
+        # future tail ticks are visible to the umbrella without a copy.
         td.span_records[n] = []
         td.roots_in_order.append({
             'kind': 'span', 'start': n,
@@ -5314,90 +5496,56 @@ def _fold_record(td, cur, rec, n, path):
     return dirty
 
 
-def _resolve_tool_owner(rec, tool_owner):
-    """Look up the assistant_uuid that this record back-points at, or None."""
-    # (0) Explicit assistant-uuid back-pointer (subagent transcripts stamp
-    # every tool-result user record with the owning assistant turn's
-    # uuid). Strongest signal — bypasses the tool_owner indirection.
-    asst = rec.get('sourceToolAssistantUUID')
-    if asst:
-        return asst
-    # (1) user tool_result content: tool_use_id back-pointer.
-    msg = rec.get('message')
-    if isinstance(msg, dict):
-        content = msg.get('content')
-        if isinstance(content, list):
-            for p in content:
-                if (isinstance(p, dict)
-                        and p.get('type') == 'tool_result'):
-                    tu = p.get('tool_use_id')
-                    if tu in tool_owner:
-                        return tool_owner[tu]
-    # (2) attachment with toolUseID — hook outputs.
-    if rec.get('type') == 'attachment':
-        att = rec.get('attachment')
-        if isinstance(att, dict):
-            tu = att.get('toolUseID')
-            if tu in tool_owner:
-                return tool_owner[tu]
-    # (3) records with explicit back-pointer fields.
-    tu = rec.get('sourceToolUseID')
-    if tu in tool_owner:
-        return tool_owner[tu]
+def _resolve_tool_owner(rec, tool_owner, td):
+    """Key of the record whose tool call ``rec`` answers or annotates, or None.
+
+    An explicit caller back-pointer (``rec.caller_id``, stamped by the
+    agent) is the strongest signal; otherwise the result's call ids,
+    then the annotation ``call_id``, are looked up in the open turn's
+    ``tool_owner`` registry.
+    """
+    if rec.caller_id:
+        owner = td.key_of_id.get(rec.caller_id)
+        if owner is not None:
+            return owner
+    if rec.kind == 'tool_result':
+        for tool in rec.tools:
+            if tool['call_id'] in tool_owner:
+                return tool_owner[tool['call_id']]
+    if rec.call_id in tool_owner:
+        return tool_owner[rec.call_id]
     return None
 
 
-def _maybe_link_subagent(td, rec, owner_uuid, path):
-    """If ``rec`` is a tool_result that resolves a subagent transcript, link it.
+def _maybe_link_subagent(td, rec, owner_key, path):
+    """If ``rec`` is a result of a spawn call that resolves a child transcript, link it.
 
-    Inspects the owner assistant's tool_use parts to find the matching
-    Agent/Task call and records the join via ``td.agent_link`` plus the
+    Records the join in ``td.agent_link`` plus the
     ``agent_to_assistant_line`` shortcut. Returns True when a link was
-    recorded (so a live-tail fold can dirty the session's top block);
-    no-op returning False if anything mismatches.
+    recorded (so a live-tail fold can dirty the session's top block).
     """
-    linked = False
-    msg = rec.get('message')
-    if not isinstance(msg, dict):
-        return linked
-    content = msg.get('content')
-    if not isinstance(content, list):
-        return linked
-    asst = td.by_uuid.get(owner_uuid)
+    if rec.kind != 'tool_result' or not (0 <= owner_key < len(td.records)):
+        return False
+    asst = td.records[owner_key]
     if asst is None:
-        return linked
-    amsg = asst.get('message') or {}
-    if not isinstance(amsg, dict):
-        return linked
-    acontent = amsg.get('content') or []
-    if not isinstance(acontent, list):
-        return linked
-    for cp in content:
-        if not (isinstance(cp, dict) and cp.get('type') == 'tool_result'):
+        return False
+    spawns = {t['call_id']: t for t in asst.tools if t['canon'] == 'spawn'}
+    linked = False
+    for result in rec.tools:
+        call = spawns.get(result['call_id'])
+        if call is None:
             continue
-        tu_id = cp.get('tool_use_id')
-        if not tu_id:
+        hit = store_resolve_spawned_child(path, call, rec)
+        if hit is None:
             continue
-        for ap in acontent:
-            if not (isinstance(ap, dict)
-                    and ap.get('type') == 'tool_use'
-                    and ap.get('id') == tu_id
-                    and ap.get('name') in ('Agent', 'Task')):
-                continue
-            hit = store_resolve_spawned_child(
-                path, rec.get('toolUseResult'), ap.get('input'))
-            if hit is None:
-                continue
-            agent_id, agent_path = hit
-            td.agent_link[tu_id] = {
-                'agent_id': agent_id,
-                'agent_path': agent_path,
-                'assistant_uuid': owner_uuid,
-            }
-            linked = True
-            asst_line = td.line_of.get(owner_uuid)
-            if asst_line is not None:
-                td.agent_to_assistant_line[agent_id] = asst_line
+        child_key, child_session = hit
+        td.agent_link[result['call_id']] = {
+            'child_key': child_key,
+            'child_session': child_session,
+            'assistant_key': owner_key,
+        }
+        td.agent_to_assistant_line[child_key] = owner_key
+        linked = True
     return linked
 
 
@@ -5409,9 +5557,9 @@ def _list_tree_roots(sess):
     records. The first message is no longer also the expandable node —
     that's the umbrella's job.
 
-    ALL the session's subagent files surface here in a top block,
-    newest-first like the flat view; agents with no dispatch site in
-    the main thread come back tagged ``orphan`` and dimmed.
+    ALL the session's child transcripts surface here in a top block,
+    newest-first like the flat view; children with no dispatch site in
+    the main thread come back tagged orphan and dimmed.
     """
     td = _scan_tree(sess)
     out = []
@@ -5434,9 +5582,8 @@ def _list_tree_roots(sess):
                         title='--- Session:', meta=True))
     for entry in td.roots_in_order:
         if entry['kind'] == 'turn':
-            line = entry['line']
-            rec = entry['rec']
-            out.append(_prompt_umbrella_item(sess, line, rec, td))
+            out.append(_prompt_umbrella_item(
+                sess, entry['line'], entry['rec'], td))
         else:   # 'span'
             out.append(_span_umbrella_item(
                 sess, entry['start'], entry['records'],
@@ -5445,24 +5592,21 @@ def _list_tree_roots(sess):
 
 
 def _tree_subagents_for_session(sess, td):
-    """Subagent rows for the tree-mode top block, newest-first.
+    """Child rows for the tree-mode top block, newest-first.
 
-    Keeps the flat-view ordering from ``store_child_sessions``
-    (newest mtime first) so both views show the same row sequence.
-    Agents with no dispatch site in the main thread (no
-    ``td.agent_to_assistant_line`` entry, built by
-    ``_maybe_link_subagent`` during scan) come back tagged
-    ``orphan · …`` and dimmed so the user can see they aren't wired
-    into the session's turn graph.
+    Keeps the ordering of ``store_child_sessions`` so both views show
+    the same row sequence. Children with no dispatch site in the main
+    thread (no ``td.agent_to_assistant_line`` entry, built by
+    ``_maybe_link_subagent`` during scan) are marked orphan, dimmed, and
+    re-tagged by the store.
     """
     subs = store_child_sessions(sess)
     for item in subs:
-        if item.agent_id in td.agent_to_assistant_line:
+        if item.id[2] in td.agent_to_assistant_line:
             continue
-        item.tag = (f'{item.agent_type} · {item.line_count} msg · orphan · '
-                    f'{_human_time(item.mtime)}')
-        item.tag_style = 'dim'
         item.is_orphan = True
+        item.tag_style = 'dim'
+        store_mark_orphan(item)
     return subs
 
 
@@ -5470,10 +5614,10 @@ def _list_prompt_children(sess, turn_root_line):
     """Children of a ``<prompt>`` umbrella.
 
     Returns the turn root user voice as a leaf, followed by each turn
-    member in file order. Assistant members carrying a ``tool_use`` are
-    wrapped in their own ``<tool:Name>`` umbrella (always, even if no
-    tool_result has arrived yet — the umbrella shape stays stable as
-    the transcript grows).
+    member in file order. Members issuing tool calls are wrapped in
+    their own ``<tool:Name>`` umbrella (always, even if no result has
+    arrived yet — the umbrella shape stays stable as the transcript
+    grows).
     """
     td = _scan_tree(sess)
     if not (0 <= turn_root_line < len(td.records)):
@@ -5481,7 +5625,6 @@ def _list_prompt_children(sess, turn_root_line):
     rec = td.records[turn_root_line]
     if rec is None:
         return []
-    uuid = rec.get('uuid')
     out = []
     # 1) The turn root itself, as a leaf — visible at the top of the
     # expansion so the user prompt content is readable at the same
@@ -5492,15 +5635,9 @@ def _list_prompt_children(sess, turn_root_line):
     if leaf is not None:
         out.append(leaf)
     # 2) Each turn member.
-    if uuid is None:
-        return out
-    for child in td.turn_direct.get(uuid, []):
-        cuuid = child.get('uuid')
-        if cuuid in td.assistant_has_tool_use:
-            cline = td.line_of.get(cuuid)
-            if cline is None:
-                continue
-            out.append(_tool_umbrella_item(sess, cline, child, td))
+    for child in td.turn_direct.get(turn_root_line, []):
+        if _issues_tool_call(child):
+            out.append(_tool_umbrella_item(sess, child.key, child, td))
         else:
             it = _tree_item(sess, child, td)
             if it is not None:
@@ -5511,11 +5648,11 @@ def _list_prompt_children(sess, turn_root_line):
 def _list_tool_children(sess, assistant_line):
     """Children of a ``<tool>`` umbrella.
 
-    Returns the assistant tool_use record as a leaf, then every paired
-    tool_result / hook attachment in file order. The umbrella exists
-    even when no tool_result has arrived yet so the shape is stable
-    across in-flight transcripts. Subagent transcripts are NOT nested
-    here — they live in the session's top block (``_list_tree_roots``).
+    Returns the tool-call record as a leaf, then every paired result /
+    annotation in file order. The umbrella exists even when no result
+    has arrived yet so the shape is stable across in-flight transcripts.
+    Child transcripts are NOT nested here — they live in the session's
+    top block (``_list_tree_roots``).
     """
     td = _scan_tree(sess)
     if not (0 <= assistant_line < len(td.records)):
@@ -5523,17 +5660,15 @@ def _list_tool_children(sess, assistant_line):
     rec = td.records[assistant_line]
     if rec is None:
         return []
-    uuid = rec.get('uuid')
     out = []
-    # 1) Assistant tool_use record as a leaf. Keeps its ``row_bg``
-    # voice stripe if the assistant has text content (mixed text +
-    # tool_use case) — same reasoning as the prompt umbrella's first
-    # leaf: voice markers belong on voice rows, regardless of nesting.
+    # 1) The tool-call record as a leaf. Keeps its ``row_bg`` voice
+    # stripe if it also carries text (mixed text + tool call) — same
+    # reasoning as the prompt umbrella's first leaf.
     leaf = _tree_item(sess, rec, td)
     if leaf is not None:
         out.append(leaf)
-    # 2) Paired tool_children (tool_result, hook attachments, …).
-    for child in td.tool_children.get(uuid, []):
+    # 2) Paired tool_children (results, hook annotations, …).
+    for child in td.tool_children.get(assistant_line, []):
         it = _tree_item(sess, child, td)
         if it is not None:
             out.append(it)
@@ -5552,7 +5687,7 @@ def _list_span_records(sess, start_line):
 
 
 def _tree_item(sess, rec, td):
-    """Build a leaf list-row ``Item`` for ``rec`` in tree mode.
+    """Build a leaf list-row ``Item`` for ``rec`` (both view modes).
 
     Conversationally a leaf — wrapping into ``<prompt>`` / ``<tool>`` umbrellas
     is the listing layer's job (``_list_prompt_children`` /
@@ -5562,22 +5697,15 @@ def _tree_item(sess, rec, td):
     no-op ``False`` when ``md_doc`` is absent), so a row with markdown headings
     or a ``.md`` reference still gains the document-subtree arrow.
     """
-    n = td.line_of.get(rec.get('uuid'))
-    if n is None:
-        for i, r in enumerate(td.records):
-            if r is rec:
-                n = i
-                break
+    n = rec.key
     if n is None:
         return None
-    kind = _kind_of(rec)
-
     item_id = ('msg', sess, n)
     item = Item(
         id=item_id,
         title=_link_marker(item_id) + _oneline(_summarise_message(rec)),
-        tag=_row_tag(kind, rec),
-        tag_style=_TAG_STYLE_FOR_KIND.get(kind, ''),
+        tag=_row_tag(rec),
+        tag_style=_record_tag_style(rec),
         # Optimistic markdown-subtree detection (no-op when md_doc absent):
         # a heading or a ``.md`` ref earns an expansion arrow, built lazily by
         # ``get_children`` and self-healed by ``_on_children_loaded`` if false.
@@ -5587,11 +5715,11 @@ def _tree_item(sess, rec, td):
     item.kind = 'message'
     item.line_no = n
     item.session_path = sess
-    item.message_kind = kind
-    if _is_voice(rec):
-        bg = _ROW_BG_FOR_KIND.get(kind)
-        if bg is not None:
-            item.row_bg = bg
+    # Stripe rows that carry actual *speech*; tool calls and results are
+    # machinery and keep the default no-bg look.
+    bg = _record_row_bg(rec)
+    if bg is not None:
+        item.row_bg = bg
     return item
 
 
@@ -5600,25 +5728,21 @@ def _prompt_umbrella_item(sess, turn_root_line, rec, td):
 
     Id shape: ``('prompt', sess, turn_root_line)``. Children are the turn
     root user voice (as a leaf) followed by every turn member, with each
-    assistant-with-tool_use member further wrapped in a ``<tool>``
-    umbrella. The umbrella's title prefix mirrors the existing
-    ``<system>`` precedent so the kind tag reads consistently across all
-    umbrella rows.
+    tool-calling member further wrapped in a ``<tool>`` umbrella. The
+    umbrella's title prefix mirrors the existing ``<system>`` precedent
+    so the kind tag reads consistently across all umbrella rows.
     """
     summary = _oneline(_summarise_message(rec))
-    uuid = rec.get('uuid')
-    members = td.turn_direct.get(uuid, []) if uuid else []
+    members = td.turn_direct.get(turn_root_line, [])
     # Count of direct children visible when expanded: the user voice
     # itself + each member (tool-using members collapse into one row).
     n_replies = len(members)
     item_id = ('prompt', sess, turn_root_line)
-    # A turn opened by a worker→leader task-notification or an inbound
-    # peer message is agent voice, not a human prompt — relabel its
-    # umbrella so the row doesn't masquerade as one (a SendMessage-only
-    # assistant turn can't be a turn root; only user voice opens turns).
-    kind = _kind_of(rec)
-    prefix = {'agent-reply': '<reply>',
-              'agent-peer': '<peer>'}.get(kind, '<prompt>')
+    # A turn opened by a worker's reply or an inbound peer message is
+    # agent voice, not a human prompt — relabel its umbrella so the row
+    # doesn't masquerade as one.
+    prefix = {'reply': '<reply>', 'peer': '<peer>',
+              'idle': '<peer>'}.get(rec.agent_voice, '<prompt>')
     item = Item(
         id=item_id,
         title=f'{_link_marker(item_id)}{prefix}  {summary}',
@@ -5630,14 +5754,12 @@ def _prompt_umbrella_item(sess, turn_root_line, rec, td):
     item.kind = 'prompt'
     item.line_no = turn_root_line
     item.session_path = sess
-    item.message_kind = kind
     # Voice stripe — the umbrella visually IS the user prompt at the
     # turn level. Matches the leaf user-msg row's stripe so the two
     # adjacent rows read as one voice block.
-    if _is_voice(rec):
-        bg = _ROW_BG_FOR_KIND.get(item.message_kind)
-        if bg is not None:
-            item.row_bg = bg
+    bg = _record_row_bg(rec)
+    if bg is not None:
+        item.row_bg = bg
     return item
 
 
@@ -5645,65 +5767,42 @@ def _tool_umbrella_item(sess, assistant_line, rec, td):
     """``<tool:Name>`` umbrella wrapping one tool-execution group.
 
     Id shape: ``('tool', sess, assistant_line)``. Children are the
-    dispatching assistant itself (leaf) and the paired ``tool_result``
-    + hook attachments. The tool name in the prefix is the **first**
-    ``tool_use`` part's name.
+    tool-call record itself (leaf) and the paired results / annotations.
+    The tool name in the prefix is the **first** call's name.
 
-    Voice stripe: inherited from the underlying assistant record when
-    it qualifies as voice (mixed text + tool_use), OR from the subagent
-    kind when this umbrella wraps a resolvable Agent/Task dispatch —
-    dispatch sites keep the same stripe as the subagent rows in the
-    session's top block.
+    Voice stripe: inherited from the underlying record when it qualifies
+    as voice (mixed text + tool call), OR the spawn stripe when this
+    umbrella wraps a resolvable child dispatch — dispatch sites keep the
+    same stripe as the child rows in the session's top block.
     """
     summary = _oneline(_summarise_message(rec))
-    uuid = rec.get('uuid')
-    tool_name = td.tool_use_name_of.get(uuid, 'tool')
+    tool_name = rec.tool['name'] or 'tool'
     item_id = ('tool', sess, assistant_line)
     item = Item(
         id=item_id,
         title=f'{_link_marker(item_id)}<tool:{tool_name}>  {summary}',
         tag='tool_use',
-        tag_style=_TAG_STYLE_FOR_KIND.get('tool_use', ''),
+        tag_style='yellow',
         has_children=True,
         hidden=not _passes_filter(item_id, td),
     )
     item.kind = 'tool'
     item.line_no = assistant_line
     item.session_path = sess
-    item.message_kind = _kind_of(rec)
     item.tool_name = tool_name
-    if _is_voice(rec):
-        bg = _ROW_BG_FOR_KIND.get(item.message_kind)
-        if bg is not None:
-            item.row_bg = bg
+    bg = _record_row_bg(rec)
+    if bg is not None:
+        item.row_bg = bg
     elif _tool_umbrella_wraps_subagent(rec, td):
-        bg = _ROW_BG_FOR_KIND.get('subagent')
-        if bg is not None:
-            item.row_bg = bg
+        item.row_bg = _ROW_BG_SPAWN
     return item
 
 
 def _tool_umbrella_wraps_subagent(rec, td):
-    """True iff this assistant tool_use record dispatches a resolvable
-    Agent/Task subagent — i.e. there is at least one tool_use part with
-    name in ('Agent', 'Task') whose id has an ``agent_link`` entry.
-    """
-    msg = rec.get('message') if isinstance(rec, dict) else None
-    if not isinstance(msg, dict):
-        return False
-    content = msg.get('content')
-    if not isinstance(content, list):
-        return False
-    for p in content:
-        if not isinstance(p, dict):
-            continue
-        if p.get('type') != 'tool_use':
-            continue
-        if p.get('name') not in ('Agent', 'Task'):
-            continue
-        if td.agent_link.get(p.get('id')):
-            return True
-    return False
+    """True iff this record dispatches a resolvable child — i.e. at least
+    one of its spawn calls has an ``agent_link`` entry."""
+    return any(t['canon'] == 'spawn' and td.agent_link.get(t['call_id'])
+               for t in rec.tools)
 
 
 def _span_umbrella_item(sess, start_line, records):
@@ -5711,24 +5810,12 @@ def _span_umbrella_item(sess, start_line, records):
 
     Id shape: ``('span', sess, start_line)``. ``get_children`` routes
     that id to ``_list_span_records`` which returns the span's records
-    as flat children. Title shows the count + dominant types so the
+    as flat children. Title shows the count + dominant labels so the
     row's still informative when collapsed.
     """
     from collections import Counter
-    type_counts = Counter()
-    for r in records:
-        if not isinstance(r, dict):
-            continue
-        t = r.get('type', '?')
-        if t == 'attachment':
-            att = r.get('attachment') or {}
-            sub = att.get('type', '') if isinstance(att, dict) else ''
-            type_counts[f'att:{sub}'] += 1
-        elif t == 'system':
-            sub = r.get('subtype', '')
-            type_counts[f'sys:{sub}' if sub else 'system'] += 1
-        else:
-            type_counts[t] += 1
+    type_counts = Counter(r.meta.get('span_label') or r.tag
+                          for r in records if r is not None)
     types_summary = ', '.join(
         f'{n}× {t}' if n > 1 else t
         for t, n in type_counts.most_common(4)
@@ -5740,7 +5827,7 @@ def _span_umbrella_item(sess, start_line, records):
     # — the same min-level rule ``_passes_filter`` applies to its
     # ``('span', …)`` id, computed here off the records in hand.
     any_visible = any(
-        isinstance(r, dict) and _record_min_level(r) <= _DETAIL_LEVEL
+        r is not None and _record_min_level(r) <= _DETAIL_LEVEL
         for r in records
     )
     item = Item(
@@ -5756,6 +5843,56 @@ def _span_umbrella_item(sess, start_line, records):
     item.span_count = len(records)
     item.session_path = sess
     return item
+
+
+def _passes_filter(item_id, td=None):
+    """True iff ``item_id`` should be visible at the current detail level.
+
+    Used by every Item builder to derive ``hidden`` and by the live-tail
+    worker to detect when a hidden umbrella has crossed the visibility
+    threshold. A row is shown iff its *minimum* level (the lowest
+    ``_DETAIL_LEVEL`` it becomes visible at) is ``<= _DETAIL_LEVEL``.
+
+    Predicate body, by id tag:
+      * ``('msg', sess, n)``    → ``_record_min_level(td.records[n])``
+      * ``('prompt', sess, n)`` → always (turns open at a turn-root
+                                   user prompt, level 1)
+      * ``('tool', sess, n)``   → its record's min level (a bare tool
+                                   call is level 4, an edit/write tool
+                                   level 3), but promoted to the voice
+                                   tier (level 2) when the umbrella wraps
+                                   a resolvable child (same rule as
+                                   ``_tool_umbrella_item``)
+      * ``('span', sess, n)``   → min level over the span's members
+      * ``('agent', …)``        → always (child umbrella; we don't peek
+                                   into other sessions at filter time)
+      * any other id            → always (be permissive; framework
+                                   error rows and ``('trunc', …)``
+                                   fillers stay visible)
+    """
+    if _DETAIL_LEVEL >= 7:
+        return True
+    if not isinstance(item_id, tuple) or not item_id:
+        return True
+    tag = item_id[0]
+    if tag not in ('msg', 'prompt', 'tool', 'span'):
+        return True
+    path, n = item_id[1], item_id[2]
+    if td is None:
+        td = _TREE_CACHE.get(path)
+    if td is None:
+        return True
+    if tag == 'prompt':
+        return True
+    if tag == 'span':
+        return any(rec is not None and _record_min_level(rec) <= _DETAIL_LEVEL
+                   for rec in td.span_records.get(n, []))
+    rec = td.records[n] if 0 <= n < len(td.records) else None
+    if rec is None:
+        return True
+    if tag == 'tool' and _tool_umbrella_wraps_subagent(rec, td):
+        return _DETAIL_LEVEL >= 2
+    return _record_min_level(rec) <= _DETAIL_LEVEL
 
 
 # ---- live tail -----------------------------------------------------------
@@ -5865,7 +6002,7 @@ def _fold_records(td, cur, records, sess):
         if rec is None:
             continue
         dirty |= _fold_record(td, cur, rec, n, sess)
-        if _is_voice(rec):
+        if rec.is_voice:
             td.latest_voice_line = n
     return dirty
 
@@ -6079,22 +6216,19 @@ def _push_flat_inserts(b, sess, records):
         item_id = ('msg', sess, n)
         if item_id in existing_ids:
             continue
-        kind = _kind_of(rec)
         fields = {
             'title': _oneline(_summarise_message(rec)),
-            'tag': kind,
-            'tag_style': _TAG_STYLE_FOR_KIND.get(kind, ''),
+            'tag': rec.tag,
+            'tag_style': _record_tag_style(rec),
             'has_children': False,
             'hidden': not _passes_filter(item_id),
             'kind': 'message',
             'line_no': n,
             'session_path': sess,
-            'message_kind': kind,
         }
-        if _is_voice(rec):
-            bg = _ROW_BG_FOR_KIND.get(kind)
-            if bg is not None:
-                fields['row_bg'] = bg
+        bg = _record_row_bg(rec)
+        if bg is not None:
+            fields['row_bg'] = bg
         ops.append(upsert(item_id, session_id, **fields))
     if ops:
         b.update_data(ops)
@@ -6188,7 +6322,7 @@ def _cursor_tail_session(item_id):
 def _last_voice_id(sess):
     """Return ``('msg', sess, n)`` id of the most-recent voice record, or None.
 
-    "Voice" matches ``_is_voice`` (user prompt or assistant text).
+    "Voice" is ``rec.is_voice`` (user prompt or assistant text).
     Reads the eagerly-tracked ``td.latest_voice_line`` populated by
     ``_scan_tree`` during its forward pass, so this is O(1) on cache
     hit (no reverse walk).
@@ -6217,7 +6351,7 @@ def _last_visible_voice_id(sess):
         return None
     for i in range(n, -1, -1):
         rec = td.records[i]
-        if not (isinstance(rec, dict) and _is_voice(rec)):
+        if rec is None or not rec.is_voice:
             continue
         if _passes_filter(('msg', sess, i), td):
             return ('msg', sess, i)
@@ -6256,7 +6390,8 @@ def _list_messages(sess, limit=None):
     ``_scan_tree`` populates the cache the first time we visit the
     session (and keeps its tail state so the live-tail worker resumes
     from where the read stopped). Placeholder records (``None``) are
-    skipped without surfacing a fake row.
+    skipped without surfacing a fake row. Rows are the same leaf
+    ``Item``s tree mode builds (``_tree_item``).
 
     ``limit`` truncates from the **start** of the file (so the user
     keeps the most recent messages — they're scrolling toward the
@@ -6287,36 +6422,12 @@ def _list_messages(sess, limit=None):
             tag_style='dim',
         ))
     for n in range(start, total):
-        obj = td.records[n]
-        if obj is None:
+        rec = td.records[n]
+        if rec is None:
             continue
-        kind = _kind_of(obj)
-        item_id = ('msg', sess, n)
-        item = Item(
-            id=item_id,
-            title=_link_marker(item_id) + _oneline(_summarise_message(obj)),
-            tag=_row_tag(kind, obj),
-            tag_style=_TAG_STYLE_FOR_KIND.get(kind, ''),
-            # Optimistic markdown-subtree detection — see ``_tree_item``. The
-            # feature is mode-agnostic, so flat-mode rows gain the same arrow;
-            # ``get_children`` returns the document nodes regardless of mode.
-            has_children=_md_has_children(obj),
-            hidden=not _passes_filter(item_id, td),
-        )
-        item.kind = 'message'
-        item.line_no = n
-        item.session_path = sess
-        item.message_kind = kind
-        # Stripe rows that carry actual *speech* — the user typing, or
-        # the assistant's text reply. Tool calls (assistant tool_use)
-        # and tool results (user tool_result) are machinery, not voice,
-        # so they keep the default no-bg look even though their record
-        # type is user/assistant.
-        if _is_voice(obj):
-            bg = _ROW_BG_FOR_KIND.get(kind)
-            if bg is not None:
-                item.row_bg = bg
-        out.append(item)
+        item = _tree_item(sess, rec, td)
+        if item is not None:
+            out.append(item)
 
     return out
 
@@ -6491,8 +6602,9 @@ def store_tailable(session_key):
 def _read_tail_lines(f, state, *, strict):
     """Read complete lines from ``f`` at ``state.byte_offset``.
 
-    Returns ``[(line_no, rec_or_None), …]``; ``rec`` is ``None`` for blank
-    lines and non-dict JSON. With ``strict`` a malformed line latches
+    Returns ``[(line_no, record_or_None), …]``; a ``Record`` parsed by
+    ``_parse_record`` for each JSON object, ``None`` for blank lines and
+    non-dict JSON. With ``strict`` a malformed line latches
     ``state.error`` and stops the read (live-tail semantics); without it
     the line yields ``None`` and the read goes on (bulk read).
     """
@@ -6512,8 +6624,8 @@ def _read_tail_lines(f, state, *, strict):
                     state.error = True
                     break
                 rec = None
-            if not isinstance(rec, dict):
-                rec = None
+            rec = (_parse_record(rec, state.start_line)
+                   if isinstance(rec, dict) else None)
         out.append((state.start_line, rec))
         state.byte_offset = f.tell()
         state.line_offsets.append(state.byte_offset)
@@ -6646,44 +6758,18 @@ def store_source_excerpt(per_session):
 
 
 def _message_md_text(rec):
-    """The message's markdown text: every ``text`` part + any ``tool_result``
-    text, joined with blank lines.
+    """The record's markdown text: its body plus any tool-result output,
+    joined with blank lines.
 
     This is the inline document's source — what ``md2ansi_doc`` /
-    ``md_heading_trigger`` scan for headings. Unlike ``_extract_text`` (which
-    returns the *first* useful fragment for a one-line summary), this collects
-    ALL prose: every ``type=='text'`` content part, plus the textual body of
-    any ``type=='tool_result'`` part (its ``content`` string, or the ``text``
-    of its content sub-parts). ``thinking`` and ``tool_use`` parts are skipped
-    — they aren't the message's authored markdown. A bare-string ``content`` is
-    returned verbatim. Returns ``''`` for a record with no text.
+    ``md_heading_trigger`` scan for headings. Collects ALL prose
+    (``rec.text``) plus the output of each result on a ``tool_result``
+    record; tool calls aren't the message's authored markdown. Returns
+    ``''`` for a record with no text.
     """
-    msg = rec.get('message') if isinstance(rec, dict) else None
-    content = msg.get('content') if isinstance(msg, dict) else None
-    if isinstance(content, str):
-        return content
-    if not isinstance(content, list):
-        return ''
-    chunks = []
-    for part in content:
-        if not isinstance(part, dict):
-            continue
-        ptype = part.get('type')
-        if ptype == 'text':
-            t = part.get('text', '') or ''
-            if t:
-                chunks.append(t)
-        elif ptype == 'tool_result':
-            inner = part.get('content')
-            if isinstance(inner, str):
-                if inner:
-                    chunks.append(inner)
-            elif isinstance(inner, list):
-                for sub in inner:
-                    if isinstance(sub, dict) and sub.get('type') == 'text':
-                        t = sub.get('text', '') or ''
-                        if t:
-                            chunks.append(t)
+    chunks = [rec.text] if rec.text else []
+    if rec.kind == 'tool_result':
+        chunks.extend(t['output'] for t in rec.tools if t['output'])
     return '\n\n'.join(chunks)
 
 
@@ -6707,17 +6793,18 @@ def _iter_str_leaves(obj):
 
 
 def _record_has_md_ref(rec):
-    """True iff any string leaf of ``rec`` contains a ``.md`` reference token.
+    """True iff any string leaf of the source object contains a ``.md``
+    reference token.
 
-    Short-circuiting: walks ``rec``'s string leaves (``_iter_str_leaves``) and
-    stops at the FIRST ``.md`` hit via ``md_doc.find_md_refs`` — far cheaper
-    than serialising the whole record. No ``os.stat`` here (detection is
-    optimistic; existence is checked lazily on expand, and a dead token
-    self-heals). Sees ``Write``/``Read``/``Edit`` tool paths and prose alike.
+    Short-circuiting: walks ``rec.raw``'s string leaves (``_iter_str_leaves``)
+    and stops at the FIRST ``.md`` hit via ``md_doc.find_md_refs`` — far
+    cheaper than serialising the whole record. No ``os.stat`` here (detection
+    is optimistic; existence is checked lazily on expand, and a dead token
+    self-heals). Sees tool paths and prose alike, whatever the agent's shape.
     """
     if _md_doc is None:
         return False
-    for s in _iter_str_leaves(rec):
+    for s in _iter_str_leaves(rec.raw):
         if _md_doc.find_md_refs(s):
             return True
     return False
@@ -6957,7 +7044,7 @@ def _md_refs_umbrella_children(item_id):
     if rec is None:
         return []
     doc_dir = cwd or project_root
-    record_text = '\n'.join(_iter_str_leaves(rec))
+    record_text = '\n'.join(_iter_str_leaves(rec.raw))
     return [
         _md_file_item(anchor, (abspath,), label)
         for abspath, label in _md_resolved_refs(
@@ -7009,7 +7096,7 @@ def _md_message_children(anchor):
     # The same concatenated string leaves (prose + tool paths) feed both halves.
     cwd, project_root = store_session_cwd_and_root(path)
     doc_dir = cwd or project_root
-    record_text = '\n'.join(_iter_str_leaves(rec))
+    record_text = '\n'.join(_iter_str_leaves(rec.raw))
     if _has_any_existing_ref(record_text, doc_dir, cwd or '', project_root or ''):
         out.append(_md_refs_umbrella_item(anchor, ()))
     return out
@@ -7462,9 +7549,10 @@ def _preview_message(sess, n):
     preview no longer concatenates anything extra — the umbrella's own
     preview is where multi-child concatenation lives.
     """
-    obj = _record_at(sess, n)
-    if obj is None:
+    rec = _record_at(sess, n)
+    if rec is None:
         return ''
+    obj = rec.raw
     kind = _classify(obj)
     body = _RENDERERS.get(kind, _render_unknown)(obj)
     chrome = _fmt_chrome(obj, _turn_root_ts(sess, n))
@@ -7508,7 +7596,7 @@ def _fmt_scope_card(sess, td):
     rows.append(('lines', str(n_lines)))
     if td.voice_count is None:
         td.voice_count = sum(
-            1 for r in td.records if isinstance(r, dict) and _is_voice(r)
+            1 for r in td.records if r is not None and r.is_voice
         )
     rows.append(('voice', str(td.voice_count)))
     if info['mtime'] is not None:
@@ -7745,11 +7833,12 @@ def _render_record_with_rule(sess, n):
     logical line — so successive turns stand out as the visual anchors
     of a composed multi-turn preview.
     """
-    obj = _record_at(sess, n)
-    if obj is None or not isinstance(obj, dict):
+    rec = _record_at(sess, n)
+    if rec is None:
         return None
+    obj = rec.raw
     kind = _classify(obj)
-    if _is_turn_root(obj):
+    if _is_turn_root(rec):
         # A turn root is always a 'user' record (``_is_turn_root``), so
         # ``_render_user`` is the right renderer; thread the band's SGR
         # params as md2ansi's reset baseline, then band every line.
@@ -7766,16 +7855,15 @@ def _render_record_with_rule(sess, n):
 def _tool_label(cid):
     """Tool name for a composed ``('tool', sess, key)`` block's section rule.
 
-    Resolves the dispatching assistant record's first ``tool_use`` name from
-    ``td.tool_use_name_of`` — the same source the ``<tool:Name>`` umbrella
-    title prefix uses. Defensive: any malformed id / scan failure / missing
-    entry falls back to ``'tool'`` so the rule still renders.
+    The dispatching record's first call name — the same source the
+    ``<tool:Name>`` umbrella title prefix uses. Defensive: any malformed
+    id / scan failure / missing entry falls back to ``'tool'`` so the
+    rule still renders.
     """
     try:
         _tag, sess, assistant_line = cid
-        td = _scan_tree(sess)
-        rec = td.records[assistant_line]
-        return td.tool_use_name_of.get(rec.get('uuid'), 'tool')
+        rec = _scan_tree(sess).records[assistant_line]
+        return rec.tool['name'] or 'tool'
     except Exception:
         return 'tool'
 
@@ -7928,46 +8016,49 @@ def _ancestor_ids_for(item_id):
 #                                           forward link, the group row).
 #
 # The send-direction order join skips auto-generated idle notifications
-# (they aren't sent via SendMessage, so they'd shift the join); an order
-# join that runs past the end — or a reply whose text matches no send —
-# falls back to the subagent group row (no reverse half — the group row's
-# backlink is the session-level pair).
+# (``agent_voice == 'idle'``: they aren't sent via a message tool, so
+# they'd shift the join); an order join that runs past the end — or a
+# reply whose text matches no send — falls back to the subagent group
+# row (no reverse half — the group row's backlink is the session-level
+# pair).
+#
+# Everything here reads normalized records: an outbound message is a
+# tool of canon ``message`` (``peer`` = recipient, ``text`` = body), a
+# spawn is canon ``spawn`` (``peer`` = teammate name), and an inbound
+# peer message is a ``user_prompt`` with ``agent_voice == 'peer'``
+# (``peer`` = sender, ``text`` = body).
 
 
-def _is_idle_notification(body):
-    """True for a teammate's auto-generated idle notice (not a real reply)."""
-    body = body.lstrip()
-    if not body.startswith('{'):
-        return False
-    try:
-        return json.loads(body).get('type') == 'idle_notification'
-    except Exception:
-        return False
+def _message_sends(rec):
+    """``(recipient, body)`` per outbound message call in ``rec``."""
+    if rec is None or not _issues_tool_call(rec):
+        return []
+    return [(t['peer'], t['text'] or '') for t in rec.tools
+            if t['canon'] == 'message']
+
+
+def _is_peer_message(rec):
+    """A delivered inbound peer message (not a queued echo or idle notice)."""
+    return (rec is not None and rec.kind == 'user_prompt'
+            and rec.agent_voice == 'peer')
 
 
 def _spawn_use_name(rec, tu_id):
-    """``input.name`` of the Agent/Task tool_use part ``tu_id`` in ``rec``."""
-    msg = rec.get('message') if isinstance(rec, dict) else None
-    content = msg.get('content') if isinstance(msg, dict) else None
-    if not isinstance(content, list):
-        return None
-    for p in content:
-        if (isinstance(p, dict) and p.get('type') == 'tool_use'
-                and p.get('id') == tu_id):
-            return (p.get('input') or {}).get('name')
+    """Teammate name of the spawn call ``tu_id`` in ``rec``."""
+    for t in rec.tools:
+        if t['call_id'] == tu_id:
+            return t['peer']
     return None
 
 
 def _inbound_lines(std):
-    """Lines of delivered inbound teammate messages, in order.
+    """Keys of delivered inbound teammate messages, in order.
 
     The 1st is the spawn prompt delivery; idle notices are excluded so
-    the order join stays aligned with the leader's SendMessage list.
+    the order join stays aligned with the leader's message list.
     """
     return [wn for wn, wrec in enumerate(std.records)
-            if isinstance(wrec, dict) and wrec.get('type') == 'user'
-            and _is_agent_message(wrec)
-            and not _is_idle_notification(_parse_agent_message(wrec)[1])]
+            if _is_peer_message(wrec)]
 
 
 def _link_map(path):
@@ -8002,30 +8093,16 @@ def _link_map(path):
     rev = {}
     agent_counts = {}
 
-    # One master pass: SendMessage dispatch lines per recipient and
-    # inbound teammate-message reply ``(line, body)`` per sender (idle
-    # notices and queue-operation echoes excluded — only delivered
-    # ``user`` records join).
+    # One master pass: message dispatch lines per recipient and inbound
+    # peer reply ``(line, body)`` per sender (idle notices and queued
+    # echoes excluded — only delivered records join).
     sends_to = {}
     replies_from = {}
     for n, rec in enumerate(td.records):
-        if not isinstance(rec, dict):
-            continue
-        rtype = rec.get('type')
-        if rtype == 'assistant':
-            msg = rec.get('message') or {}
-            content = msg.get('content') if isinstance(msg, dict) else None
-            if isinstance(content, list):
-                for p in content:
-                    if (isinstance(p, dict) and p.get('type') == 'tool_use'
-                            and p.get('name') == 'SendMessage'):
-                        recipient, _s, _m = _send_message_fields(
-                            p.get('input'))
-                        sends_to.setdefault(recipient, []).append(n)
-        elif rtype == 'user' and _is_agent_message(rec):
-            sender, body = _parse_agent_message(rec)
-            if sender and not _is_idle_notification(body):
-                replies_from.setdefault(sender, []).append((n, body))
+        for recipient, _body in _message_sends(rec):
+            sends_to.setdefault(recipient, []).append(n)
+        if _is_peer_message(rec) and rec.peer:
+            replies_from.setdefault(rec.peer, []).append((n, rec.text))
 
     # Spawn sites + teammate name join. A respawn reuses the name; the
     # latest spawn (by line) owns the send/reply order joins.
@@ -8033,9 +8110,9 @@ def _link_map(path):
     for tu_id, info in sorted(
             td.agent_link.items(),
             key=lambda kv: td.agent_to_assistant_line.get(
-                kv[1].get('agent_id'), -1)):
-        aid = info.get('agent_id')
-        agent_path = info.get('agent_path')
+                kv[1]['child_key'], -1)):
+        aid = info['child_key']
+        agent_path = info['child_session']
         spawn_line = td.agent_to_assistant_line.get(aid)
         if spawn_line is None or not agent_path:
             continue
@@ -8060,27 +8137,15 @@ def _link_map(path):
 
     for name, (aid, agent_path, std, spawn_line, inbound) in by_name.items():
         group_id = ('agent', path, aid)
-        # Teammate-side SendMessage lines with their message text. A
-        # reply joins the send whose text it delivered — stripped, as
-        # ``_parse_agent_message`` strips the body. No recipient filter:
-        # the name a worker addresses ("main", "team-lead", …) need not
-        # match the name the leader goes by, and sends to OTHER peers
-        # simply never match a leader-side reply body.
-        wsends = []
-        for wn, wrec in enumerate(std.records):
-            if not (isinstance(wrec, dict)
-                    and wrec.get('type') == 'assistant'):
-                continue
-            msg = wrec.get('message') or {}
-            content = msg.get('content') if isinstance(msg, dict) else None
-            if not isinstance(content, list):
-                continue
-            for p in content:
-                if (isinstance(p, dict) and p.get('type') == 'tool_use'
-                        and p.get('name') == 'SendMessage'):
-                    _r, _s, wmsg = _send_message_fields(p.get('input'))
-                    wsends.append(
-                        (wn, wmsg.strip() if isinstance(wmsg, str) else ''))
+        # Teammate-side message lines with their body. A reply joins the
+        # send whose text it delivered — stripped, as the parser strips
+        # the delivered body. No recipient filter: the name a worker
+        # addresses ("main", "team-lead", …) need not match the name the
+        # leader goes by, and sends to OTHER peers simply never match a
+        # leader-side reply body.
+        wsends = [(wn, body.strip())
+                  for wn, wrec in enumerate(std.records)
+                  for _r, body in _message_sends(wrec)]
         # Only traffic AFTER the owning spawn joins — an earlier
         # incarnation of a reused name exchanged its own messages, and
         # walking those into this transcript would link them to the
@@ -8161,7 +8226,7 @@ def _link_label(target_id):
     _src, line = store_source_locator(sess, n)
     td = _scan_tree(sess)
     rec = td.records[n] if 0 <= n < len(td.records) else None
-    what = _oneline(_summarise_message(rec)) if rec else f'line {line}'
+    what = _oneline(_summarise_message(rec)) if rec is not None else f'line {line}'
     if len(what) > 60:
         what = what[:59] + '…'
     return f'↗ {name}:{line}  {what}'
@@ -9112,7 +9177,7 @@ def _action_toggle_tree(ctx):
     """Flip flat ↔ tree view; preserve cursor on the same message id.
 
     Flat→tree: the cursor's message may end up several levels deep
-    inside a turn-root that's collapsed by default. Walk the ``parentUuid``
+    inside a turn-root that's collapsed by default. Walk the ancestor
     chain from the target up to root, add each ancestor to the
     framework's ``expanded`` set, then ``refresh()`` (which refetches the
     root + every expanded parent) and ``cursor_to`` the original id.
@@ -9670,62 +9735,6 @@ def on_context_menu(ctx):
 # ---- entry point ---------------------------------------------------------
 
 
-_HELP_USAGE_TMPL = """\
-Usage: browse-agents-claude [OPTIONS] [PROJECT]
-  -n NUMBER       Cap messages enumerated per session (default: {default}).
-  --session ID    Open the .jsonl for that sessionId directly.
-  --pid PID       Open the .jsonl owned by the running Claude PID.
-  --file PATH     Open an arbitrary .jsonl file directly.
-  --running       Filter projects/sessions to those with a live PID.
-  --item N        After --session/--pid/--file, position the cursor on
-                  line N (1-based) of the resolved transcript.
-  --tree          Show sessions as a tree, grouped by turn (default).
-                  Subagents list in a top block, newest first.
-  --no-tree       Show sessions as a flat reverse-time list.
-  --detail LEVEL  Detail level (default: 1). LEVEL is 1-7 or a word:
-                  1=summary (user prompts + end_turn responses),
-                  2=voice (all speech), 3=edits (+ Edit/Write/NotebookEdit),
-                  4=tools (+ all tool calls), 5=detailed (+ useful
-                  metadata), 6=all (every known record kind),
-                  7=unknown (+ unrecognised record kinds — maintenance
-                  view). Change it live with the '1'-'7' keys.
-  PROJECT         Project directory name under ~/.claude/projects/ to
-                  drill into on launch. Ignored when --session / --pid /
-                  --file is given.\
-"""
-
-
-_HELP_INTRO = """\
-browse-agents-claude — Claude Code project / session / message browser.
-
-Walks ~/.claude/projects/ to surface a four-level tree: projects ->
-sessions -> messages (or subagents) -> subagent messages. Drill into
-a transcript with Right/Alt-Down; preview shows the rendered turn.
-
-  v / V   page the preview (v) / the source .jsonl (V) via $PAGER.
-  e / E   open the preview (e) / the source .jsonl (E) in $EDITOR.
-  m       toggle inline markdown coloring of voice content (only bound
-          when the md2ansi_lib Python module is importable).
-  M       render the preview via $MDCAT / mdcat (external).
-  J / K   jump cursor to next / previous user-or-assistant voice.
-  t       toggle flat / tree view.
-  1-7     detail level: 1 summary, 2 voice, 3 edits, 4 tools,
-          5 detailed, 6 all, 7 unknown (adds unrecognised kinds).
-  Enter   follow a row's [↗] cross-link — every link is two-way: the
-          spawn site pairs with the subagent row, message rows pair
-          with their counterpart in the other transcript; a row with
-          several links opens a menu of targets.
-
-Right-click a row (or the backslash / F1 keys) for a menu: message and
-turn / tool / span umbrella rows offer the source actions above
-(edit / view / id, plus mdcat / toggle on a message); session and subagent
-rows open the transcript and show their path / id. Every row also surfaces a
-directory cluster over its project / cwd / worktree dirs — open in browse-fs,
-run a shell there, browse the git history (a submenu of commits / branches /
-status / stashes / reflog), or browse its .PLAN.md.\
-"""
-
-
 _message_limit = _MESSAGE_LIMIT
 
 
@@ -9911,8 +9920,8 @@ def main():
         # all of them) drop the preview cache; the framework then refetches
         # and ``get_preview`` re-renders at the now-current preview width.
         on_resize=lambda ctx, cols, rows: ctx.drop_preview_cache(),
-        help_usage=_HELP_USAGE_TMPL.format(default=_MESSAGE_LIMIT),
-        help_intro=_HELP_INTRO,
+        help_usage=store_help_usage(),
+        help_intro=store_help_intro(),
     ))
     _BROWSER = b
 

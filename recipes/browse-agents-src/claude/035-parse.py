@@ -1,15 +1,15 @@
-# ---- message classification + summary ------------------------------------
+# ---- raw Claude record → normalized Record -------------------------------
 #
 # Claude Code .jsonl files mix several record shapes:
-#   1. ``type=last-prompt``     — bookmark for the most recent prompt.
-#   2. ``type=permission-mode`` — permission-mode change events.
-#   3. ``type=user``            — user turn (string or content-list).
-#   4. ``type=assistant``       — assistant turn (always content-list).
-#   5. anything else            — fall back to ``message``.
+#   1. ``type=user`` / ``type=assistant`` — the conversation (string or
+#      content-list ``message.content``; tool_use / tool_result parts).
+#   2. ``type=system`` / ``type=attachment`` — framing and injected context.
+#   3. bookkeeping types (``last-prompt``, ``ai-title``, …) → ``meta``.
+#   4. anything else → ``unknown``.
 #
-# The summary is one line, capped at 80 chars, and is intentionally lossy:
-# the preview pane shows the full pretty-printed JSON, so we optimise the
-# title for fast visual scanning.
+# ``_parse_record`` maps one raw object to one ``Record``. Row labels keep
+# the raw type names (``tag``); the summary is one line, intentionally
+# lossy (the preview shows the full record), optimised for scanning.
 
 
 _TAG_STYLE_FOR_KIND = {
@@ -18,8 +18,6 @@ _TAG_STYLE_FOR_KIND = {
     'assistant':           'green',
     'attachment':          'blue',
     'system':              'gray',
-    'tool_use':            'yellow',
-    'tool_result':         'yellow',
     # Inter-agent voice: leader → worker SendMessage (send), the
     # worker → leader task-notification reply (reply), and an inbound
     # peer message from another session (peer).
@@ -70,11 +68,6 @@ _ROW_BG_FOR_KIND = {
     # talking" even though they slot into the open turn rather than
     # opening a new one.
     'queue-operation':  17,
-    # Subagent umbrella rows: the dispatching assistant ``Agent`` /
-    # ``Task`` call IS voice (it's how the assistant tells the
-    # subagent what to do), so the umbrella inherits the assistant
-    # stripe.
-    'subagent':        235,
     # Outbound leader→worker SendMessage: agent-to-agent traffic shares
     # the assistant stripe — the whole point is to keep it off the human
     # stripe (17).
@@ -87,6 +80,30 @@ _ROW_BG_FOR_KIND = {
     # from both the human stripe (17) and the assistant stripe (235).
     'agent-peer':       22,
 }
+
+
+_CANON_BY_TOOL = {
+    'Bash': 'bash',
+    'Read': 'read',
+    'Edit': 'edit', 'MultiEdit': 'edit', 'NotebookEdit': 'edit',
+    'Write': 'write',
+    'Grep': 'grep',
+    'Glob': 'glob',
+    'Agent': 'spawn', 'Task': 'spawn',
+    'SendMessage': 'message',
+    'AskUserQuestion': 'question',
+    'WebFetch': 'webfetch',
+    'WebSearch': 'websearch',
+    'Skill': 'skill',
+}
+
+
+def _tool_canon(name):
+    if name in _CANON_BY_TOOL:
+        return _CANON_BY_TOOL[name]
+    if isinstance(name, str) and name.startswith('mcp__'):
+        return 'mcp'
+    return 'other'
 
 
 def _is_voice(obj):
@@ -179,7 +196,7 @@ _L3_USEFUL = frozenset([
 
 
 # Recognised-but-noise record kinds, pinned at level 6 (all). Level 7
-# (unknown) is a maintenance view: ``_record_min_level``'s fallthrough
+# (unknown) is a maintenance view: ``_min_level_of``'s fallthrough
 # returns 7 only for a type / system subtype / attachment type the
 # recipe does not recognise anywhere — neither in a tier above, nor
 # here, nor in ``_ATTACH_FORMATTERS`` / ``_METADATA_TYPES`` (the
@@ -215,12 +232,11 @@ def _is_empty_thinking_only(rec):
 
     Signature-only (redacted/encrypted) thinking blocks store a
     ``signature`` but no readable ``thinking`` text. A turn made up
-    solely of such parts has nothing to render — ``_extract_text`` skips
-    thinking, so it summarises as the bare ``<N parts>`` shape — so
-    ``_record_min_level`` sinks it to the ``all`` (6) tier. A thinking
-    part with actual text, or any other part (tool_use / tool_result /
-    text) alongside, fails the test — readable thinking is voice
-    (level 2), other machinery stays at level 4 (3 for an edit tool).
+    solely of such parts has nothing to render, so ``_min_level_of``
+    sinks it to the ``all`` (6) tier. A thinking part with actual text,
+    or any other part (tool_use / tool_result / text) alongside, fails
+    the test — readable thinking is voice (level 2), other machinery
+    stays at level 4 (3 for an edit tool).
     """
     msg = rec.get('message') if isinstance(rec.get('message'), dict) else {}
     content = msg.get('content')
@@ -288,7 +304,15 @@ def _is_edit_tool_record(rec):
     )
 
 
-def _record_min_level(rec):
+def _is_fresh_prompt(rec):
+    """A human-typed prompt: user voice that is neither injected context
+    nor inbound agent voice."""
+    return (isinstance(rec, dict) and rec.get('type') == 'user'
+            and not rec.get('isMeta') and _is_voice(rec)
+            and not (_is_task_notification(rec) or _is_agent_message(rec)))
+
+
+def _min_level_of(rec):
     """Minimum detail level at which ``rec`` becomes visible (1-7).
 
     Whitelist semantics: only records we recognise are promoted to a
@@ -325,7 +349,7 @@ def _record_min_level(rec):
     # stamped ``isMeta`` (the gate below would bury them) and queued
     # deliveries are ``queue-operation`` records (the enqueue rule
     # below would promote them to the human prompt tier).
-    if _is_inbound_agent_voice(rec):
+    if _is_task_notification(rec) or _is_agent_message(rec):
         return 2
     # Injected context is never part of the lived conversation — it
     # outranks even its own type, so check it first.
@@ -341,7 +365,7 @@ def _record_min_level(rec):
         # ``enqueue`` is a prompt the user typed while Claude was busy,
         # so it belongs with the prompts (its ``popAll`` consumption
         # echo stays at voice to avoid a dupe).
-        if (_is_turn_root(rec)
+        if (_is_fresh_prompt(rec)
                 or (_is_end_turn(rec) and _has_spoken_text(rec))
                 or (rec.get('type') == 'queue-operation'
                     and rec.get('operation') == 'enqueue')):
@@ -388,89 +412,17 @@ def _record_min_level(rec):
     return 7
 
 
-def _passes_filter(item_id, td=None):
-    """True iff ``item_id`` should be visible at the current detail level.
+def _row_label(obj):
+    """Row label for one raw record: its ``type`` / message role, refined
+    for the inter-agent voice channel.
 
-    Used by every Item builder to derive ``hidden`` and by the live-tail
-    worker to detect when a hidden umbrella has crossed the visibility
-    threshold. A row is shown iff its *minimum* level (the lowest
-    ``_DETAIL_LEVEL`` it becomes visible at) is ``<= _DETAIL_LEVEL``.
-
-    Predicate body, by id tag:
-      * ``('msg', jsonl, n)``    → ``_record_min_level(td.records[n])``
-      * ``('prompt', jsonl, n)`` → always (turns open at a turn-root
-                                    user prompt, level 1)
-      * ``('tool', jsonl, n)``   → its assistant record's min level
-                                    (a bare tool_use is level 4, an
-                                    edit/write tool level 3), but
-                                    promoted to the voice tier (level 2)
-                                    when the umbrella wraps a resolvable
-                                    subagent (same rule as
-                                    ``_tool_umbrella_item``)
-      * ``('span', jsonl, n)``   → min level over the span's members
-      * ``('agent', …)``         → always (subagent umbrella; we don't
-                                    peek into other files at filter time)
-      * any other id             → always (be permissive; framework
-                                    error rows and ``('trunc', …)``
-                                    fillers stay visible)
-    """
-    if _DETAIL_LEVEL >= 7:
-        return True
-    if not isinstance(item_id, tuple) or not item_id:
-        return True
-    tag = item_id[0]
-    if tag == 'agent':
-        return True
-    if tag not in ('msg', 'prompt', 'tool', 'span'):
-        return True
-    path, n = item_id[1], item_id[2]
-    if td is None:
-        td = _TREE_CACHE.get(path)
-    if td is None:
-        return True
-    if tag == 'prompt':
-        return True
-    if tag == 'tool':
-        if 0 <= n < len(td.records):
-            rec = td.records[n]
-            if isinstance(rec, dict):
-                # A ``<tool:Agent>`` umbrella that dispatches a
-                # resolvable subagent reads as voice-tier (level 2) —
-                # dispatch sites keep the same tier as the subagent
-                # rows in the top block, same rule that gives them
-                # their row stripe in ``_tool_umbrella_item``.
-                # Otherwise it carries its assistant record's own min
-                # level (a bare tool_use is level 4; an edit/write
-                # tool is level 3).
-                if _tool_umbrella_wraps_subagent(rec, td):
-                    return _DETAIL_LEVEL >= 2
-                return _record_min_level(rec) <= _DETAIL_LEVEL
-        return True
-    if tag == 'span':
-        for rec in td.span_records.get(n, []):
-            if isinstance(rec, dict) and _record_min_level(rec) <= _DETAIL_LEVEL:
-                return True
-        return False
-    # tag == 'msg'
-    if 0 <= n < len(td.records):
-        rec = td.records[n]
-        if isinstance(rec, dict):
-            return _record_min_level(rec) <= _DETAIL_LEVEL
-    return True
-
-
-def _kind_of(obj):
-    """Best-effort classifier for one JSONL record.
-
-    Most records map to their raw ``type`` / message role. Three
-    refinements for the inter-agent voice channel: an assistant record
-    whose salient content is a ``SendMessage`` tool_use is the leader
-    voicing a worker (``agent-send``); a ``<task-notification>`` is the
-    worker's reply back (``agent-reply``); a peer session's message is
-    ``agent-peer``. The inbound two match both the delivered ``user``
-    record and its queued ``queue-operation`` echo. Each drives its own
-    stripe + tag style — without this, inbound agent voice would
-    inherit the human stripe and be mis-attributed.
+    An assistant record whose salient content is a ``SendMessage``
+    tool_use is the leader voicing a worker (``agent-send``); a
+    ``<task-notification>`` is the worker's reply back (``agent-reply``);
+    a peer session's message is ``agent-peer``. The inbound two match
+    both the delivered ``user`` record and its queued ``queue-operation``
+    echo. Each drives its own stripe + tag style — without this, inbound
+    agent voice would inherit the human stripe and be mis-attributed.
     """
     if _is_send_message(obj):
         return 'agent-send'
@@ -487,51 +439,322 @@ def _kind_of(obj):
     return 'message'
 
 
-def _row_tag(kind, rec):
-    """Row tag for ``rec``.
-
-    Adds ``· <attributionAgent>`` to assistant rows inside subagent
-    transcripts so the user can see which sub-type produced the turn
-    (e.g. ``assistant · general-purpose``), ``· end_turn`` to the
-    turn-concluding responses so the final word(s) of a turn stand out
-    in the row list, and ``· thinking`` to running-commentary rows
-    (readable thinking). Other record kinds get the bare kind label.
-    """
-    tag = kind
-    if kind == 'assistant' and isinstance(rec, dict):
-        attr = rec.get('attributionAgent')
-        if attr:
-            tag = f'{tag} · {attr}'
-        if _is_end_turn(rec):
-            tag = f'{tag} · end_turn'
-        elif _thinking_text(rec):
-            tag = f'{tag} · thinking'
-    return tag
+def _iso_epoch(iso):
+    """Epoch seconds of an ISO-8601 stamp, or ``None``."""
+    if not iso:
+        return None
+    try:
+        dt = datetime.datetime.fromisoformat(str(iso).replace('Z', '+00:00'))
+    except (ValueError, TypeError):
+        return None
+    if dt.tzinfo is None:
+        dt = dt.replace(tzinfo=datetime.timezone.utc)
+    try:
+        return dt.timestamp()
+    except (OverflowError, OSError, ValueError):
+        return None
 
 
-def _summarise_message(obj):
-    """One-line summary of a JSONL entry, capped at 400 chars.
+def _text_parts(content):
+    """Every non-empty ``text`` part (or the bare string), joined."""
+    if isinstance(content, str):
+        return content
+    if not isinstance(content, list):
+        return ''
+    return '\n\n'.join(
+        p['text'] for p in content
+        if isinstance(p, dict) and p.get('type') == 'text' and p.get('text')
+    )
 
-    Per-type formatters peel off the salient field without re-parsing
-    the record — every input field comes from ``obj`` directly so this
-    stays O(line) inside ``_list_messages``.
-    """
-    t = obj.get('type', '')
 
-    # Inbound agent voice — delivered (``user`` record) or queued
-    # (``queue-operation``) — summarises off the parsed wrapper fields,
-    # not the raw XML. Checked ahead of the per-type formatters so the
-    # queued echo reads like the delivered record.
-    if _is_task_notification(obj):
-        d = _parse_task_notification(_inbound_voice_text(obj) or '')
+def _tool_result_output(content):
+    """Text of a tool_result part's ``content`` (string or text sub-parts)."""
+    if isinstance(content, str):
+        return content
+    if isinstance(content, list):
+        return '\n'.join(
+            p.get('text') or '' for p in content
+            if isinstance(p, dict) and p.get('type') == 'text'
+        )
+    return None
+
+
+def _tool_result_glance(tur):
+    """Structured ``toolUseResult`` glance for the row title, or ``None``
+    to fall back to the raw output text."""
+    if isinstance(tur, dict):
+        if 'stdout' in tur:
+            return _trim(tur.get('stdout', ''), 5000) or '(no output)'
+        if 'numFiles' in tur:
+            return f'{tur["numFiles"]} files'
+        if 'agentType' in tur:
+            return f'{tur["agentType"]} → {tur.get("status", "?")}'
+        if 'taskId' in tur:
+            sc = tur.get('statusChange') or {}
+            return f'#{tur["taskId"]} {sc.get("from", "?")}→{sc.get("to", "?")}'
+        if 'commandName' in tur:
+            return tur['commandName']
+        return None
+    if isinstance(tur, str):
+        return _trim(tur, 5000)
+    return None
+
+
+def _tur_diff(tur):
+    """Unified diff of an edit result's ``structuredPatch``, or ``None``."""
+    if not (isinstance(tur, dict) and isinstance(tur.get('structuredPatch'), list)):
+        return None
+    try:
+        return _structured_patch_to_unified(
+            tur['structuredPatch'], tur.get('filePath') or '')
+    except Exception:
+        return None
+
+
+def _parse_record(raw, key=None):
+    """Map one raw Claude record to a ``Record``."""
+    label = _row_label(raw)
+    rec = Record(
+        'unknown', raw, key,
+        tag=label,
+        tag_style=_TAG_STYLE_FOR_KIND.get(label, ''),
+        id=raw.get('uuid') or None,
+        ts=_iso_epoch(raw.get('timestamp')),
+        is_voice=_is_voice(raw),
+        is_meta=bool(raw.get('isMeta')),
+        min_level=_min_level_of(raw),
+    )
+    if rec.is_voice:
+        rec.row_bg = _ROW_BG_FOR_KIND.get(label)
+
+    # Inbound agent voice (delivered ``user`` record or queued echo):
+    # summary from the parsed wrapper, body as text.
+    if _is_task_notification(raw):
+        text = _inbound_voice_text(raw) or ''
+        d = _parse_task_notification(text)
+        rec.agent_voice = 'reply'
+        rec.text = d['result'] or text
         bits = [b for b in (d['task_id'], d['status'], d['summary']) if b]
-        return '← ' + ' · '.join(bits) if bits else '← task-notification'
-    if _is_agent_message(obj):
-        sender, body = _parse_agent_message(obj)
-        body = _summarise_json_body(body) or _trim(body, 5000)
-        return f'← {sender}: {body}' if sender else f'← {body}'
+        rec.summary = '← ' + ' · '.join(bits) if bits else '← task-notification'
+    elif _is_agent_message(raw):
+        sender, body = _parse_agent_message(raw)
+        rec.agent_voice = 'idle' if _is_idle_notification(body) else 'peer'
+        rec.peer = sender or None
+        rec.text = body
+        short = _summarise_json_body(body) or _trim(body, 5000)
+        rec.summary = f'← {sender}: {short}' if sender else f'← {short}'
 
-    # Metadata records — surface the salient field.
+    t = raw.get('type')
+    msg = raw.get('message') if isinstance(raw.get('message'), dict) else {}
+    content = msg.get('content', '')
+    parts = [p for p in content if isinstance(p, dict)] \
+        if isinstance(content, list) else []
+
+    if t == 'user':
+        rec.caller_id = raw.get('sourceToolAssistantUUID') or None
+        rec.call_id = raw.get('sourceToolUseID') or None
+        results = [p for p in parts if p.get('type') == 'tool_result']
+        if results:
+            rec.kind = 'tool_result'
+            tur = raw.get('toolUseResult')
+            diff = _tur_diff(tur)
+            for p in results:
+                rec.tools.append(new_tool(
+                    call_id=p.get('tool_use_id'),
+                    output=_tool_result_output(p.get('content')),
+                    is_error=bool(p.get('is_error')),
+                    diff=diff,
+                ))
+            glance = _tool_result_glance(tur)
+            for tool in rec.tools:
+                tool['glance'] = glance
+            rec.text = _text_parts(content)
+        else:
+            rec.kind = 'user_prompt'
+            if rec.agent_voice is None:
+                rec.text = _text_parts(content)
+        return rec
+
+    if t == 'assistant':
+        rec.end_turn = msg.get('stop_reason') == 'end_turn'
+        if raw.get('attributionAgent'):
+            rec.meta['agent'] = raw['attributionAgent']
+        for p in parts:
+            if p.get('type') != 'tool_use':
+                continue
+            name = p.get('name')
+            inp = p.get('input') or {}
+            tool = new_tool(canon=_tool_canon(name), name=name,
+                            call_id=p.get('id'), input=inp)
+            if tool['canon'] == 'message':
+                recipient, _s, message = _send_message_fields(inp)
+                tool['peer'] = recipient
+                tool['text'] = message if isinstance(message, str) else ''
+            elif tool['canon'] == 'spawn' and isinstance(inp, dict):
+                tool['peer'] = inp.get('name') or None
+            rec.tools.append(tool)
+        spoken = _text_parts(content)
+        think = _thinking_text(raw)
+        if think:
+            rec.meta['thinking'] = True
+        if spoken.strip():
+            rec.kind = 'assistant_text'
+            rec.text = spoken
+        elif think:
+            rec.kind = 'thinking'
+            rec.text = think
+        elif rec.tools:
+            rec.kind = 'tool_call'
+        elif _is_empty_thinking_only(raw):
+            rec.kind = 'thinking'
+            rec.meta['encrypted'] = True
+        else:
+            rec.kind = 'assistant_text'
+        return rec
+
+    if t == 'system':
+        sub = raw.get('subtype', '')
+        body = raw.get('content') or ''
+        if sub == 'compact_boundary':
+            rec.kind = 'compaction'
+        elif sub == 'turn_duration':
+            rec.kind = 'turn_end'
+            rec.meta['duration_ms'] = raw.get('durationMs', 0)
+        else:
+            rec.kind = 'system'
+        rec.text = body if isinstance(body, str) else ''
+        rec.summary = _system_summary(raw, sub)
+        rec.meta['span_label'] = f'sys:{sub}' if sub else 'system'
+        return rec
+
+    if t == 'attachment':
+        a = raw.get('attachment') if isinstance(raw.get('attachment'), dict) else {}
+        rec.kind = 'system'
+        rec.call_id = a.get('toolUseID') or None
+        rec.summary = _attachment_summary(a)
+        rec.meta['span_label'] = f'att:{a.get("type", "")}'
+        return rec
+
+    if t == 'queue-operation':
+        rec.kind = 'meta'
+        rec.text = raw.get('content') or ''
+        if rec.summary is None:
+            rec.summary = f'queue {raw.get("operation", "?")}: {_trim(rec.text, 5000)}'
+        return rec
+
+    if t in _METADATA_TYPES or t in _KNOWN_TYPE_NOISE:
+        rec.kind = 'meta'
+        rec.summary = _metadata_summary(raw, t)
+        if t == 'ai-title':
+            rec.meta['title'] = raw.get('aiTitle')
+            rec.meta['title_by'] = 'agent'
+        elif t == 'custom-title':
+            rec.meta['title'] = raw.get('customTitle')
+            rec.meta['title_by'] = 'user'
+        return rec
+
+    # Unrecognised: keep whatever text it carries.
+    text = _extract_text(content) if content else ''
+    role = msg.get('role') or raw.get('role') or t or ''
+    rec.text = text
+    if role and text:
+        rec.summary = f'{role}: {_trim(text, 5000)}'
+    elif not role and not text:
+        rec.summary = '(empty)'
+    return rec
+
+
+def _system_summary(obj, sub):
+    if sub == 'turn_duration':
+        ms = obj.get('durationMs', 0)
+        return f'⏱ turn {ms/1000:.2f}s · {obj.get("messageCount", 0)} msgs'
+    if sub == 'api_error':
+        return f'‼ api_error'
+    if sub == 'local_command':
+        cmd = _trim(obj.get('content') or obj.get('command', ''), 5000)
+        return f'$ {cmd}' if cmd else 'local_command'
+    if sub == 'compact_boundary':
+        trig = (obj.get('compactMetadata') or {}).get('trigger', '')
+        base = obj.get('content') or 'Conversation compacted'
+        return f'♻ {base}' + (f' ({trig})' if trig else '')
+    if sub == 'model_refusal_fallback':
+        return f'⚠ refusal fallback: {_trim(obj.get("content", ""), 5000)}'
+    if sub == 'away_summary':
+        return f'away: {_trim(obj.get("content", ""), 5000)}'
+    if sub == 'informational':
+        return f'ℹ {_trim(obj.get("content", ""), 5000)}'
+    if sub == 'agents_killed':
+        return '■ agents killed'
+    return f'system: {sub}' if sub else 'system'
+
+
+def _attachment_summary(a):
+    """Row title for an attachment: the most salient field per subtype."""
+    sub = a.get('type', '?')
+    if sub == 'file':
+        return f'📎 file: {a.get("displayPath", a.get("filename", ""))}'
+    if sub == 'queued_command':
+        p = _trim(a.get('prompt', ''), 5000)
+        return f'📥 queued: {p}'
+    if sub == 'hook_success':
+        ok = a.get('exitCode', 0) == 0
+        return (f'{"✓" if ok else "✗"} hook {a.get("hookName", "?")} '
+                f'({a.get("hookEvent", "?")})')
+    if sub == 'hook_additional_context':
+        return f'+ ctx from {a.get("hookName", "?")}'
+    if sub == 'task_reminder':
+        return f'🔔 reminder ({a.get("itemCount", 0)})'
+    if sub == 'skill_listing':
+        return f'📚 skills: {a.get("skillCount", 0)}'
+    if sub == 'mcp_instructions_delta':
+        return (f'mcp Δ: +{len(a.get("addedNames") or [])}'
+                f' -{len(a.get("removedNames") or [])}')
+    if sub == 'deferred_tools_delta':
+        return (f'tools Δ: +{len(a.get("addedNames") or [])}'
+                f' -{len(a.get("removedNames") or [])}')
+    if sub == 'date_change':
+        return f'📅 date: {a.get("newDate", "?")}'
+    if sub == 'diagnostics':
+        n = len(a.get('files') or [])
+        return f'diagnostics: {n} files'
+    if sub == 'command_permissions':
+        return f'allowed: {", ".join(a.get("allowedTools") or [])}'
+    if sub == 'ultrathink_effort':
+        return '🧠 ultrathink'
+    if sub == 'total_tokens_reminder':
+        n = _total_tokens_left(a)
+        return (f'⛽ {_human_count(n)} tokens left' if n is not None
+                else '⛽ tokens left')
+    if sub == 'agent_listing_delta':
+        return (f'agents Δ: +{len(a.get("addedTypes") or [])}'
+                f' -{len(a.get("removedTypes") or [])}')
+    if sub == 'batching_reminder_sent':
+        return '🔔 batching reminder'
+    if sub == 'bash_output_audience_note':
+        return 'bash output audience note'
+    if sub == 'nested_memory':
+        return f'📎 memory: {a.get("displayPath", a.get("path", ""))}'
+    if sub == 'read_truncation_notice':
+        return f'✂ {_trim(a.get("banner", ""), 5000)}'
+    if sub in ('auto_mode', 'plan_mode'):
+        return f'⇆ {sub.replace("_", " ")}'
+    if sub == 'silent_turn_reminder':
+        return f'🔔 {_trim(a.get("text", ""), 5000)}'
+    if sub == 'already_read_file':
+        return (f'📎 already read: '
+                f'{a.get("displayPath", a.get("filename", ""))}')
+    if sub == 'hook_cancelled':
+        return (f'✗ hook {a.get("hookName", "?")} cancelled '
+                f'({a.get("hookEvent", "?")})')
+    if sub == 'invoked_skills':
+        names = [s.get('name', '?') for s in a.get('skills') or []
+                 if isinstance(s, dict)]
+        return f'📚 invoked: {", ".join(names)}'
+    return f'📎 {sub}'
+
+
+def _metadata_summary(obj, t):
+    """Row title for a bookkeeping record: the salient field per type."""
     if t == 'last-prompt':
         prompt = _trim(obj.get('lastPrompt', ''), 5000)
         return f'last-prompt: {prompt}' if prompt else 'last-prompt'
@@ -570,9 +793,6 @@ def _summarise_message(obj):
     if t == 'speculation-accept':
         ms = obj.get('timeSavedMs', 0)
         return f'speculation-accept: +{ms/1000:.1f}s saved'
-    if t == 'queue-operation':
-        c = _trim(obj.get('content', ''), 5000)
-        return f'queue {obj.get("operation", "?")}: {c}'
     if t == 'file-history-snapshot':
         snap = obj.get('snapshot') or {}
         n = len(snap) if isinstance(snap, dict) else '?'
@@ -597,185 +817,7 @@ def _summarise_message(obj):
         cost = obj.get('totalCostUSD') or 0
         return (f'💰 ${cost:.2f} · {obj.get("totalLinesAdded", 0)}+'
                 f'/{obj.get("totalLinesRemoved", 0)}−')
-    if t == 'atis-latch':
-        return 'atis-latch'
-
-    # System events.
-    if t == 'system':
-        sub = obj.get('subtype', '')
-        if sub == 'turn_duration':
-            ms = obj.get('durationMs', 0)
-            return f'⏱ turn {ms/1000:.2f}s · {obj.get("messageCount", 0)} msgs'
-        if sub == 'api_error':
-            return f'‼ api_error'
-        if sub == 'local_command':
-            cmd = _trim(obj.get('content') or obj.get('command', ''), 5000)
-            return f'$ {cmd}' if cmd else 'local_command'
-        if sub == 'compact_boundary':
-            trig = (obj.get('compactMetadata') or {}).get('trigger', '')
-            base = obj.get('content') or 'Conversation compacted'
-            return f'♻ {base}' + (f' ({trig})' if trig else '')
-        if sub == 'model_refusal_fallback':
-            return f'⚠ refusal fallback: {_trim(obj.get("content", ""), 5000)}'
-        if sub == 'away_summary':
-            return f'away: {_trim(obj.get("content", ""), 5000)}'
-        if sub == 'informational':
-            return f'ℹ {_trim(obj.get("content", ""), 5000)}'
-        if sub == 'agents_killed':
-            return '■ agents killed'
-        return f'system: {sub}' if sub else 'system'
-
-    # Attachment — pick the most salient field per subtype.
-    if t == 'attachment':
-        a = obj.get('attachment') if isinstance(obj.get('attachment'), dict) else {}
-        sub = a.get('type', '?')
-        if sub == 'file':
-            return f'📎 file: {a.get("displayPath", a.get("filename", ""))}'
-        if sub == 'queued_command':
-            p = _trim(a.get('prompt', ''), 5000)
-            return f'📥 queued: {p}'
-        if sub == 'hook_success':
-            ok = a.get('exitCode', 0) == 0
-            return (f'{"✓" if ok else "✗"} hook {a.get("hookName", "?")} '
-                    f'({a.get("hookEvent", "?")})')
-        if sub == 'hook_additional_context':
-            return f'+ ctx from {a.get("hookName", "?")}'
-        if sub == 'task_reminder':
-            return f'🔔 reminder ({a.get("itemCount", 0)})'
-        if sub == 'skill_listing':
-            return f'📚 skills: {a.get("skillCount", 0)}'
-        if sub == 'mcp_instructions_delta':
-            return (f'mcp Δ: +{len(a.get("addedNames") or [])}'
-                    f' -{len(a.get("removedNames") or [])}')
-        if sub == 'deferred_tools_delta':
-            return (f'tools Δ: +{len(a.get("addedNames") or [])}'
-                    f' -{len(a.get("removedNames") or [])}')
-        if sub == 'date_change':
-            return f'📅 date: {a.get("newDate", "?")}'
-        if sub == 'diagnostics':
-            n = len(a.get('files') or [])
-            return f'diagnostics: {n} files'
-        if sub == 'command_permissions':
-            return f'allowed: {", ".join(a.get("allowedTools") or [])}'
-        if sub == 'ultrathink_effort':
-            return '🧠 ultrathink'
-        if sub == 'total_tokens_reminder':
-            n = _total_tokens_left(a)
-            return (f'⛽ {_human_count(n)} tokens left' if n is not None
-                    else '⛽ tokens left')
-        if sub == 'agent_listing_delta':
-            return (f'agents Δ: +{len(a.get("addedTypes") or [])}'
-                    f' -{len(a.get("removedTypes") or [])}')
-        if sub == 'batching_reminder_sent':
-            return '🔔 batching reminder'
-        if sub == 'bash_output_audience_note':
-            return 'bash output audience note'
-        if sub == 'nested_memory':
-            return f'📎 memory: {a.get("displayPath", a.get("path", ""))}'
-        if sub == 'read_truncation_notice':
-            return f'✂ {_trim(a.get("banner", ""), 5000)}'
-        if sub in ('auto_mode', 'plan_mode'):
-            return f'⇆ {sub.replace("_", " ")}'
-        if sub == 'silent_turn_reminder':
-            return f'🔔 {_trim(a.get("text", ""), 5000)}'
-        if sub == 'already_read_file':
-            return (f'📎 already read: '
-                    f'{a.get("displayPath", a.get("filename", ""))}')
-        if sub == 'hook_cancelled':
-            return (f'✗ hook {a.get("hookName", "?")} cancelled '
-                    f'({a.get("hookEvent", "?")})')
-        if sub == 'invoked_skills':
-            names = [s.get('name', '?') for s in a.get('skills') or []
-                     if isinstance(s, dict)]
-            return f'📚 invoked: {", ".join(names)}'
-        return f'📎 {sub}'
-
-    # User / assistant — peek into content for salient fragment.
-    msg = obj.get('message') if isinstance(obj.get('message'), dict) else {}
-    role = msg.get('role') or obj.get('role') or t or ''
-    content = msg.get('content', obj.get('content', ''))
-
-    # Assistant with only tool_use parts → format as the tool call.
-    if role == 'assistant' and isinstance(content, list):
-        only_tool = [p for p in content
-                     if isinstance(p, dict) and p.get('type') == 'tool_use']
-        any_text = any(isinstance(p, dict) and p.get('type') == 'text'
-                       and (p.get('text') or '').strip()
-                       for p in content)
-        # Readable thinking with no spoken text → running commentary;
-        # surface it under the thinking marker (spoken text wins).
-        if not any_text:
-            think = _thinking_text(obj)
-            if think:
-                return f'🧠 thinking: {_trim(think, 5000)}'
-        if only_tool and not any_text:
-            tu = only_tool[0]
-            name = tu.get('name', '?')
-            inp = tu.get('input') or {}
-            extra = _tool_use_one_line(name, inp)
-            return f'🔧 {name}({extra})' if extra else f'🔧 {name}'
-
-    # User with tool_result → distinct prefix + a glance at the output.
-    if role == 'user' and isinstance(content, list):
-        for p in content:
-            if isinstance(p, dict) and p.get('type') == 'tool_result':
-                return f'↳ tool_result: {_tool_result_one_line(obj, p)}'
-
-    text = _extract_text(content)
-    text = _trim(text, 5000)
-    if obj.get('isMeta') and role:
-        role = f'{role}/meta'
-    if role:
-        return f'{role}: {text}' if text else role
-    return text or '(empty)'
-
-
-def _tool_use_one_line(name, inp):
-    """Compact one-line summary of a tool's input for the row title."""
-    if name == 'Bash':
-        return _trim(inp.get('command', ''), 5000)
-    if name in ('Read', 'Edit', 'Write'):
-        return inp.get('file_path', '')
-    if name == 'Grep':
-        return f'/{inp.get("pattern", "")}/'
-    if name == 'Glob':
-        return inp.get('pattern', '')
-    if name in ('Agent', 'Task'):
-        return inp.get('subagent_type', '?')
-    if name == 'Skill':
-        return inp.get('skill', '?')
-    if name == 'SendMessage':
-        recipient, summary, _ = _send_message_fields(inp)
-        return f'→ {recipient}: {summary}'
-    return ''
-
-
-def _tool_result_one_line(obj, part):
-    """One-liner peek at a tool_result for the row title."""
-    tur = obj.get('toolUseResult')
-    if isinstance(tur, dict):
-        if 'stdout' in tur:
-            return _trim(tur.get('stdout', ''), 5000) or '(no output)'
-        if 'numFiles' in tur:
-            return f'{tur["numFiles"]} files'
-        if 'agentType' in tur:
-            return f'{tur["agentType"]} → {tur.get("status", "?")}'
-        if 'taskId' in tur:
-            sc = tur.get('statusChange') or {}
-            return f'#{tur["taskId"]} {sc.get("from", "?")}→{sc.get("to", "?")}'
-        if 'commandName' in tur:
-            return tur['commandName']
-    if isinstance(tur, str):
-        return _trim(tur, 5000)
-    # Fall back to the raw content text.
-    content = part.get('content')
-    if isinstance(content, str):
-        return _trim(content, 5000)
-    if isinstance(content, list):
-        for p in content:
-            if isinstance(p, dict) and p.get('type') == 'text':
-                return _trim(p.get('text', ''), 5000)
-    return ''
+    return t
 
 
 def _extract_text(content):
@@ -813,6 +855,202 @@ def _extract_text(content):
     if content is None:
         return ''
     return str(content)
+
+
+def _send_message_fields(inp):
+    """``(recipient, summary, message)`` from a ``SendMessage`` input.
+
+    The tool duplicates its fields: prefer ``recipient``/``message``,
+    fall back to ``to``/``content``. ``summary`` is a short label.
+    """
+    inp = inp if isinstance(inp, dict) else {}
+    recipient = inp.get('recipient') or inp.get('to') or '?'
+    summary = inp.get('summary', '')
+    message = inp.get('message')
+    if not message:
+        message = inp.get('content', '')
+    return recipient, summary, message
+
+
+def _is_send_message(rec):
+    """True iff ``rec`` is an assistant record whose salient content is a
+    ``SendMessage`` tool_use (mirrors the AskUserQuestion voice branch)."""
+    if not isinstance(rec, dict):
+        return False
+    msg = rec.get('message') if isinstance(rec.get('message'), dict) else {}
+    if (rec.get('type') or msg.get('role')) != 'assistant':
+        return False
+    content = msg.get('content')
+    if not isinstance(content, list):
+        return False
+    for p in content:
+        if (isinstance(p, dict) and p.get('type') == 'tool_use'
+                and p.get('name') == 'SendMessage'):
+            return True
+    return False
+
+
+_TASK_NOTIFY_PREFIX = '<task-notification>'
+
+# Map the wrapper's hyphenated tags onto the dict keys we surface.
+_TASK_NOTIFY_TAGS = {
+    'task-id': 'task_id',
+    'tool-use-id': 'tool_use_id',
+    'output-file': 'output_file',
+    'status': 'status',
+    'summary': 'summary',
+    'result': 'result',
+}
+
+
+def _parse_task_notification(text):
+    """Peel a ``<task-notification>`` wrapper into its tagged fields.
+
+    Returns ``{task_id, tool_use_id, output_file, status, summary,
+    result}`` — every key present, missing tags resolving to ``''``.
+    ``result`` is kept as raw markdown (rendered later via ``_md_voice``).
+    A single non-greedy regex per tag, not a full XML parse: the payload
+    is machine-emitted with a fixed shape and ``result`` is free-form
+    markdown that would choke a strict parser.
+    """
+    text = text or ''
+    out = {v: '' for v in _TASK_NOTIFY_TAGS.values()}
+    for tag, key in _TASK_NOTIFY_TAGS.items():
+        m = re.search(rf'<{tag}>(.*?)</{tag}>', text, re.DOTALL)
+        if m:
+            out[key] = m.group(1).strip()
+    return out
+
+
+def _inbound_voice_text(rec):
+    """Text payload used for inbound-agent-voice detection, or None.
+
+    Two record shapes can carry an inbound agent message: a ``user``
+    record (the delivered turn — text in ``message.content``) and a
+    ``queue-operation`` record (the same payload queued while the
+    session was busy — raw text in ``content``; queue records never
+    carry an ``origin`` field, so detection there is text-shape only).
+    """
+    if not isinstance(rec, dict):
+        return None
+    if rec.get('type') == 'queue-operation':
+        return rec.get('content') or ''
+    msg = rec.get('message') if isinstance(rec.get('message'), dict) else {}
+    if (rec.get('type') or msg.get('role')) != 'user':
+        return None
+    return _extract_text(msg.get('content', ''))
+
+
+def _is_task_notification(rec):
+    """True iff ``rec`` carries a ``<task-notification>`` wrapper (the
+    worker→leader inbound reply) — as a delivered ``user`` record or a
+    queued ``queue-operation`` echo.
+
+    Mirrors ``_is_send_message`` for the outbound half: detection is by
+    the wrapper prefix on the record's text content, tolerant of the
+    bare-string and single-text-part content shapes.
+    """
+    text = _inbound_voice_text(rec)
+    return text is not None and text.lstrip().startswith(_TASK_NOTIFY_PREFIX)
+
+
+# Injected preamble + wrapper of an inbound peer message (another
+# session's SendMessage delivered into this one as a ``user`` record).
+# The wrapper tag has two known spellings: ``<agent-message from="…">``
+# and the older ``<teammate-message teammate_id="…">``.
+_AGENT_MSG_PREAMBLE = 'Another Claude session sent a message:'
+_AGENT_MSG_RE = re.compile(
+    r'<(agent-message|teammate-message)\b([^>]*)>\n?(.*?)\n?</\1>',
+    re.DOTALL)
+_AGENT_MSG_FROM_RE = re.compile(r'\b(?:from|teammate_id)="([^"]*)"')
+
+
+def _is_agent_message(rec):
+    """True iff ``rec`` carries an inbound peer message (another
+    session's SendMessage → this one) — as a delivered ``user`` record
+    or a queued ``queue-operation`` echo.
+
+    Primary signal for delivered records: the structured ``origin``
+    field — ``{"kind": "peer", "from": <sender>, ...}``. The text-shape
+    check (fixed preamble / ``<agent-message>`` / ``<teammate-message>``
+    wrapper) is the only signal for queue records (they never carry
+    ``origin``) and the LEGACY fallback for ``user`` records written
+    before ``origin`` existed — narrow it back to queue records once
+    pre-``origin`` transcripts stop mattering.
+    """
+    if isinstance(rec, dict):
+        origin = rec.get('origin')
+        if isinstance(origin, dict) and origin.get('kind') == 'peer':
+            return True
+    text = _inbound_voice_text(rec)
+    if text is None:
+        return False
+    text = text.lstrip()
+    return (text.startswith(_AGENT_MSG_PREAMBLE)
+            or text.startswith('<agent-message')
+            or text.startswith('<teammate-message'))
+
+
+def _parse_agent_message(rec):
+    """Peel an inbound peer message into ``(sender, body)``.
+
+    Sender comes from ``origin.from`` when present, else from the
+    wrapper's ``from="…"`` / ``teammate_id="…"`` attribute. Body is the
+    markdown inside the wrapper; a record with neither wrapper nor
+    preamble falls back to its whole text.
+    """
+    text = _inbound_voice_text(rec) or ''
+    origin = rec.get('origin')
+    sender = origin.get('from', '') if isinstance(origin, dict) else ''
+    m = _AGENT_MSG_RE.search(text)
+    if m:
+        if not sender:
+            fm = _AGENT_MSG_FROM_RE.search(m.group(2))
+            sender = fm.group(1) if fm else ''
+        body = m.group(3).strip()
+    else:
+        body = text.strip()
+        if body.startswith(_AGENT_MSG_PREAMBLE):
+            body = body[len(_AGENT_MSG_PREAMBLE):].strip()
+    return sender, body
+
+
+def _summarise_json_body(body):
+    """Compact row one-liner for a JSON-object peer-message body, or
+    ``None`` (non-JSON, malformed almost-JSON and non-object JSON keep
+    the raw text — the preview renders objects field-wise and still
+    pretty-prints other JSON).
+
+    Known shapes summarise off their salient fields (idle_notification
+    → reason + summary); any other object gets a short type/first-key
+    marker instead of a full raw-JSON line.
+    """
+    if not body.lstrip().startswith('{'):
+        return None
+    try:
+        parsed = json.loads(body)
+    except (TypeError, ValueError):
+        return None
+    if not isinstance(parsed, dict) or not parsed:
+        return None
+    if parsed.get('type') == 'idle_notification':
+        bits = [b for b in ('idle', parsed.get('idleReason'),
+                            parsed.get('summary')) if b]
+        return _trim(' · '.join(str(b) for b in bits), 5000)
+    t = parsed.get('type')
+    if isinstance(t, str) and t:
+        return f'{{{t}}}'
+    return f'{{{next(iter(parsed))}: …}}'
+
+def _is_idle_notification(body):
+    """True for a teammate's auto-generated idle notice (not a real reply)."""
+    body = body.lstrip()
+    if not body.startswith('{'):
+        return False
+    try:
+        return json.loads(body).get('type') == 'idle_notification'
+    except Exception:
+        return False
 
 
 # ---- preview rendering ---------------------------------------------------
@@ -1071,9 +1309,9 @@ def _render_tool_umbrella(item_id):
     if not (0 <= assistant_line < len(td.records)):
         return None
     rec = td.records[assistant_line]
-    if not isinstance(rec, dict):
+    if rec is None:
         return None
-    msg = rec.get('message') or {}
+    msg = rec.raw.get('message') or {}
     content = msg.get('content') if isinstance(msg, dict) else None
     if not isinstance(content, list):
         return None
@@ -1088,9 +1326,8 @@ def _render_tool_umbrella(item_id):
     # result record carries one (occasionally more) tool_result content
     # part; map id -> (tur, raw_content, is_error) for O(1) pairing.
     results = {}
-    for child in td.tool_children.get(rec.get('uuid'), []):
-        if not isinstance(child, dict):
-            continue
+    for child_rec in td.tool_children.get(assistant_line, []):
+        child = child_rec.raw
         c_msg = child.get('message') or {}
         c_content = c_msg.get('content') if isinstance(c_msg, dict) else None
         if not isinstance(c_content, list):
@@ -1874,192 +2111,6 @@ def _fmt_aq_one(q, answer, annotation):  # noqa: ARG001 — annotation reserved
 
 def _fmt_tool_use_ask_user_question(inp):
     return _md_voice(_fmt_ask_user_question(inp.get('questions')))
-
-
-def _send_message_fields(inp):
-    """``(recipient, summary, message)`` from a ``SendMessage`` input.
-
-    The tool duplicates its fields: prefer ``recipient``/``message``,
-    fall back to ``to``/``content``. ``summary`` is a short label.
-    """
-    inp = inp if isinstance(inp, dict) else {}
-    recipient = inp.get('recipient') or inp.get('to') or '?'
-    summary = inp.get('summary', '')
-    message = inp.get('message')
-    if not message:
-        message = inp.get('content', '')
-    return recipient, summary, message
-
-
-def _is_send_message(rec):
-    """True iff ``rec`` is an assistant record whose salient content is a
-    ``SendMessage`` tool_use (mirrors the AskUserQuestion voice branch)."""
-    if not isinstance(rec, dict):
-        return False
-    msg = rec.get('message') if isinstance(rec.get('message'), dict) else {}
-    if (rec.get('type') or msg.get('role')) != 'assistant':
-        return False
-    content = msg.get('content')
-    if not isinstance(content, list):
-        return False
-    for p in content:
-        if (isinstance(p, dict) and p.get('type') == 'tool_use'
-                and p.get('name') == 'SendMessage'):
-            return True
-    return False
-
-
-_TASK_NOTIFY_PREFIX = '<task-notification>'
-
-# Map the wrapper's hyphenated tags onto the dict keys we surface.
-_TASK_NOTIFY_TAGS = {
-    'task-id': 'task_id',
-    'tool-use-id': 'tool_use_id',
-    'output-file': 'output_file',
-    'status': 'status',
-    'summary': 'summary',
-    'result': 'result',
-}
-
-
-def _parse_task_notification(text):
-    """Peel a ``<task-notification>`` wrapper into its tagged fields.
-
-    Returns ``{task_id, tool_use_id, output_file, status, summary,
-    result}`` — every key present, missing tags resolving to ``''``.
-    ``result`` is kept as raw markdown (rendered later via ``_md_voice``).
-    A single non-greedy regex per tag, not a full XML parse: the payload
-    is machine-emitted with a fixed shape and ``result`` is free-form
-    markdown that would choke a strict parser.
-    """
-    text = text or ''
-    out = {v: '' for v in _TASK_NOTIFY_TAGS.values()}
-    for tag, key in _TASK_NOTIFY_TAGS.items():
-        m = re.search(rf'<{tag}>(.*?)</{tag}>', text, re.DOTALL)
-        if m:
-            out[key] = m.group(1).strip()
-    return out
-
-
-def _inbound_voice_text(rec):
-    """Text payload used for inbound-agent-voice detection, or None.
-
-    Two record shapes can carry an inbound agent message: a ``user``
-    record (the delivered turn — text in ``message.content``) and a
-    ``queue-operation`` record (the same payload queued while the
-    session was busy — raw text in ``content``; queue records never
-    carry an ``origin`` field, so detection there is text-shape only).
-    """
-    if not isinstance(rec, dict):
-        return None
-    if rec.get('type') == 'queue-operation':
-        return rec.get('content') or ''
-    msg = rec.get('message') if isinstance(rec.get('message'), dict) else {}
-    if (rec.get('type') or msg.get('role')) != 'user':
-        return None
-    return _extract_text(msg.get('content', ''))
-
-
-def _is_task_notification(rec):
-    """True iff ``rec`` carries a ``<task-notification>`` wrapper (the
-    worker→leader inbound reply) — as a delivered ``user`` record or a
-    queued ``queue-operation`` echo.
-
-    Mirrors ``_is_send_message`` for the outbound half: detection is by
-    the wrapper prefix on the record's text content, tolerant of the
-    bare-string and single-text-part content shapes.
-    """
-    text = _inbound_voice_text(rec)
-    return text is not None and text.lstrip().startswith(_TASK_NOTIFY_PREFIX)
-
-
-# Injected preamble + wrapper of an inbound peer message (another
-# session's SendMessage delivered into this one as a ``user`` record).
-# The wrapper tag has two known spellings: ``<agent-message from="…">``
-# and the older ``<teammate-message teammate_id="…">``.
-_AGENT_MSG_PREAMBLE = 'Another Claude session sent a message:'
-_AGENT_MSG_RE = re.compile(
-    r'<(agent-message|teammate-message)\b([^>]*)>\n?(.*?)\n?</\1>',
-    re.DOTALL)
-_AGENT_MSG_FROM_RE = re.compile(r'\b(?:from|teammate_id)="([^"]*)"')
-
-
-def _is_agent_message(rec):
-    """True iff ``rec`` carries an inbound peer message (another
-    session's SendMessage → this one) — as a delivered ``user`` record
-    or a queued ``queue-operation`` echo.
-
-    Primary signal for delivered records: the structured ``origin``
-    field — ``{"kind": "peer", "from": <sender>, ...}``. The text-shape
-    check (fixed preamble / ``<agent-message>`` / ``<teammate-message>``
-    wrapper) is the only signal for queue records (they never carry
-    ``origin``) and the LEGACY fallback for ``user`` records written
-    before ``origin`` existed — narrow it back to queue records once
-    pre-``origin`` transcripts stop mattering.
-    """
-    if isinstance(rec, dict):
-        origin = rec.get('origin')
-        if isinstance(origin, dict) and origin.get('kind') == 'peer':
-            return True
-    text = _inbound_voice_text(rec)
-    if text is None:
-        return False
-    text = text.lstrip()
-    return (text.startswith(_AGENT_MSG_PREAMBLE)
-            or text.startswith('<agent-message')
-            or text.startswith('<teammate-message'))
-
-
-def _parse_agent_message(rec):
-    """Peel an inbound peer message into ``(sender, body)``.
-
-    Sender comes from ``origin.from`` when present, else from the
-    wrapper's ``from="…"`` / ``teammate_id="…"`` attribute. Body is the
-    markdown inside the wrapper; a record with neither wrapper nor
-    preamble falls back to its whole text.
-    """
-    text = _inbound_voice_text(rec) or ''
-    origin = rec.get('origin')
-    sender = origin.get('from', '') if isinstance(origin, dict) else ''
-    m = _AGENT_MSG_RE.search(text)
-    if m:
-        if not sender:
-            fm = _AGENT_MSG_FROM_RE.search(m.group(2))
-            sender = fm.group(1) if fm else ''
-        body = m.group(3).strip()
-    else:
-        body = text.strip()
-        if body.startswith(_AGENT_MSG_PREAMBLE):
-            body = body[len(_AGENT_MSG_PREAMBLE):].strip()
-    return sender, body
-
-
-def _summarise_json_body(body):
-    """Compact row one-liner for a JSON-object peer-message body, or
-    ``None`` (non-JSON, malformed almost-JSON and non-object JSON keep
-    the raw text — the preview renders objects field-wise and still
-    pretty-prints other JSON).
-
-    Known shapes summarise off their salient fields (idle_notification
-    → reason + summary); any other object gets a short type/first-key
-    marker instead of a full raw-JSON line.
-    """
-    if not body.lstrip().startswith('{'):
-        return None
-    try:
-        parsed = json.loads(body)
-    except (TypeError, ValueError):
-        return None
-    if not isinstance(parsed, dict) or not parsed:
-        return None
-    if parsed.get('type') == 'idle_notification':
-        bits = [b for b in ('idle', parsed.get('idleReason'),
-                            parsed.get('summary')) if b]
-        return _trim(' · '.join(str(b) for b in bits), 5000)
-    t = parsed.get('type')
-    if isinstance(t, str) and t:
-        return f'{{{t}}}'
-    return f'{{{next(iter(parsed))}: …}}'
 
 
 def _fmt_tool_use_send_message(inp):
@@ -2940,7 +2991,7 @@ def _turn_root_ts(path, n):
     if not (0 <= root_line < len(td.records)):
         return None
     root = td.records[root_line]
-    return root.get('timestamp') if isinstance(root, dict) else None
+    return root.raw.get('timestamp') if root is not None else None
 
 
 def _fmt_chrome(obj, turn_root_ts=None):

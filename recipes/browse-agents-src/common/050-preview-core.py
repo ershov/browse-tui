@@ -21,44 +21,18 @@
 
 
 def _message_md_text(rec):
-    """The message's markdown text: every ``text`` part + any ``tool_result``
-    text, joined with blank lines.
+    """The record's markdown text: its body plus any tool-result output,
+    joined with blank lines.
 
     This is the inline document's source — what ``md2ansi_doc`` /
-    ``md_heading_trigger`` scan for headings. Unlike ``_extract_text`` (which
-    returns the *first* useful fragment for a one-line summary), this collects
-    ALL prose: every ``type=='text'`` content part, plus the textual body of
-    any ``type=='tool_result'`` part (its ``content`` string, or the ``text``
-    of its content sub-parts). ``thinking`` and ``tool_use`` parts are skipped
-    — they aren't the message's authored markdown. A bare-string ``content`` is
-    returned verbatim. Returns ``''`` for a record with no text.
+    ``md_heading_trigger`` scan for headings. Collects ALL prose
+    (``rec.text``) plus the output of each result on a ``tool_result``
+    record; tool calls aren't the message's authored markdown. Returns
+    ``''`` for a record with no text.
     """
-    msg = rec.get('message') if isinstance(rec, dict) else None
-    content = msg.get('content') if isinstance(msg, dict) else None
-    if isinstance(content, str):
-        return content
-    if not isinstance(content, list):
-        return ''
-    chunks = []
-    for part in content:
-        if not isinstance(part, dict):
-            continue
-        ptype = part.get('type')
-        if ptype == 'text':
-            t = part.get('text', '') or ''
-            if t:
-                chunks.append(t)
-        elif ptype == 'tool_result':
-            inner = part.get('content')
-            if isinstance(inner, str):
-                if inner:
-                    chunks.append(inner)
-            elif isinstance(inner, list):
-                for sub in inner:
-                    if isinstance(sub, dict) and sub.get('type') == 'text':
-                        t = sub.get('text', '') or ''
-                        if t:
-                            chunks.append(t)
+    chunks = [rec.text] if rec.text else []
+    if rec.kind == 'tool_result':
+        chunks.extend(t['output'] for t in rec.tools if t['output'])
     return '\n\n'.join(chunks)
 
 
@@ -82,17 +56,18 @@ def _iter_str_leaves(obj):
 
 
 def _record_has_md_ref(rec):
-    """True iff any string leaf of ``rec`` contains a ``.md`` reference token.
+    """True iff any string leaf of the source object contains a ``.md``
+    reference token.
 
-    Short-circuiting: walks ``rec``'s string leaves (``_iter_str_leaves``) and
-    stops at the FIRST ``.md`` hit via ``md_doc.find_md_refs`` — far cheaper
-    than serialising the whole record. No ``os.stat`` here (detection is
-    optimistic; existence is checked lazily on expand, and a dead token
-    self-heals). Sees ``Write``/``Read``/``Edit`` tool paths and prose alike.
+    Short-circuiting: walks ``rec.raw``'s string leaves (``_iter_str_leaves``)
+    and stops at the FIRST ``.md`` hit via ``md_doc.find_md_refs`` — far
+    cheaper than serialising the whole record. No ``os.stat`` here (detection
+    is optimistic; existence is checked lazily on expand, and a dead token
+    self-heals). Sees tool paths and prose alike, whatever the agent's shape.
     """
     if _md_doc is None:
         return False
-    for s in _iter_str_leaves(rec):
+    for s in _iter_str_leaves(rec.raw):
         if _md_doc.find_md_refs(s):
             return True
     return False
@@ -332,7 +307,7 @@ def _md_refs_umbrella_children(item_id):
     if rec is None:
         return []
     doc_dir = cwd or project_root
-    record_text = '\n'.join(_iter_str_leaves(rec))
+    record_text = '\n'.join(_iter_str_leaves(rec.raw))
     return [
         _md_file_item(anchor, (abspath,), label)
         for abspath, label in _md_resolved_refs(
@@ -384,7 +359,7 @@ def _md_message_children(anchor):
     # The same concatenated string leaves (prose + tool paths) feed both halves.
     cwd, project_root = store_session_cwd_and_root(path)
     doc_dir = cwd or project_root
-    record_text = '\n'.join(_iter_str_leaves(rec))
+    record_text = '\n'.join(_iter_str_leaves(rec.raw))
     if _has_any_existing_ref(record_text, doc_dir, cwd or '', project_root or ''):
         out.append(_md_refs_umbrella_item(anchor, ()))
     return out
@@ -837,9 +812,10 @@ def _preview_message(sess, n):
     preview no longer concatenates anything extra — the umbrella's own
     preview is where multi-child concatenation lives.
     """
-    obj = _record_at(sess, n)
-    if obj is None:
+    rec = _record_at(sess, n)
+    if rec is None:
         return ''
+    obj = rec.raw
     kind = _classify(obj)
     body = _RENDERERS.get(kind, _render_unknown)(obj)
     chrome = _fmt_chrome(obj, _turn_root_ts(sess, n))
@@ -883,7 +859,7 @@ def _fmt_scope_card(sess, td):
     rows.append(('lines', str(n_lines)))
     if td.voice_count is None:
         td.voice_count = sum(
-            1 for r in td.records if isinstance(r, dict) and _is_voice(r)
+            1 for r in td.records if r is not None and r.is_voice
         )
     rows.append(('voice', str(td.voice_count)))
     if info['mtime'] is not None:
@@ -1120,11 +1096,12 @@ def _render_record_with_rule(sess, n):
     logical line — so successive turns stand out as the visual anchors
     of a composed multi-turn preview.
     """
-    obj = _record_at(sess, n)
-    if obj is None or not isinstance(obj, dict):
+    rec = _record_at(sess, n)
+    if rec is None:
         return None
+    obj = rec.raw
     kind = _classify(obj)
-    if _is_turn_root(obj):
+    if _is_turn_root(rec):
         # A turn root is always a 'user' record (``_is_turn_root``), so
         # ``_render_user`` is the right renderer; thread the band's SGR
         # params as md2ansi's reset baseline, then band every line.
@@ -1141,16 +1118,15 @@ def _render_record_with_rule(sess, n):
 def _tool_label(cid):
     """Tool name for a composed ``('tool', sess, key)`` block's section rule.
 
-    Resolves the dispatching assistant record's first ``tool_use`` name from
-    ``td.tool_use_name_of`` — the same source the ``<tool:Name>`` umbrella
-    title prefix uses. Defensive: any malformed id / scan failure / missing
-    entry falls back to ``'tool'`` so the rule still renders.
+    The dispatching record's first call name — the same source the
+    ``<tool:Name>`` umbrella title prefix uses. Defensive: any malformed
+    id / scan failure / missing entry falls back to ``'tool'`` so the
+    rule still renders.
     """
     try:
         _tag, sess, assistant_line = cid
-        td = _scan_tree(sess)
-        rec = td.records[assistant_line]
-        return td.tool_use_name_of.get(rec.get('uuid'), 'tool')
+        rec = _scan_tree(sess).records[assistant_line]
+        return rec.tool['name'] or 'tool'
     except Exception:
         return 'tool'
 

@@ -1,62 +1,6 @@
 # ---- entry point ---------------------------------------------------------
 
 
-_HELP_USAGE_TMPL = """\
-Usage: browse-agents-claude [OPTIONS] [PROJECT]
-  -n NUMBER       Cap messages enumerated per session (default: {default}).
-  --session ID    Open the .jsonl for that sessionId directly.
-  --pid PID       Open the .jsonl owned by the running Claude PID.
-  --file PATH     Open an arbitrary .jsonl file directly.
-  --running       Filter projects/sessions to those with a live PID.
-  --item N        After --session/--pid/--file, position the cursor on
-                  line N (1-based) of the resolved transcript.
-  --tree          Show sessions as a tree, grouped by turn (default).
-                  Subagents list in a top block, newest first.
-  --no-tree       Show sessions as a flat reverse-time list.
-  --detail LEVEL  Detail level (default: 1). LEVEL is 1-7 or a word:
-                  1=summary (user prompts + end_turn responses),
-                  2=voice (all speech), 3=edits (+ Edit/Write/NotebookEdit),
-                  4=tools (+ all tool calls), 5=detailed (+ useful
-                  metadata), 6=all (every known record kind),
-                  7=unknown (+ unrecognised record kinds — maintenance
-                  view). Change it live with the '1'-'7' keys.
-  PROJECT         Project directory name under ~/.claude/projects/ to
-                  drill into on launch. Ignored when --session / --pid /
-                  --file is given.\
-"""
-
-
-_HELP_INTRO = """\
-browse-agents-claude — Claude Code project / session / message browser.
-
-Walks ~/.claude/projects/ to surface a four-level tree: projects ->
-sessions -> messages (or subagents) -> subagent messages. Drill into
-a transcript with Right/Alt-Down; preview shows the rendered turn.
-
-  v / V   page the preview (v) / the source .jsonl (V) via $PAGER.
-  e / E   open the preview (e) / the source .jsonl (E) in $EDITOR.
-  m       toggle inline markdown coloring of voice content (only bound
-          when the md2ansi_lib Python module is importable).
-  M       render the preview via $MDCAT / mdcat (external).
-  J / K   jump cursor to next / previous user-or-assistant voice.
-  t       toggle flat / tree view.
-  1-7     detail level: 1 summary, 2 voice, 3 edits, 4 tools,
-          5 detailed, 6 all, 7 unknown (adds unrecognised kinds).
-  Enter   follow a row's [↗] cross-link — every link is two-way: the
-          spawn site pairs with the subagent row, message rows pair
-          with their counterpart in the other transcript; a row with
-          several links opens a menu of targets.
-
-Right-click a row (or the backslash / F1 keys) for a menu: message and
-turn / tool / span umbrella rows offer the source actions above
-(edit / view / id, plus mdcat / toggle on a message); session and subagent
-rows open the transcript and show their path / id. Every row also surfaces a
-directory cluster over its project / cwd / worktree dirs — open in browse-fs,
-run a shell there, browse the git history (a submenu of commits / branches /
-status / stashes / reflog), or browse its .PLAN.md.\
-"""
-
-
 _message_limit = _MESSAGE_LIMIT
 
 
@@ -242,8 +186,8 @@ def main():
         # all of them) drop the preview cache; the framework then refetches
         # and ``get_preview`` re-renders at the now-current preview width.
         on_resize=lambda ctx, cols, rows: ctx.drop_preview_cache(),
-        help_usage=_HELP_USAGE_TMPL.format(default=_MESSAGE_LIMIT),
-        help_intro=_HELP_INTRO,
+        help_usage=store_help_usage(),
+        help_intro=store_help_intro(),
     ))
     _BROWSER = b
 

@@ -1034,9 +1034,7 @@ def store_child_sessions(session_jsonl_path):
             # Voice stripe: the dispatching assistant call is voice, so
             # the subagent umbrella that represents it carries the
             # assistant-row background colour.
-            bg = _ROW_BG_FOR_KIND.get('subagent')
-            if bg is not None:
-                item.row_bg = bg
+            item.row_bg = _ROW_BG_SPAWN
             out.append(item)
     # Legacy team workers: on the old backend, named agents spawned via
     # the Agent tool run as sibling *sessions*, not agent-*.jsonl files
@@ -1081,13 +1079,17 @@ def store_child_sessions(session_jsonl_path):
         item.subagent_path = agent_path
         item.line_count = count
         item.mtime = st.st_mtime
-        bg = _ROW_BG_FOR_KIND.get('subagent')
-        if bg is not None:
-            item.row_bg = bg
+        item.row_bg = _ROW_BG_SPAWN
         out.append(item)
     # Newest-first ordering matches the rest of the recipe.
     out.sort(key=lambda it: -it.mtime)
     return out
+
+
+def store_mark_orphan(item):
+    """Re-tag a child row the fold could not link to a dispatch site."""
+    item.tag = (f'{item.agent_type} · {item.line_count} msg · orphan · '
+                f'{_human_time(item.mtime)}')
 
 
 _NAME_FILL_LOCK = threading.Lock()
@@ -1194,6 +1196,70 @@ def _session_path_for_sid(sid):
             _SESSION_PATH_BY_SID[sid] = candidate
             return candidate
     return None
+
+
+_HELP_USAGE_TMPL = """\
+Usage: browse-agents-claude [OPTIONS] [PROJECT]
+  -n NUMBER       Cap messages enumerated per session (default: {default}).
+  --session ID    Open the .jsonl for that sessionId directly.
+  --pid PID       Open the .jsonl owned by the running Claude PID.
+  --file PATH     Open an arbitrary .jsonl file directly.
+  --running       Filter projects/sessions to those with a live PID.
+  --item N        After --session/--pid/--file, position the cursor on
+                  line N (1-based) of the resolved transcript.
+  --tree          Show sessions as a tree, grouped by turn (default).
+                  Subagents list in a top block, newest first.
+  --no-tree       Show sessions as a flat reverse-time list.
+  --detail LEVEL  Detail level (default: 1). LEVEL is 1-7 or a word:
+                  1=summary (user prompts + end_turn responses),
+                  2=voice (all speech), 3=edits (+ Edit/Write/NotebookEdit),
+                  4=tools (+ all tool calls), 5=detailed (+ useful
+                  metadata), 6=all (every known record kind),
+                  7=unknown (+ unrecognised record kinds — maintenance
+                  view). Change it live with the '1'-'7' keys.
+  PROJECT         Project directory name under ~/.claude/projects/ to
+                  drill into on launch. Ignored when --session / --pid /
+                  --file is given.\
+"""
+
+
+_HELP_INTRO = """\
+browse-agents-claude — Claude Code project / session / message browser.
+
+Walks ~/.claude/projects/ to surface a four-level tree: projects ->
+sessions -> messages (or subagents) -> subagent messages. Drill into
+a transcript with Right/Alt-Down; preview shows the rendered turn.
+
+  v / V   page the preview (v) / the source .jsonl (V) via $PAGER.
+  e / E   open the preview (e) / the source .jsonl (E) in $EDITOR.
+  m       toggle inline markdown coloring of voice content (only bound
+          when the md2ansi_lib Python module is importable).
+  M       render the preview via $MDCAT / mdcat (external).
+  J / K   jump cursor to next / previous user-or-assistant voice.
+  t       toggle flat / tree view.
+  1-7     detail level: 1 summary, 2 voice, 3 edits, 4 tools,
+          5 detailed, 6 all, 7 unknown (adds unrecognised kinds).
+  Enter   follow a row's [↗] cross-link — every link is two-way: the
+          spawn site pairs with the subagent row, message rows pair
+          with their counterpart in the other transcript; a row with
+          several links opens a menu of targets.
+
+Right-click a row (or the backslash / F1 keys) for a menu: message and
+turn / tool / span umbrella rows offer the source actions above
+(edit / view / id, plus mdcat / toggle on a message); session and subagent
+rows open the transcript and show their path / id. Every row also surfaces a
+directory cluster over its project / cwd / worktree dirs — open in browse-fs,
+run a shell there, browse the git history (a submenu of commits / branches /
+status / stashes / reflog), or browse its .PLAN.md.\
+"""
+
+
+def store_help_usage():
+    return _HELP_USAGE_TMPL.format(default=_MESSAGE_LIMIT)
+
+
+def store_help_intro():
+    return _HELP_INTRO
 
 
 def store_name():
@@ -1324,13 +1390,16 @@ def store_parent_of_child(session_key):
     return sess_path, aid
 
 
-def store_resolve_spawned_child(session_key, tur, tool_input):
+def store_resolve_spawned_child(session_key, call, result):
     """Join an Agent/Task spawn result to its transcript.
 
-    ``tur`` is the user record's ``toolUseResult``, ``tool_input`` the
-    spawning ``tool_use`` part's input. Returns ``(child_key,
-    child_session_key)`` or ``None`` when nothing on disk matches.
+    ``call`` is the spawning tool dict (canon ``spawn``), ``result`` the
+    normalized tool_result record; the join reads the raw user record's
+    ``toolUseResult``. Returns ``(child_key, child_session_key)`` or
+    ``None`` when nothing on disk matches.
     """
+    tur = result.raw.get('toolUseResult')
+    tool_input = call['input']
     if not isinstance(tur, dict):
         return None
     agent_id = tur.get('agentId')
