@@ -295,8 +295,8 @@ status line (exit code, duration, cwd, `parsed_cmd` kinds) from the
 agent-private result keys `exit_code`, `duration`, `cwd`, `status`,
 `parsed_cmd`. Token counts and rate limits are row summaries of the
 `token_count` / `token_usage_record` meta records and the `tokens` chrome
-on `turn_end`. OpenCode extras (planned): step cost and tokens, snapshots,
-agent and model selection events.
+on `turn_end`. OpenCode has no extras: step cost and tokens are `meta`
+chrome, snapshots and the selection events are `meta` rows.
 
 ## What the common view expects from records
 
@@ -429,42 +429,78 @@ agent and model selection events.
 
 ### OpenCode
 
-* Store: `$XDG_DATA_HOME/opencode/opencode.db` (default
-  `~/.local/share/opencode/`), or `opencode-<channel>.db`; newest mtime wins,
-  `--db PATH` overrides. WAL mode, written concurrently by a running opencode;
-  open with `sqlite3.connect('file:…?mode=ro', uri=True)`. Installed
-  version 2.2.0 holds both generations in one DB.
+* Store: `$OPENCODE_DB`, else the newest `opencode.db` / `opencode-<channel>.db`
+  under `$XDG_DATA_HOME/opencode` (default `~/.local/share/opencode`);
+  `--db PATH` overrides. WAL mode, written concurrently by a running
+  opencode: every query opens a short connection through
+  `pathlib.Path(db).resolve().as_uri() + '?mode=ro'` (timeout 0.5 s) and a
+  locked or missing database yields no rows until the next call. Installed
+  version 2.2.0 holds both generations in one DB; the generation is
+  `'v2'` when `session_v2` exists, else `'v1'` when `session` exists.
+  Keys: `project_key` = `project.id`, `session_key` = session id,
+  `child_key` = child session id, `record_key` = dense ordinal over the
+  expanded records, mapped to `(message id, element index)` (v1: `(part
+  id, index)`). The index (projects, sessions with their message counts
+  and `parent_id` children) is rebuilt on each root listing. `--session
+  ID` accepts a unique prefix; a positional is a session id or a project
+  worktree path. `store_resolve_spawned_child` matches a child session id
+  in the `task` result output / metadata or the call input (no local
+  sample yet); unmatched children show as orphans.
 * v2 (default when `session_v2` exists): `project(id, worktree, name, vcs,
-  time_*)` with `project_directory` and `worktree` rows for display →
-  `session_v2(id, project_id, parent_id, fork_session_id, slug, directory,
-  title, agent, model, cost, tokens_*, time_created, time_updated,
-  time_archived, time_suspended)` → `session_message(id, session_id, type,
-  seq, time_created, time_updated, data)` ordered by `seq`.
-  `type ∈ user{text, files, agents}, assistant{agent, model{providerID, id,
-  variant}, content:[text{text, time} | reasoning{text} | tool{id, name,
-  state{status, input, content:[{type:text, text}], metadata}, time}],
-  snapshot{start, end}, finish, cost, tokens{input, output, reasoning,
-  cache{read, write}}, time}, system{text}, synthetic, skill, shell,
-  compaction, idle{outcome}, agent_selected, model_selected,
-  location_switched`.
-  Mapping: user → `user_prompt` (also opens the turn); each assistant
-  content element → `assistant_text` / `thinking` / `tool_call`+`tool_result`;
-  idle → `turn_end`; system, synthetic, skill, shell → `system`; compaction →
-  `compaction`; selection events → `meta`. Tool name is `shell` in 2.x.
+  time_*)` → `session_v2(id, project_id, parent_id, fork_session_id,
+  directory, title, version, agent, model (JSON `{id, providerID,
+  variant}`), cost, tokens_*, time_created, time_updated, time_idle,
+  idle_outcome)` → `session_message(id, session_id, type, seq,
+  time_created, time_updated, data)` ordered by `seq` (times in ms).
+  `type ∈ user{text, files, agents, time}, assistant{agent, model,
+  content:[reasoning{text, time} | tool{id, name, executed, state{status,
+  input, content:[{type:text, text}], metadata}, time} | text{text}],
+  snapshot, finish ∈ stop | tool-calls, cost, tokens{input, output,
+  reasoning, cache}, time, error?}, system{text}, idle{outcome}, synthetic,
+  skill, shell, compaction, agent_selected, model_selected,
+  location_switched`. Tool names seen: read, grep, glob, shell, edit
+  (`bash` in 1.x); an `edit` result's `metadata.files[].patch` is the
+  unified diff.
+  Mapping (`_expand`, one record per content element so a message's
+  ordinal layout never changes while it streams): user → `user_prompt`
+  (opens the turn); assistant → `thinking` per reasoning element,
+  `tool_call` + `tool_result` per tool element (the result is a `(status)`
+  placeholder with no output until `state.status` is `completed` /
+  `error`; `is_error` on error; glance from `metadata` — `exit N`,
+  `N matches`, `N files`, `N file(s): …` — else the output; edit results
+  level 3), `assistant_text` per text element (the last text of a message
+  with `finish == stop` is `end_turn`, level 1); `meta.model`
+  (`provider/id`) and `meta.agent` on every assistant record, `tokens` /
+  `cost` on the message's last record; an assistant message with no
+  content is a level-6 `meta` row, or a level-4 `system` row tagged
+  `error` when it carries `error`; idle → `turn_end` (level 4, `idle ·
+  <outcome>`); system / skill / shell → `system` (level 5), synthetic →
+  `system` + `is_meta`; compaction → `compaction`; the selection events →
+  `meta` level 5; other message types and content element types →
+  `unknown`. Tool inputs are normalised for the generic one-liners and
+  bodies (`path` / `filePath` → `file_path`, `oldString` / `newString` /
+  `replaceAll` → the snake_case names, list `command` joined, `name` →
+  `skill`); a `task` call's `description` is the tool `peer`.
 * v1 (fallback, opencode 1.x): `session(id, project_id, parent_id,
   directory, title, …)` → `message(id, session_id, time_created, data{role,
-  agent, model})` → `part(id, message_id, session_id, time_created,
-  time_updated, data{type, …})`; records are parts ordered by
-  `message.time_created, message.id, part.id`. Part types `text`,
-  `reasoning`, `tool{tool, callID, state{status, input, output, metadata,
-  title, time}}`, `step-start{snapshot}` → `turn_start`,
-  `step-finish{reason, cost, tokens}` → `turn_end`, `compaction`, `retry`,
-  `snapshot`/`patch`/`file` → `meta`. An upgraded 2.x install has migrated v1
-  rows into v2 (kv key `migration.v1-v2`), so v1 is read only when
-  `session_v2` is absent.
-* Child sessions via `parent_id`; thinking is plaintext.
-* Source locator: dump the `session_message` row (v2) or message plus parts
-  (v1) as pretty JSON to a temp file.
+  agent, providerID, modelID, finish, cost, tokens})` → `part(id,
+  message_id, session_id, time_created, time_updated, data{type, …})`;
+  rows are parts ordered by `message.time_created, message.id, part.id`
+  with the message envelope attached. Part types: text → `user_prompt` /
+  `assistant_text` (the message's last text part is `end_turn` when
+  `finish == stop`), reasoning → `thinking`, tool{tool, callID,
+  state{status, input, output, metadata}} → `tool_call` + `tool_result`
+  (`metadata.diff` as the diff when present), step-start → `turn_start`,
+  step-finish{reason, cost, tokens} → `turn_end` (level 4, cost / tokens
+  in `meta`), compaction → `compaction`, retry → `meta` level 5,
+  snapshot / patch / file / agent / subtask → `meta` level 6, else
+  `unknown`. An upgraded 2.x install has migrated v1 rows into v2 (kv key
+  `migration.v1-v2`), so v1 is read only when `session_v2` is absent.
+* Source: `store_source_path` writes the session's rows (v1: parts with
+  their message) as pretty JSON to a per-process temp dir (removed at
+  exit), refreshed when the watermark moves; `store_source_excerpt` dumps
+  the selected records' raw objects; `store_source_locator` is `(db
+  path, None)`. No `055-extras`: the generic renderers carry every record.
 
 ## Live-tail model
 
@@ -480,12 +516,14 @@ before `sys.exit`.
   offset, parse complete lines, keep a partial trailing line for the next
   poll. `changed` is always empty. The per-line byte offsets recorded
   while reading serve `store_source_excerpt`.
-* OpenCode (`045-tail`): watermark `(max(seq), max(time_updated))` of
-  `session_message` for the session (v1: `part.time_updated`). On change,
-  rows with `seq` above the watermark become `new`; rows with
-  `time_updated` above it and `seq` at or below it become `changed` (an
-  assistant row grows while streaming). `database is locked` is retried on
-  the next tick.
+* OpenCode (`045-tail`): watermark `(count, max(seq), max(time_updated))`
+  of `session_message` for the session (v1: `(count, max(time_updated))`
+  of `part`). On change, rows past the watermark become `new`; rows
+  updated in place (an assistant row grows while streaming) are
+  re-expanded and reported as `changed` under their existing keys, extra
+  elements of the LAST row are appended as `new`, and extra elements of an
+  earlier row are dropped (they would shift every later ordinal). A locked
+  database yields nothing and is retried on the next tick.
 
 ## Test strategy
 
