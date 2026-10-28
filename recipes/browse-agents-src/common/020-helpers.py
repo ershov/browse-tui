@@ -172,6 +172,28 @@ def _total_tokens_left(a):
     return int(m.group(1)) if m else None
 
 
+def _collapse_home(path):
+    """Collapse a leading ``$HOME`` to ``~`` for display (else verbatim)."""
+    if not path:
+        return path
+    home = os.environ.get('HOME') or os.path.expanduser('~')
+    if home and path == home:
+        return '~'
+    if home and path.startswith(home + '/'):
+        return '~' + path[len(home):]
+    return path
+
+
+# Titles render into one-line tags and the aligned scope card — squash
+# control chars (newlines, ESC sequences a recorded title could carry).
+_CTRL_CHARS_RE = re.compile(r'[\x00-\x1f\x7f]+')
+
+
+def _clean_title(s):
+    """One safe display line out of a recorded title (or '')."""
+    return _CTRL_CHARS_RE.sub(' ', s).strip() if s else ''
+
+
 def _human_time(epoch):
     """Compact relative-time formatter (``2m ago``, ``3d ago``, …)."""
     if not epoch:

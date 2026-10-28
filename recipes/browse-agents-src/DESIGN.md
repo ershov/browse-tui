@@ -91,9 +91,12 @@ commit as the parts that changed them.
 each agent's `025-store`, `035-parse` and `045-tail` define them and common
 code calls them by name. `common/` never touches agent paths, line numbers,
 SQL or raw record shapes: records reach it as `Record` instances (next
-section). The parser that builds them (Claude: `_parse_record(raw, key)`)
-is internal to the agent's `035-parse`, not a contract function; common
-only sees its output through `store_tail_open` / `store_tail_poll`.
+section). The parser that builds them (Claude: `_parse_record(raw, key)`;
+Codex: `_parse_record(raw, key, ctx)` with a cross-line `_ParseCtx` the
+tail state carries) is internal to the agent's `035-parse`, not a contract
+function; common only sees its output through `store_tail_open` /
+`store_tail_poll`. The display helpers common itself needs (`_clean_title`,
+`_collapse_home`) live in `common/020-helpers`.
 
 Keys: `project_key`, `session_key` and `child_key` are opaque to common
 code (hashable, orderable within their kind, stable across runs; for Claude
@@ -232,19 +235,19 @@ Tool canon names and the per-agent name map:
 
 | canon | Claude | Codex | OpenCode |
 |---|---|---|---|
-| `bash` | Bash | CommandExecution, `exec` custom tool | bash (1.x), shell (2.x) |
-| `read` | Read | | read |
-| `edit` | Edit, MultiEdit, NotebookEdit | FileChange | edit, patch |
+| `bash` | Bash | `exec_command` (the `exec` custom tool's `tools.exec_command`), shell / `shell_command` / `local_shell` function calls; CommandExecution results | bash (1.x), shell (2.x) |
+| `read` | Read | `view_image`, `read_file` | read |
+| `edit` | Edit, MultiEdit, NotebookEdit | `apply_patch` (via `exec` or a function call); FileChange results | edit, patch |
 | `write` | Write | | write |
 | `grep` | Grep | | grep |
 | `glob` | Glob | | glob, list |
-| `spawn` | Agent, Task | thread spawn (via `thread_spawn_edges`) | task |
+| `spawn` | Agent, Task | `spawn_agent`; children via `thread_spawn_edges` | task |
 | `message` | SendMessage | | |
 | `question` | AskUserQuestion | | question |
 | `webfetch` | WebFetch | | webfetch |
-| `websearch` | WebSearch | | websearch |
+| `websearch` | WebSearch | `web_search` | websearch |
 | `skill` | Skill | | skill |
-| `mcp` | `mcp__*` | | names with a server prefix |
+| `mcp` | `mcp__*` | `mcp__*` | names with a server prefix |
 | `other` | everything else | everything else | everything else (todowrite, …) |
 
 ## Extras hook contract
@@ -285,10 +288,15 @@ rows; `_TOOL_UMBRELLA_FORMATTERS` (tool name → `fn(inp, tur, raw_content,
 is_error)`) is adapted into `_TOOL_FORMATTERS` for Bash, Read, Edit,
 Write, NotebookEdit, Grep, Glob, WebFetch, WebSearch, ToolSearch, Skill,
 SendMessage, TodoWrite, ExitPlanMode, Task* and `mcp`; result tool dicts
-carry the agent-private keys `tur` and `content` for them. Codex extras
-(planned): `parsed_cmd`, token counts and rate limits. OpenCode extras
-(planned): step cost and tokens, snapshots, agent and model selection
-events.
+carry the agent-private keys `tur` and `content` for them. Codex extras:
+the generic renderers carry every record; the only entry is
+`_TOOL_FORMATTERS['exec_command']`, whose result / umbrella bodies add a
+status line (exit code, duration, cwd, `parsed_cmd` kinds) from the
+agent-private result keys `exit_code`, `duration`, `cwd`, `status`,
+`parsed_cmd`. Token counts and rate limits are row summaries of the
+`token_count` / `token_usage_record` meta records and the `tokens` chrome
+on `turn_end`. OpenCode extras (planned): step cost and tokens, snapshots,
+agent and model selection events.
 
 ## What the common view expects from records
 
@@ -336,40 +344,88 @@ events.
 
 ### Codex CLI
 
-* Store: `~/.codex/sessions/YYYY/MM/DD/rollout-<ts>-<uuid>.jsonl`
-  (`$CODEX_HOME` override). Index `~/.codex/state_5.sqlite`: `threads(id,
-  rollout_path, created_at, updated_at, cwd, title, model_provider, source,
-  tokens_used, archived, git_sha, git_branch)`,
-  `thread_spawn_edges(parent_thread_id, child_thread_id, status)`. Projects
-  group threads by `cwd`; when the DB is absent fall back to line 1
-  `session_meta.payload.cwd`.
+* Store: `$CODEX_HOME/sessions/YYYY/MM/DD/rollout-<ts>-<uuid>.jsonl`
+  (`$CODEX_HOME` defaults to `~/.codex`). Index `state_5.sqlite`:
+  `threads(id, rollout_path, cwd, title, name, model, git_branch, source,
+  cli_version, …)` (`title` is the first prompt, `name` the optional
+  short thread name) and `thread_spawn_edges(parent_thread_id,
+  child_thread_id, status)`, opened read-only through
+  `pathlib.Path(db).as_uri() + '?mode=ro'` so a path with `?`, `#` or
+  `%` is escaped (OpenCode must build its URI the same way). The
+  index is the DB rows whose rollout exists, topped up with every
+  `rollout-*.jsonl` on disk the DB does not list (facts from line 1
+  `session_meta`: id, cwd, cli_version, git branch; title from the first
+  prompt in the head); without the DB or the `sqlite3` module that scan is
+  the whole index. Rebuilt on each root listing. Keys: `project_key` =
+  cwd, `session_key` = rollout path, `child_key` = child thread id.
+  Projects group threads by `cwd`; a thread with a spawn edge lists under
+  its parent (`store_child_sessions`), not under the project. Session rows
+  are titled by the thread name, else the first prompt (the long title
+  stays a `store_session_info` meta row), tagged `model · N rec · N sub ·
+  age`. `--thread ID` accepts a unique id prefix; `--file PATH`
+  opens any rollout (its facts come from its head).
+  `store_resolve_spawned_child` joins a canon `spawn` call to the child
+  whose thread id the result output or call input mentions (no local
+  sample of a spawn yet); unmatched children show as orphans.
 * Line: `{timestamp, ordinal?, type, payload, metadata?}`. Versions seen
   locally: 0.104.0 (no `ordinal`, `event_msg.user_message`), 0.153.4, 0.161.0
   (`ordinal`, `item_completed`).
 * `type ∈ session_meta, turn_context, response_item, event_msg,
   token_usage_record, world_state`.
-  `response_item.payload.type ∈ message{role ∈ user, developer, assistant},
-  reasoning{summary, encrypted_content}, custom_tool_call{name, input, call_id},
-  custom_tool_call_output{call_id, output}, function_call{name, arguments,
-  call_id}, function_call_output{call_id, output}, …`; not a closed set,
-  others → `unknown`.
-  `event_msg.payload.type ∈ task_started, task_complete, turn_aborted,
-  token_count, thread_settings_applied, user_message (0.104),
-  item_completed{turn_id, item{type ∈ UserMessage, AgentMessage, Reasoning,
-  CommandExecution{command, cwd, parsed_cmd, stdout, stderr, exit_code,
-  duration}, FileChange{changes, status}}}`.
-* Assistant, tool and reasoning items usually appear twice (raw
-  `response_item` and `item_completed`); developer/user `response_item`
-  messages and 0.104 rollouts have no `item_completed` twin. Render from
-  `item_completed`, fall back to `response_item` when no item event exists,
-  keep the duplicate as `meta` at level 6.
-* `custom_tool_call` named `exec` wraps JS `tools.exec_command({...})`; the
-  `cmd` string is extracted for the one-line summary.
-* Thinking is encrypted; `summary_text` is usually empty → placeholder with
-  `meta.encrypted`.
-* Turns: `turn_id` explicit on every item; `task_started`/`task_complete`/
-  `turn_aborted` → `turn_start`/`turn_end`.
-* Tail: file append, same mechanism as Claude.
+  `response_item.payload.type ∈ message{role ∈ user, developer, assistant,
+  phase ∈ commentary, final_answer}, reasoning{summary, encrypted_content},
+  custom_tool_call{name, input, call_id}, custom_tool_call_output{call_id,
+  output}, function_call{name, arguments, call_id},
+  function_call_output{call_id, output}, …`; not a closed set, others →
+  `unknown`. `event_msg.payload.type ∈ task_started, task_complete{duration_ms,
+  error?}, turn_aborted{reason, duration_ms}, token_count{info, rate_limits},
+  thread_settings_applied, user_message (0.104), item_completed{turn_id,
+  item{type ∈ UserMessage, AgentMessage{phase}, Reasoning{summary_text},
+  CommandExecution{command, cwd, parsed_cmd, stdout, stderr,
+  aggregated_output, exit_code, duration, status}, FileChange{changes{path →
+  {type, unified_diff, move_path}}, status, stdout}}}`.
+* Codex writes most facts twice, in a fixed order the parser relies on
+  (`_ParseCtx`, carried on the tail state): raw `message/user` → item
+  `UserMessage`; item `AgentMessage` → raw `message/assistant` (same id);
+  item `Reasoning` → raw `reasoning` (same id); raw `custom_tool_call` →
+  item `CommandExecution` | `FileChange` → raw `custom_tool_call_output`.
+  Mapping: the prompt is the `UserMessage` item or the 0.104 `user_message`
+  event, never the raw user message (it also carries the injected context
+  and is a level-6 `meta` row, tag `raw`); a raw assistant / reasoning line
+  whose id an item already rendered is a level-6 `raw` duplicate, otherwise
+  (0.104) it renders; `developer` messages → `system`, `is_meta`, level 5;
+  `custom_tool_call` / `function_call` → `tool_call` (`(call_id, canon)`
+  joins the pending list, which every turn boundary clears so an
+  interrupted call never pairs across turns); a `CommandExecution` /
+  `FileChange` item answers the oldest pending call of its canon (bash /
+  edit) as its `tool_result` (output = `aggregated_output` / stdout,
+  `is_error` on a non-zero exit or `failed` status, glance `exit N · …`;
+  FileChange → `diff` with `---`/`+++` headers per path, glance `N
+  file(s): …`, level 3 like its call), and the raw output that follows is a level-6 duplicate
+  folded under the call (`call_id`); an output with no item renders as the
+  result; an item with no pending call renders as a `tool_call`.
+* `custom_tool_call` named `exec` wraps JavaScript: `tools.exec_command({cmd,
+  workdir, …})` → tool name `exec_command`, canon bash, `input.command` /
+  `cwd`; `const patch = "…"; tools.apply_patch(patch)` → `apply_patch`,
+  canon edit, `input.patch` / `file_path` (the `*** Update|Add|Delete
+  File:` paths); any other script keeps `input.script`, canon other.
+* Reasoning is encrypted; `summary_text` is usually empty → `thinking`
+  with `meta.encrypted`, level 6, summary `🧠 reasoning (encrypted)`; a
+  non-empty summary is readable thinking (voice, level 2). `phase ==
+  final_answer` sets `end_turn` and level 1 (`commentary` stays at 2); 0.104
+  messages carry no `phase`, so those rollouts have no `end_turn` / level-1
+  reply rows. `turn_context` / `thread_settings_applied`
+  set the model stamped as `meta.model` on assistant, thinking and tool
+  records.
+* Turns: `task_started` → `turn_start` (level 5, before the prompt, so it
+  lands in the preceding `<system>` span); `task_complete` / `turn_aborted`
+  → `turn_end` (level 4) with `meta.duration_ms`, `meta.tokens` (the latest
+  `token_count` total) and a summary `turn complete · 9.0s` / `turn aborted
+  (interrupted) · …` / `turn failed: <error>`. `session_meta`,
+  `turn_context`, `thread_settings_applied` → `meta` level 5; `token_count`,
+  `token_usage_record`, `world_state` → `meta` level 6.
+* Tail: file append, same mechanism as Claude (`045-tail` is a near copy
+  with the parse context on the state; a shared helper is a follow-up).
 
 ### OpenCode
 
