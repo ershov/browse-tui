@@ -35,7 +35,7 @@ Non-goals now:
 ```
 recipes/browse-agents-src/
   DESIGN.md
-  common/      015-imports 020-helpers 030-model 040-tree 050-preview-core 070-links 080-actions 085-menus 090-main
+  common/      015-imports 020-helpers 030-model 040-tree 050-preview-core 050-render 070-links 080-actions 085-menus 090-main
   claude/      010-prelude 025-store 035-parse 045-tail 055-extras
   codex/       010-prelude 025-store 035-parse 045-tail 055-extras
   opencode/    010-prelude 025-store 035-parse 045-tail 055-extras
@@ -46,11 +46,16 @@ build-all.sh             ./build-tui.sh then ./build-agents.sh
 Numbering convention:
 
 * Common parts use multiples of 10 (`020-helpers`, `030-model`, `040-tree`,
-  `050-preview-core`, `070-links`, `080-actions`, `090-main`) plus
-  `015-imports` and `085-menus`.
+  `050-preview-core`, `050-render`, `070-links`, `080-actions`, `090-main`)
+  plus `015-imports` and `085-menus`; two common parts may share a number
+  when they sort before the agent part that extends them. `050-preview-core`
+  sorts before `050-render` by name and `050-render` depends on it (helpers
+  such as `_rule` / `_md_voice` / `_record_at`), so neither may be renamed
+  in a way that flips that order; `050-render` holds the registries
+  `055-extras` fills.
 * Agent parts use the 5s and sort right after the common part they extend:
   `025-store` after `020-helpers`, `035-parse` after `030-model`, `045-tail`
-  after `040-tree`, `055-extras` after `050-preview-core`.
+  after `040-tree`, `055-extras` after `050-render`.
 * Every agent owns `010-prelude` (shebang and module docstring); it sorts
   first and nothing in `common/` uses number 010.
 * Counterpart files carry the same number in every agent dir.
@@ -117,17 +122,15 @@ store to re-tag it (`store_mark_orphan`).
 | `store_list_projects()` | project `Item`s with ids `('project', project_key)` |
 | `store_list_sessions(project_key)` | top-level session `Item`s with ids `('session', session_key)`; `[]` for an unknown project |
 | `store_project_path(project_key)` | filesystem path for the external source actions |
-| `store_project_preview(project_key)` | preview text for a project row |
 | `store_project_of_session(session_key)` | the project key a session lists under |
 | `store_session_exists(session_key)` | `bool` |
-| `store_session_item(session_key)` | the session `Item` (same shape as the listing) or `None` |
+| `store_session_item(session_key)` | the session `Item` (same shape as the listing) or `None`; the project preview is built in common from `store_project_path` and the listing's titles |
 | `store_session_info(session_key)` | `{'path', 'label', 'is_child', 'meta': [(key, value), …], 'mtime'}` for the scope / metadata cards and link labels; never a full read |
-| `store_session_cwd_and_root(session_key)` | `(cwd, project_root)` anchors for the markdown reference resolver |
+| `store_session_dirs(session_key)` | `(cwd, project_dir)`: the session's recorded working directory (or `None`) and its real project directory; common derives the git root for the markdown reference resolver |
 | `store_context_dirs(project_key, session_key)` | `[(role, path)]` with roles `project` / `cwd` / `workspace` for the directory actions; `session_key` may be `None` |
 | `store_child_sessions(session_key)` | child (subagent / worker) `Item`s with ids `('agent', session_key, child_key)`; never returned by `store_list_sessions` |
 | `store_mark_orphan(item)` | re-tags a child `Item` the fold found no dispatch site for (common has already set `is_orphan` and `tag_style`) |
-| `store_child_session(session_key, child_key)` | the child's `session_key`, or `None` when it has no transcript |
-| `store_child_source_path(session_key, child_key)` | the path a child transcript would live at, existing or not (error reporting) |
+| `store_child_session(session_key, child_key)` | the child's `session_key`, or `None` when it has no transcript (the source actions then report "no transcript for child") |
 | `store_parent_of_child(session_key)` | `(parent_session_key, child_key)` when the session is a child transcript, else `None` |
 | `store_resolve_spawned_child(session_key, call, result)` | `(child_key, child_session_key)` for a canon `spawn` tool dict `call` and the `Record` of its result, or `None`; used by the tree fold to link `('agent', …)` rows to their dispatch site |
 | `store_source_path(session_key)` | filesystem path holding the whole transcript (may be a temp file the store wrote) |
@@ -137,8 +140,7 @@ Tail (`045-tail`):
 
 | Function | Returns |
 |---|---|
-| `store_tailable(session_key)` | `bool`; whether the worker should follow this session |
-| `store_tail_open(session_key)` | `(records, state)`: every record so far as `[(record_key, Record_or_None), …]` plus an opaque state whose watermark sits at the end of that read; `([], None)` when the session cannot be read. This is the one bulk read of a session |
+| `store_tail_open(session_key)` | `(records, state)`: every record so far as `[(record_key, Record_or_None), …]` plus an opaque state whose watermark sits at the end of that read; `([], None)` when the session cannot be read or followed (the worker then leaves it alone). This is the one bulk read of a session |
 | `store_tail_poll(session_key, state)` | `(new, changed)`: `new` is a list of `(record_key, Record)` appended since the watermark, `changed` a list of records whose body changed in place (same key); updates the watermark |
 | `store_tail_interval()` | poll period in seconds (Claude and Codex 5.0, OpenCode 1.0) |
 | `store_source_excerpt({session_key: [record_key, …]})` | a temp file holding exactly those records in order (caller unlinks), or `None`; lives next to the reader because it reuses its per-record locators |
@@ -180,19 +182,20 @@ renderers (#1287 keys them on `tool.canon`) and the source view.
 | `is_meta` | bool | injected context, never typed or spoken (Claude `isMeta`, Codex `developer`, OpenCode `synthetic`) |
 | `end_turn` | bool | an assistant record that concluded its turn |
 | `min_level` | int or `None` | lowest detail level that shows the record; `None` means the per-kind default |
-| `meta` | dict | small facts: `agent` (attribution), `title` + `title_by` (`user`/`agent`: a session title stated by this record), `duration_ms`, `encrypted`, `thinking` (the record also carries readable thinking → `· thinking` row tag), `span_label` (finer label for `<system>` span titles, Claude `att:<type>` / `sys:<subtype>`); #1287 adds `model`, `tokens`, `cost` for the chrome footer |
+| `meta` | dict | small facts: `agent` (attribution), `title` + `title_by` (`user`/`agent`: a session title stated by this record), `duration_ms`, `encrypted`, `thinking` (the readable thinking text, also when the record has spoken text → `· thinking` row tag and the thinking rule in the generic body), `span_label` (finer label for `<system>` span titles, Claude `att:<type>` / `sys:<subtype>`), and the generic chrome keys `model`, `tokens`, `cost` |
 
-Common does not consume `ts` or `turn_id` yet: the fold derives turns from
-`user_prompt` / `turn_end` records and the chrome footer (#1287) will read
-`ts`; both are filled now so Codex, which has explicit turns and
-timestamps, maps onto the same shape.
+The fold does not consume `turn_id` yet (it derives turns from
+`user_prompt` / `turn_end` records); the generic chrome reads `ts`. Both
+are filled so Codex, which has explicit turns and timestamps, maps onto
+the same shape.
 
 Tool dicts come from `new_tool(**fields)` with every key present:
 `canon`, `name`, `call_id`, `input` (dict or str), `output` (str or `None`),
 `glance` (short result text for the row title, `None` = `output`; Claude
 derives it from `toolUseResult`), `diff` (unified diff of an edit result or
 `None`), `is_error`, plus `peer` (canon `message`: recipient; canon `spawn`:
-teammate name) and `text` (canon `message`: body). The generic one-liner reads `input` keys
+teammate name) and `text` (canon `message`: body). An agent may add keys
+of its own for its extras (Claude: `tur`, `content` on results). The generic one-liner reads `input` keys
 `command`, `file_path`, `pattern`, `subagent_type`, `skill`, `summary` by
 canon; a parser whose native shape differs normalises `input` or sets
 `summary`.
@@ -246,25 +249,46 @@ Tool canon names and the per-agent name map:
 
 ## Extras hook contract
 
-`055-extras` may define any of these; common code calls them through
-`globals().get(name)` and falls back to the generic path when absent or when
-the hook returns `None`.
-
-Provisional, finalized in #1287. Listed are the hooks the Claude fork
-demonstrably needs; others are added only when an agent needs them. There
-is no common parser: each agent's `_parse_record` classifies its own raw
-objects, so `extras_classify` is not needed and is dropped.
+`055-extras` is optional. Common code looks the hooks up by name at call
+time (`globals().get(name)`) and falls back to its generic rendering when
+a hook is absent or returns `None`; an agent with only `010-prelude`,
+`025-store`, `035-parse` and `045-tail` gets a complete browser.
 
 | Hook | Called | Returns |
 |---|---|---|
-| `extras_render(rec)` | preview body for `system`/`meta`/`unknown` records | ANSI str or `None` |
-| `extras_chrome(rec)` | footer of a record preview | list of str facts |
-| `extras_actions()` | Browser construction | list of `Action` |
+| `extras_render(rec, bg)` | before the generic body of any record preview (`_render_record`); `bg` is the md2ansi reset baseline of a banded turn-root prompt | ANSI str, or `None` for the generic body |
+| `extras_chrome(rec, root)` | before the generic metadata footer (`_record_chrome`); `root` is the turn-root `Record` or `None` | ANSI str (may be `''`), or `None` for the generic footer |
+| `_TOOL_FORMATTERS[key]` | registry in `050-render`: `key` is a canon (common entries) or the agent's own tool name (agent entries, tried first); value `{'call': fn, 'result': fn, 'umbrella': fn}`, each `fn(call, result) -> str \| None` over tool dicts (`result` is `None` while pending) | `call`: the request body under the `🔧 Name` header; `result`: the body under `↳ tool_result`; `umbrella`: the fused block of a `<tool:>` row (`None` cascades to the leaves) |
 
-Claude extras: attachments, teams, running-session pid detection, queued
-commands, hook results. Codex extras: `parsed_cmd`, token counts and rate
-limits. OpenCode extras: step cost and tokens, snapshots, agent and model
-selection events.
+Generic rendering (`050-render`): `user_prompt` → `▶ user` (or `← reply` /
+`← peer from X` for inbound agent voice) + the markdown body; assistant
+kinds → `⏺ assistant model [end_turn]`, the thinking under a rule, the
+spoken text, each call via `_fmt_tool_call`; `tool_result` → `↳
+tool_result [error] id=…` + the result body; `turn_end` / `compaction`
+one-liners; `system` / `meta` / `unknown` → the label, text or summary,
+and the raw object as JSON (always for `unknown`, at detail 6+ for the
+others — the one place common reads `raw`). The generic chrome shows
+`id`, `timestamp` (from `ts`), `offset` (from the turn root's `ts`) and
+the meta keys `model`, `agent`, `tokens`, `cost`, `duration_ms`. Generic
+tool formatters exist for canon bash, read, edit, write, grep, glob,
+skill, message, webfetch, websearch, mcp (umbrellas), spawn / question /
+message (call bodies), spawn / message / webfetch (markdown results); the
+default result body is the diff, else the output (JSON coloured).
+
+Claude extras: `extras_render` renders every record from `raw`
+(`_classify` → `_render_user` / `_render_assistant` / `_render_attachment`
+/ `_render_system` / `_render_metadata` / `_render_unknown`), because the
+raw shapes carry permission mode, structured `toolUseResult`s,
+attachments and bookkeeping detail the model does not; `extras_chrome`
+emits the uuid / parentUuid / sessionId / cwd / version / flags / usage
+rows; `_TOOL_UMBRELLA_FORMATTERS` (tool name → `fn(inp, tur, raw_content,
+is_error)`) is adapted into `_TOOL_FORMATTERS` for Bash, Read, Edit,
+Write, NotebookEdit, Grep, Glob, WebFetch, WebSearch, ToolSearch, Skill,
+SendMessage, TodoWrite, ExitPlanMode, Task* and `mcp`; result tool dicts
+carry the agent-private keys `tur` and `content` for them. Codex extras
+(planned): `parsed_cmd`, token counts and rate limits. OpenCode extras
+(planned): step cost and tokens, snapshots, agent and model selection
+events.
 
 ## What the common view expects from records
 
@@ -277,9 +301,11 @@ selection events.
   markdown subtree operate on `text` (plus result `output`).
 * `turn_end` is optional; the fold opens a turn at each fresh
   `user_prompt` and closes it at the next `turn_end` or prompt.
-* `raw` is read only by the agent's own renderers, the markdown `.md`
-  reference scan (a string-leaf walk, no field names) and
-  `store_source_locator`.
+* `raw` is read only by the agent's own extras, the generic JSON dump of
+  `unknown` / high-detail bookkeeping records and `store_source_locator`;
+  the markdown `.md` reference scan reads `text` and the tool inputs /
+  outputs (`_record_strings`), so a reference that only appears in an
+  agent-private field (a Claude attachment path) is not detected.
 
 ## Per-agent format notes
 

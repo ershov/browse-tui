@@ -55,19 +55,28 @@ def _iter_str_leaves(obj):
             yield from _iter_str_leaves(v)
 
 
-def _record_has_md_ref(rec):
-    """True iff any string leaf of the source object contains a ``.md``
-    reference token.
+def _record_strings(rec):
+    """The record's prose plus every string in its tool inputs / outputs —
+    what the markdown reference scans look at."""
+    out = [rec.text] if rec.text else []
+    for t in rec.tools:
+        for v in (t['input'], t['output'], t['text']):
+            out.extend(_iter_str_leaves(v))
+    return out
 
-    Short-circuiting: walks ``rec.raw``'s string leaves (``_iter_str_leaves``)
-    and stops at the FIRST ``.md`` hit via ``md_doc.find_md_refs`` — far
-    cheaper than serialising the whole record. No ``os.stat`` here (detection
-    is optimistic; existence is checked lazily on expand, and a dead token
-    self-heals). Sees tool paths and prose alike, whatever the agent's shape.
+
+def _record_has_md_ref(rec):
+    """True iff any string of the record (``_record_strings``) contains a
+    ``.md`` reference token.
+
+    Short-circuiting: stops at the FIRST ``.md`` hit via
+    ``md_doc.find_md_refs``. No ``os.stat`` here (detection is optimistic;
+    existence is checked lazily on expand, and a dead token self-heals).
+    Sees tool paths and prose alike.
     """
     if _md_doc is None:
         return False
-    for s in _iter_str_leaves(rec.raw):
+    for s in _record_strings(rec):
         if _md_doc.find_md_refs(s):
             return True
     return False
@@ -88,6 +97,20 @@ def _md_has_children(rec):
     if _md_doc.md_heading_trigger(_message_md_text(rec)):
         return True
     return _record_has_md_ref(rec)
+
+
+def _session_cwd_and_root(sess):
+    """``(cwd, project_root)`` anchors for the markdown reference resolver.
+
+    ``cwd`` is the session's recorded working directory (``None`` when the
+    store has none); ``project_root`` the git root above it when one
+    exists, else ``cwd`` itself, else the store's project directory.
+    """
+    cwd, project_dir = store_session_dirs(sess)
+    if cwd:
+        root = _md_doc.find_git_root(cwd) if _md_doc is not None else None
+        return cwd, root or cwd
+    return None, project_dir
 
 
 def _md_ref_label(abspath, cwd, project_root):
@@ -277,8 +300,8 @@ def _md_refs_umbrella_children(item_id):
 
     Two document shapes, mirroring the two callers:
 
-      * **message base** (``chain == ()``) → scan the whole record's string
-        leaves (prose + tool paths), anchored on ``store_session_cwd_and_root`` with
+      * **message base** (``chain == ()``) → scan the record's strings
+        (prose + tool paths), anchored on ``_session_cwd_and_root`` with
         ``doc_dir = cwd or project_root`` — the message-level rule. Refs chain
         directly off the message anchor.
       * **file-doc** (``chain`` non-empty) → the file's own text
@@ -290,7 +313,7 @@ def _md_refs_umbrella_children(item_id):
     """
     _, anchor, chain = item_id
     sess = anchor[1]
-    cwd, project_root = store_session_cwd_and_root(sess)
+    cwd, project_root = _session_cwd_and_root(sess)
     if chain:
         # File-doc umbrella: resolve the file's own refs, nested onto its chain.
         text, doc = _md_chain_doc(anchor, chain)
@@ -307,7 +330,7 @@ def _md_refs_umbrella_children(item_id):
     if rec is None:
         return []
     doc_dir = cwd or project_root
-    record_text = '\n'.join(_iter_str_leaves(rec.raw))
+    record_text = '\n'.join(_record_strings(rec))
     return [
         _md_file_item(anchor, (abspath,), label)
         for abspath, label in _md_resolved_refs(
@@ -357,9 +380,9 @@ def _md_message_children(anchor):
     # (its ``('refs', …)`` id routes to ``_md_refs_umbrella_children`` in
     # ``get_children``); here we only short-circuit on the FIRST existing ref.
     # The same concatenated string leaves (prose + tool paths) feed both halves.
-    cwd, project_root = store_session_cwd_and_root(path)
+    cwd, project_root = _session_cwd_and_root(path)
     doc_dir = cwd or project_root
-    record_text = '\n'.join(_iter_str_leaves(rec.raw))
+    record_text = '\n'.join(_record_strings(rec))
     if _has_any_existing_ref(record_text, doc_dir, cwd or '', project_root or ''):
         out.append(_md_refs_umbrella_item(anchor, ()))
     return out
@@ -435,7 +458,7 @@ def _md_subtree_children(item_id):
     out = [_md_node_item(anchor, chain, node)
            for node in _md_doc.visible_children(doc.tree)]
     if chain:
-        cwd, project_root = store_session_cwd_and_root(anchor[1])
+        cwd, project_root = _session_cwd_and_root(anchor[1])
         doc_dir = os.path.dirname(chain[-1])
         if _has_any_existing_ref(text, doc_dir, cwd or '', project_root or ''):
             out.append(_md_refs_umbrella_item(anchor, chain))
@@ -656,8 +679,8 @@ def _maybe_json_color(text):
 def _json_color_value(parsed):
     """Colored pretty-print of an already-parsed JSON value, nested
     JSON-strings appended decoded — the shared tail of
-    ``_maybe_json_color``, also used for dict-shaped ``toolUseResult``
-    payloads that skip the string round-trip."""
+    ``_maybe_json_color``, also used for already-parsed result payloads
+    that skip the string round-trip."""
     out = [_json_color(json.dumps(parsed, indent=2, ensure_ascii=False))]
     for path, sub in _nested_json_strings(parsed):
         out.append(f'\n{MUTE}{path} ={RESET}')
@@ -716,7 +739,7 @@ def _record_at(sess, n):
 def get_preview(item_id):
     """Preview-pane content for the cursor item.
 
-    * ``('project', dir)``     : human-readable summary + session list
+    * ``('project', key)``     : path + session titles (``_preview_project``)
     * ``('session', sess)``    : concatenated child previews (same machinery
                                   as the umbrella previews — uniform body
                                   cascade, honours the detail filter
@@ -759,8 +782,20 @@ def get_preview(item_id):
     if tag == 'msg':
         return _preview_message(item_id[1], item_id[2])
     if tag == 'project':
-        return store_project_preview(item_id[1])
+        return _preview_project(item_id[1])
     return ''
+
+
+def _preview_project(project_key):
+    """Preview text for a project row: its real directory, its store path
+    and the session titles."""
+    sessions = store_list_sessions(project_key)
+    real = dict(store_context_dirs(project_key)).get('project')
+    header = (f'project: {real}\n'
+              f'path:    {store_project_path(project_key)}\n'
+              f'\n{len(sessions)} session(s):')
+    body = '\n'.join(f'  {it.title}' for it in sessions[:1000])
+    return f'{header}\n{body}' if body else header
 
 
 def _item_is_active(item_id):
@@ -801,25 +836,6 @@ def _preview_session_card(sess):
     hint = (f'\n\n{MUTE}(expand or scope in to see the transcript){RESET}')
     label = _prog_name() + (' (subagent)' if info['is_child'] else '')
     return f'{_rule(label, BLUE)}\n{body}\n{_rule()}{hint}'
-
-
-def _preview_message(sess, n):
-    """Per-line preview for a leaf message: classify + dispatch + chrome.
-
-    Each renderer returns a body str with ANSI inlined. The chrome
-    footer (uuid, cwd, timestamp, …) is uniform and appended here. In
-    the new umbrella tree model leaves don't have children, so the
-    preview no longer concatenates anything extra — the umbrella's own
-    preview is where multi-child concatenation lives.
-    """
-    rec = _record_at(sess, n)
-    if rec is None:
-        return ''
-    obj = rec.raw
-    kind = _classify(obj)
-    body = _RENDERERS.get(kind, _render_unknown)(obj)
-    chrome = _fmt_chrome(obj, _turn_root_ts(sess, n))
-    return body + ('\n' + chrome if chrome else '')
 
 
 def _scope_card_session(item_id):
@@ -1083,36 +1099,6 @@ def _walk_umbrella(item_id, _state, _flush):
         except Exception as e:
             yield (_rule(f'error rendering child {cid}', RED)
                    + f'\n{type(e).__name__}: {e}\n\n')
-
-
-def _render_record_with_rule(sess, n):
-    """Read one record, render its body, prefix with a section rule.
-
-    Most leaves get the fixed ~60-wide bright-yellow rule. A
-    turn-opening user prompt gets a FULL-WIDTH dark-blue band for its
-    divider (bold-white title) AND has its whole prompt painted on the
-    same dark-blue background — ``current_style`` keeps the band behind
-    the voice markdown's styled spans, ``_band_block`` re-asserts it per
-    logical line — so successive turns stand out as the visual anchors
-    of a composed multi-turn preview.
-    """
-    rec = _record_at(sess, n)
-    if rec is None:
-        return None
-    obj = rec.raw
-    kind = _classify(obj)
-    if _is_turn_root(rec):
-        # A turn root is always a 'user' record (``_is_turn_root``), so
-        # ``_render_user`` is the right renderer; thread the band's SGR
-        # params as md2ansi's reset baseline, then band every line.
-        width = getattr(_BROWSER, 'preview_width', 0) or 60
-        rule = _rule(kind, BOLD + WHITE, width=width, bg=BLUE_BG)
-        cs = BLUE_BG_PARAMS if BLUE_BG else '0'
-        body = _band_block(_render_user(obj, bg=cs), BLUE_BG)
-        return rule + '\n' + body
-    body = _RENDERERS.get(kind, _render_unknown)(obj)
-    rule = _rule(kind, YELLOW)
-    return rule + '\n' + body
 
 
 def _tool_label(cid):

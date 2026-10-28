@@ -1046,18 +1046,19 @@ def _cursor_tail_session(item_id):
         (drill-into row), so tail the subagent.
 
     Other id kinds: take the id's session. ``None`` when the resolved
-    session isn't one the store can tail.
+    session does not exist (``store_tail_open`` answers ``([], None)``
+    for one the store cannot follow).
     """
     if not isinstance(item_id, tuple) or not item_id:
         return None
     if item_id[0] == 'agent':
         sess, aid = item_id[1], item_id[2]
         if _TREE_MODE:
-            return sess if store_tailable(sess) else None
+            return sess if store_session_exists(sess) else None
         child = store_child_session(sess, aid)
-        return child if child and store_tailable(child) else None
+        return child if child and store_session_exists(child) else None
     sess = _id_session(item_id)
-    return sess if sess is not None and store_tailable(sess) else None
+    return sess if sess is not None and store_session_exists(sess) else None
 
 
 def _last_voice_id(sess):

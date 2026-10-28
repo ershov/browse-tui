@@ -11,24 +11,24 @@
 #   startup       store_init()  store_pop_args()  store_resolve_positional(arg)
 #                 store_reset()
 #   projects      store_list_projects()  store_list_sessions(project_key)
-#                 store_project_path(project_key)  store_project_preview(project_key)
-#                 store_project_of_session(session_key)
+#                 store_project_path(project_key)  store_project_of_session(session_key)
 #   sessions      store_session_exists(session_key)  store_session_item(session_key)
-#                 store_session_info(session_key)  store_session_cwd_and_root(session_key)
+#                 store_session_info(session_key)  store_session_dirs(session_key)
 #                 store_context_dirs(project_key, session_key)
 #   children      store_child_sessions(session_key)  store_mark_orphan(item)
 #                 store_child_session(session_key, child_key)
-#                 store_child_source_path(session_key, child_key)
 #                 store_parent_of_child(session_key)
 #                 store_resolve_spawned_child(session_key, call, result)
 #   source        store_source_path(session_key)
 #                 store_source_locator(session_key, record_key)
 #                 store_source_excerpt({session_key: [record_key, …]})
-#   tail          store_tailable(session_key)  store_tail_open(session_key)
-#                 store_tail_poll(session_key, state)  store_tail_interval()
+#   tail          store_tail_open(session_key)  store_tail_poll(session_key, state)
+#                 store_tail_interval()
 #
 # The tail functions yield ``Record`` instances (below); the agent's
-# 035-parse maps its raw objects to them.
+# 035-parse maps its raw objects to them. Optional extras (055-extras):
+# ``extras_render(rec, bg)``, ``extras_chrome(rec, root)`` and entries in
+# the ``_TOOL_FORMATTERS`` registry (050-render).
 
 
 # ---- normalized record model ---------------------------------------------
@@ -87,7 +87,7 @@ def new_tool(**fields):
         'peer': None,       # canon message: recipient; canon spawn: teammate name
         'text': None,       # canon message: the message body
     }
-    tool.update(fields)
+    tool.update(fields)     # an agent may add keys for its own extras
     return tool
 
 
@@ -121,7 +121,8 @@ class Record:
         'end_turn',     # an assistant record that concluded its turn
         'min_level',    # explicit detail level, or None for the kind default
         'meta',         # small facts: agent, title, title_by, duration_ms,
-                        # thinking (record also carries readable thinking),
+                        # thinking (the readable thinking text, also when
+                        # the record has spoken text),
                         # span_label (finer label for <system> span titles), …
     )
 

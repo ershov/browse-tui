@@ -32,8 +32,9 @@ def _gather_line_source(items):
         umbrella's same-session descendants and record each leaf's key.
         ``agent`` boundaries are NOT crossed — subagents are their own
         sessions.
-      * ``('agent', sess, aid)`` (subagent group row) → the subagent's own
-        source is the "whole file" to open.
+      * ``('agent', sess, aid)`` (subagent group row) → the child's own
+        source is the "whole file" to open (``None`` when it has no
+        transcript).
       * ``('session', sess)`` / ``('trunc'|'err', sess)`` → that session's
         source whole. ``('project', key)`` → that directory whole.
 
@@ -49,8 +50,9 @@ def _gather_line_source(items):
             continue
         tag = iid[0]
         if tag == 'agent':
+            child = store_child_session(iid[1], iid[2])
             whole_paths.append(
-                (store_child_source_path(iid[1], iid[2]), item))
+                (store_source_path(child) if child else None, item))
             continue
         if tag in ('prompt', 'tool', 'span'):
             # Recurse through the umbrella's same-session leaves.
@@ -164,7 +166,10 @@ def _run_source_command(ctx, cmd_env_var, default_cmd):
     # path. Covers cursor-on-session, cursor-on-scope_root, cursor-on-
     # umbrella, and cursor-on-project use cases.
     if whole_paths:
-        path, _item = whole_paths[0]
+        path, item = whole_paths[0]
+        if path is None and item.id[0] == 'agent':
+            ctx.error(f'no transcript for child {item.id[2]!r}')
+            return
         if not path or not os.path.exists(path):
             ctx.error(f'no such path: {path!r}')
             return

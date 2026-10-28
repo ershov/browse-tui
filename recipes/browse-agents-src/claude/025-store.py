@@ -459,11 +459,6 @@ def _session_name_lookup(path):
     return False, None
 
 
-def _session_name(path):
-    """Best known display name for a session, without touching the file."""
-    return _session_name_lookup(path)[1]
-
-
 def store_list_projects():
     if not os.path.isdir(CLAUDE_ROOT):
         return []
@@ -522,15 +517,21 @@ def store_list_projects():
     return out
 
 
-def store_session_item(full, st=None):
+def store_session_item(session_key):
+    """The session row ``Item`` (same shape as the listing), or ``None``."""
+    return _session_item(session_key)
+
+
+def _session_item(full, st=None):
     """Build the rich session-row Item for the ``.jsonl`` at ``full``.
 
     Single source of truth for the session-row shape, shared by
-    :func:`store_list_sessions` (project listing) and the direct-launch
-    scope-root seed (:func:`_seed_scope_root_item`, #730). ``st`` is an
-    optional pre-fetched ``os.stat`` result; when omitted it's stat'd
-    here. Returns ``None`` if the file can't be stat'd or ``--running``
-    is active and this session has no live process.
+    :func:`store_list_sessions` (project listing), the name back-fill and
+    the direct-launch scope-root seed (:func:`_seed_scope_root_item`,
+    #730). ``st`` is an optional pre-fetched ``os.stat`` result; when
+    omitted it's stat'd here. Returns ``None`` if the file can't be
+    stat'd or ``--running`` is active and this session has no live
+    process.
     """
     if st is None:
         try:
@@ -619,7 +620,7 @@ def store_list_sessions(project_dir):
         if not name.endswith('.jsonl'):
             continue
         full = os.path.join(project_dir, name)
-        item = store_session_item(full)
+        item = _session_item(full)
         if item is not None:
             out.append(item)
     # Fold team workers under their lead session: a linked worker
@@ -800,28 +801,19 @@ def _real_project_path(project_dir):
     return _decode_project_path(os.path.basename(project_dir.rstrip('/')))
 
 
-def _session_cwd_and_root(session_jsonl_path):
-    """``(cwd, project_root)`` for a session — the resolver's path anchors.
+def store_session_dirs(session_key):
+    """``(cwd, project_dir)`` for a session.
 
     ``cwd`` is the session's recorded working directory (its containing
-    project dir's ``_real_project_cwd``; ``None`` if unreadable).
-    ``project_root`` is the git root above ``cwd`` (nearest ``.git``
-    ancestor) when one exists, else the session's real project directory —
-    the actual filesystem path (not HOME-collapsed), so callers can
-    ``os.path.join`` against it. Both fall back gracefully: an unreadable
-    session yields ``(None, <lossy decoded project dir>)``.
-
-    Consumed by the markdown reference resolver to anchor relative ``.md``
-    references against the right roots.
+    project dir's ``_real_project_cwd``; ``None`` if unreadable);
+    ``project_dir`` the real project directory — the actual filesystem path
+    (not HOME-collapsed), falling back to the lossy dir-name decode expanded
+    to an absolute path, so callers can ``os.path.join`` against it.
     """
-    project_dir = os.path.dirname(session_jsonl_path)
+    project_dir = os.path.dirname(session_key)
     cwd = _real_project_cwd(project_dir)
     if cwd:
-        root = _md_doc.find_git_root(cwd) or cwd
-        return cwd, root
-    # No readable cwd (e.g. an empty project dir): best-effort root from the
-    # lossy dir-name decode, expanded to a real absolute path so callers can
-    # join against it.
+        return cwd, cwd
     decoded = _decode_project_path(os.path.basename(project_dir.rstrip('/')))
     return None, os.path.expanduser(decoded)
 
@@ -1102,7 +1094,7 @@ _NAME_FILL_PENDING = {}
 def _fill_session_names(paths):
     """Tail-scan each pending session and patch its row tag.
 
-    The tag is rebuilt from a fresh ``store_session_item`` (the tail-scan
+    The tag is rebuilt from a fresh ``_session_item`` (the tail-scan
     primes the name cache first), not from text captured at listing
     time — so a row whose counts/liveness moved while the scan ran
     isn't clobbered with stale text. Ops go out in small batches;
@@ -1113,7 +1105,7 @@ def _fill_session_names(paths):
     for path in paths:
         if not _session_name_from_file(path):
             continue
-        item = store_session_item(path)
+        item = _session_item(path)
         if item is None:
             continue
         ops.append(mod(('session', path), tag=item.tag))
@@ -1353,15 +1345,6 @@ def store_child_session(session_key, child_key):
     return p if os.path.isfile(p) else None
 
 
-def store_child_source_path(session_key, child_key):
-    """Filesystem path a child transcript would live at, existing or not.
-
-    The external source actions open it as a whole file and report a
-    missing one by this path.
-    """
-    return _resolve_agent_jsonl(session_key, child_key)
-
-
 def store_parent_of_child(session_key):
     """``(parent_session_key, child_key)`` when ``session_key`` is a
     subagent transcript, else ``None``.
@@ -1483,10 +1466,6 @@ def store_session_info(session_key):
             'meta': meta, 'mtime': mtime}
 
 
-def store_session_cwd_and_root(session_key):
-    return _session_cwd_and_root(session_key)
-
-
 def store_context_dirs(project_key, session_key=None):
     """``[(role, abspath), …]`` directory anchors for a project or session.
 
@@ -1514,24 +1493,3 @@ def store_context_dirs(project_key, session_key=None):
     for cwd in cwds:
         out.append(('cwd' if cwd == primary else 'workspace', cwd))
     return [(role, path) for role, path in out if path]
-
-
-def store_project_preview(project_key):
-    """Preview text for a project row: real path plus its session files."""
-    if not os.path.isdir(project_key):
-        return ''
-    try:
-        names = sorted(
-            n for n in os.listdir(project_key) if n.endswith('.jsonl')
-        )
-    except OSError as e:
-        return f'[error] {e}'
-    header = (
-        f'project: {_real_project_path(project_key)}\n'
-        f'path:    {project_key}\n'
-        f'\n{len(names)} session(s):'
-    )
-    body = '\n'.join(f'  {n}' for n in names[:1000])
-    if len(names) > 50:
-        body += f'\n  … and {len(names) - 50} more'
-    return f'{header}\n{body}' if body else header

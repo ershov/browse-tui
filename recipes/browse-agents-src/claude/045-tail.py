@@ -50,12 +50,6 @@ def store_tail_interval():
     return 5.0
 
 
-def store_tailable(session_key):
-    """True iff the session is a readable transcript the tail can follow."""
-    return (isinstance(session_key, str) and session_key.endswith('.jsonl')
-            and os.path.isfile(session_key))
-
-
 def _read_tail_lines(f, state, *, strict):
     """Read complete lines from ``f`` at ``state.byte_offset``.
 
@@ -96,9 +90,11 @@ def store_tail_open(session_key):
     ``records`` is ``[(record_key, rec_or_None), …]`` in file order and
     ``state`` the tail state positioned at the last complete line
     (``last_size`` equal to that offset, so a partial trailing line is
-    re-polled as soon as the file grows). ``([], None)`` when the file
-    cannot be opened.
+    re-polled as soon as the file grows). ``([], None)`` when the key is
+    not a ``.jsonl`` transcript or the file cannot be opened.
     """
+    if not (isinstance(session_key, str) and session_key.endswith('.jsonl')):
+        return [], None
     state = _TailState(byte_offset=0, last_size=0, start_line=0,
                        cursor=None, error=False)
     try:

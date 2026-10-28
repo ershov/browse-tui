@@ -1173,12 +1173,13 @@ class TestTurnOffset(unittest.TestCase):
         path = self._write(self._records())
         try:
             # Turn member resolves to the opening user request's timestamp.
-            self.assertEqual(self.r._turn_root_ts(path, 2),
-                             '2026-06-09T00:00:00.000Z')
+            self.assertEqual(
+                self.r._turn_root_record(path, 2).raw['timestamp'],
+                '2026-06-09T00:00:00.000Z')
             # The turn root itself has no offset (it IS the request).
-            self.assertIsNone(self.r._turn_root_ts(path, 1))
+            self.assertIsNone(self.r._turn_root_record(path, 1))
             # Out-of-turn span member has no umbrella request.
-            self.assertIsNone(self.r._turn_root_ts(path, 0))
+            self.assertIsNone(self.r._turn_root_record(path, 0))
         finally:
             os.unlink(path)
 
@@ -4127,8 +4128,9 @@ class TestLiveTail(unittest.TestCase):
                              path)
             self.assertEqual(self.r._cursor_tail_session(('span', path, 2)),
                              path)
-            # Non-jsonl path: None.
-            self.assertIsNone(self.r._cursor_tail_session(('session', '/etc/passwd')))
+            # Missing session: None.
+            self.assertIsNone(self.r._cursor_tail_session(
+                ('session', path + '.missing')))
             self.assertIsNone(self.r._cursor_tail_session(None))
         finally:
             os.unlink(path)
@@ -4261,12 +4263,9 @@ class TestViewEditSource(unittest.TestCase):
         # Whole-path entries: umbrellas + subagent + session + project dir.
         whole_paths_only = [p for p, _ in whole_paths]
         self.assertEqual(len(whole_paths_only), 6)
-        # Subagent group resolves to the agent's jsonl, not the parent
-        # session.
-        self.assertIn(
-            os.path.join(self.r._subagents_dir(path), 'agent-AAA.jsonl'),
-            whole_paths_only,
-        )
+        # Subagent group with no transcript on disk resolves to None (the
+        # action reports "no transcript for child"), not the parent session.
+        self.assertIn(None, whole_paths_only)
         # The project dir resolves to its directory path.
         self.assertIn('/some/proj', whole_paths_only)
         # Plain umbrella ids + the session row resolve to the file path.
@@ -9529,7 +9528,7 @@ class TestSendMessage(unittest.TestCase):
         self.assertIn('Please fix the **three** findings.', out)
 
     def test_send_message_registered_in_formatters(self):
-        self.assertIn('SendMessage', self.r._TOOL_USE_FORMATTERS)
+        self.assertIn('call', self.r._TOOL_FORMATTERS['SendMessage'])
 
     # -- one-liner ---------------------------------------------------------
 
@@ -10613,8 +10612,6 @@ class TestTeamWorkers(unittest.TestCase):
         card = self.r._fmt_scope_card(p, td)
         self.assertIn('name', card)
         self.assertIn('Tree title', card)
-        # _session_name serves it from the scanned tree, no file read.
-        self.assertEqual(self.r._session_name(p), 'Tree title')
 
     def test_session_row_tag_carries_known_name(self):
         p = self._write_named('dddd4444-0000-0000-0000-000000000000', [
@@ -11291,9 +11288,17 @@ class TestMarkdownSubtrees(unittest.TestCase):
     def test_detection_ref_message_tool_path(self):
         # The ref lives in a tool_use input, not prose — the string-leaf walk
         # must still find it (covers Write/Read/Edit paths).
-        rec = {'message': {'content': [
-            {'type': 'tool_use', 'name': 'Read',
+        rec = {'type': 'assistant', 'message': {'content': [
+            {'type': 'tool_use', 'id': 't', 'name': 'Read',
              'input': {'file_path': 'notes.md'}}]}}
+        self.assertTrue(self.r._md_has_children(self.r._parse_record(rec)))
+
+    def test_detection_ref_in_attachment_path(self):
+        # A Claude attachment names the file only in its own fields; the
+        # parser surfaces the path as the record text so the scan sees it.
+        rec = {'type': 'attachment', 'attachment': {
+            'type': 'file', 'displayPath': 'docs/report.md',
+            'filename': '/x/docs/report.md'}}
         self.assertTrue(self.r._md_has_children(self.r._parse_record(rec)))
 
     def test_detection_plain_message_false(self):
@@ -12714,14 +12719,14 @@ class TestToolUmbrellaInfra(unittest.TestCase):
             tool_name='Demo', input_={'k': 'v'}, tur={'ok': True})
         seen = {}
 
-        def _fmt(inp, tur, raw_content, is_error):
-            seen['inp'] = inp
-            seen['tur'] = tur
-            seen['raw'] = raw_content
-            seen['err'] = is_error
+        def _fmt(call, result):
+            seen['inp'] = call['input']
+            seen['tur'] = result['tur']
+            seen['raw'] = result['content']
+            seen['err'] = result['is_error']
             return 'CUSTOM-BLOCK'
 
-        self.r._TOOL_UMBRELLA_FORMATTERS['Demo'] = _fmt
+        self.r._TOOL_FORMATTERS['Demo'] = {'umbrella': _fmt}
         try:
             out = self.r._render_tool_umbrella(item_id)
             self.assertEqual(out, 'CUSTOM-BLOCK')
@@ -12731,7 +12736,7 @@ class TestToolUmbrellaInfra(unittest.TestCase):
             self.assertEqual(seen['raw'], 'out')
             self.assertFalse(seen['err'])
         finally:
-            self.r._TOOL_UMBRELLA_FORMATTERS.pop('Demo', None)
+            self.r._TOOL_FORMATTERS.pop('Demo', None)
             os.unlink(path)
 
     def test_unregistered_tool_returns_none(self):
@@ -12744,33 +12749,31 @@ class TestToolUmbrellaInfra(unittest.TestCase):
 
     def test_formatter_returning_none_falls_through(self):
         path, item_id = self._umbrella_fixture(tool_name='Demo')
-        self.r._TOOL_UMBRELLA_FORMATTERS['Demo'] = lambda *a: None
+        self.r._TOOL_FORMATTERS['Demo'] = {'umbrella': lambda *a: None}
         try:
             self.assertIsNone(self.r._render_tool_umbrella(item_id))
         finally:
-            self.r._TOOL_UMBRELLA_FORMATTERS.pop('Demo', None)
+            self.r._TOOL_FORMATTERS.pop('Demo', None)
             os.unlink(path)
 
     def test_in_flight_passes_none_result(self):
         # No result record yet: the formatter is still consulted, with
-        # ``tur=None`` / ``raw_content=None`` (lets a tool like Bash render
-        # just its request). Here the formatter declines -> None.
+        # ``result=None`` (lets a tool like Bash render just its request).
+        # Here the formatter declines -> None.
         path, item_id = self._umbrella_fixture(
             tool_name='Demo', with_result=False)
         seen = {}
 
-        def _fmt(inp, tur, raw_content, is_error):
-            seen['tur'] = tur
-            seen['raw'] = raw_content
+        def _fmt(call, result):
+            seen['result'] = result
             return None
 
-        self.r._TOOL_UMBRELLA_FORMATTERS['Demo'] = _fmt
+        self.r._TOOL_FORMATTERS['Demo'] = {'umbrella': _fmt}
         try:
             self.assertIsNone(self.r._render_tool_umbrella(item_id))
-            self.assertIsNone(seen['tur'])
-            self.assertIsNone(seen['raw'])
+            self.assertIsNone(seen['result'])
         finally:
-            self.r._TOOL_UMBRELLA_FORMATTERS.pop('Demo', None)
+            self.r._TOOL_FORMATTERS.pop('Demo', None)
             os.unlink(path)
 
     def test_all_parts_must_be_registered(self):
@@ -12794,11 +12797,11 @@ class TestToolUmbrellaInfra(unittest.TestCase):
             for rec in records:
                 f.write(_json.dumps(rec) + '\n')
             path = f.name
-        self.r._TOOL_UMBRELLA_FORMATTERS['Demo'] = lambda *a: 'X'
+        self.r._TOOL_FORMATTERS['Demo'] = {'umbrella': lambda *a: 'X'}
         try:
             self.assertIsNone(self.r._render_tool_umbrella(('tool', path, 1)))
         finally:
-            self.r._TOOL_UMBRELLA_FORMATTERS.pop('Demo', None)
+            self.r._TOOL_FORMATTERS.pop('Demo', None)
             os.unlink(path)
 
 
