@@ -4,20 +4,20 @@
 
 | Command | What it does |
 |---------|--------------|
-| `./run-tests.sh` | Canonical / CI runner. Rebuilds the `browse-tui` binary, then runs every suite via `python3 -m unittest discover -t . -s test/`. |
+| `./run-tests.sh` | Canonical / CI runner. Runs `./build-all.sh` (the `browse-tui` binary from `src-tui/` and the `recipes/browse-agents-*` recipes from `recipes/browse-agents-src/`), then every suite via `python3 -m unittest discover -t . -s test/`. |
 | `./run-tests-parallel.sh [-j N] [modules…]` | Same coverage, split into **per-module subprocesses** in a process pool (default 4 workers). Accepts specific modules, e.g. `./run-tests-parallel.sh test.unit.test_md_doc`. |
 | `python3 -m unittest discover -t . -s test/unit` | Run one suite directory (`test/unit`, `test/async_`, or `test/ui`). |
 | `python3 -m unittest test.unit.test_md_doc` | Run a single module. |
 
 ## Test layout
 
-- **`test/unit`** — unit tests for the framework (`src-tui/*`) and the recipes. These **stub `browse_tui`** (see below), so they do **not** need the binary built.
+- **`test/unit`** — unit tests for the framework (`src-tui/*`) and the recipes. These **stub `browse_tui`** (see below), so they do **not** need the binary built. The `test_browse_agents_*` suites load the **generated** `recipes/browse-agents-<agent>` files, so they need `./build-agents.sh` to have run after any edit to the parts.
 - **`test/async_`** — async worker / post-queue tests. No build needed.
-- **`test/ui`** — end-to-end tests that spawn the real `browse-tui` binary through tmux. These **require `./build-tui.sh` first** (the binary must be current); `run-tests.sh` always rebuilds before running. They may be skipped where the environment has no tmux.
+- **`test/ui`** — end-to-end tests that spawn the real `browse-tui` binary through tmux. These **require `./build-all.sh` first** (the binary and the generated recipes must be current); `run-tests.sh` always rebuilds before running. They may be skipped where the environment has no tmux.
 
 ## Gotcha: `browse_tui` import order when running recipe tests together
 
-`browse_tui` (the framework) is not an installable module — it only exists at runtime, assembled from `src-tui/*` into the `browse-tui` binary. So the unit tests **fake it**: each recipe test file inserts a stub `browse_tui` into `sys.modules` via its own `_stub_browse_tui()`, exposing **only the symbols its recipe imports**. That helper returns early if `browse_tui` is already in `sys.modules` — it does not reconcile or top up the names:
+`browse_tui` (the framework) is not an installable module — it only exists at runtime, assembled from `src-tui/*` into the `browse-tui` binary. So the unit tests **fake it**: each recipe test file inserts a stub `browse_tui` into `sys.modules` via its own `_stub_browse_tui()`. The older recipe suites expose **only the symbols their recipe imports** and return early if `browse_tui` is already in `sys.modules` — they do not reconcile or top up the names:
 
 ```python
 def _stub_browse_tui():
@@ -26,7 +26,7 @@ def _stub_browse_tui():
     ...
 ```
 
-Because the stub is process-wide, **whichever recipe test module loads first wins**, and its stub is reused by every recipe test loaded afterward in the same process.
+Because the stub is process-wide, **whichever recipe test module loads first wins**, and its stub is reused by every recipe test loaded afterward in the same process. The `test_browse_agents_*` suites install a **full** stub (every name the generated recipes and the frozen `browse-claude` import) and do not return early, so they are safe in any position; the trap is between the older suites.
 
 ### Symptom
 

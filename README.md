@@ -127,7 +127,7 @@ The user manual lives in **[`MANUAL/`](MANUAL/)**:
 
 - **[cli.md](MANUAL/cli.md)** — every flag, every input format, worked examples.
 - **[api.md](MANUAL/api.md)** — Python API: `Browser`, `Item`, `Action`, `Context`, `BrowserConfig`.
-- **[recipes.md](MANUAL/recipes.md)** — every shipped recipe (`browse-git`, `browse-claude`, `browse-md`, …) and how to write your own.
+- **[recipes.md](MANUAL/recipes.md)** — every shipped recipe (`browse-git`, `browse-agents-claude` / `-codex` / `-opencode`, `browse-md`, …) and how to write your own.
 
 For contributors, `docs/` holds [internals.md](docs/internals.md) (module
 layout, threading model) and the [design
@@ -139,7 +139,7 @@ specs](docs/superpowers/specs/2026-04-30-browse-tui-design.md).
 
 [![b-git](media/browse-git.png)](media/browse-git.png)
 
-**`b-claude`** — your Claude Code history: projects → sessions → messages.
+**`b-claude`** — your Claude Code history: projects → sessions → messages (`b-agents-claude` is the current, parts-built version; `b-agents-codex` and `b-agents-opencode` do the same for Codex CLI and OpenCode).
 
 [![b-claude](media/browse-claude.png)](media/browse-claude.png)
 

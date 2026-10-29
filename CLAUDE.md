@@ -8,6 +8,14 @@ Big tasks are done in a git worktree.
 We never make changes in a regular branch.
 If unsure whether the task is big enought for a worktree development, as the user.
 
+### Building
+
+`browse-tui` is generated from `src-tui/` by `./build-tui.sh`; the
+`recipes/browse-agents-*` recipes are generated from the parts in
+`recipes/browse-agents-src/` (`common/` plus one agent dir) by
+`./build-agents.sh`; `./build-all.sh` runs both. Edit the parts, never the
+generated files, and commit the regenerated output together with the parts.
+
 ### Code review
 
 Use planning-with-plan skill to create implementation plan. Use dispatch-with-plan skill to dispatch tasks to subagents.
