@@ -4001,12 +4001,15 @@ def _fold_records(td, cur, records, sess):
 def _read_new_records(sess):
     """Records appended since the last call: ``(records, dirty_parents)``.
 
-    ``records`` is ``[(record_key, rec_or_None), …]`` from
-    ``store_tail_poll``. When ``_TREE_CACHE`` has an entry the records
-    are also folded into it (so tree-mode umbrellas, parent_id_of,
-    agent_link … stay current) and ``dirty_parents`` is the set of
-    umbrella ids whose visible child list grew; a record the store
-    reports as changed is replaced in place and its parent dirtied.
+    ``records`` is the ``new`` list from ``store_tail_poll`` followed by
+    its ``changed`` records, all ``(record_key, rec)``. When
+    ``_TREE_CACHE`` has an entry the new records are folded into it (so
+    tree-mode umbrellas, parent_id_of, agent_link … stay current) and a
+    changed record replaces the old object everywhere the fold placed it
+    (``records``, its umbrella's member list, a turn root entry);
+    ``dirty_parents`` is the set of umbrella ids whose child list grew or
+    whose children changed — for a changed tool call also its turn's
+    ``<prompt>`` umbrella, whose ``<tool:>`` row title derives from it.
     Flat mode ignores the dirty set and consumes ``records`` directly.
     ``([], set())`` when the session has no tail state or the store
     has nothing new.
@@ -4020,12 +4023,59 @@ def _read_new_records(sess):
     if td is not None:
         dirty |= _fold_records(td, state.cursor, new, sess)
         for n, rec in changed:
-            if 0 <= n < len(td.records):
-                td.records[n] = rec
-                parent = td.parent_id_of.get(n)
-                if parent is not None:
-                    dirty.add(parent)
-    return (new, dirty)
+            dirty |= _replace_record(td, rec, n, sess)
+    return (new + changed, dirty)
+
+
+def _replace_record(td, rec, n, sess):
+    """Swap the changed ``rec`` in for key ``n``; returns the dirty ids."""
+    if not (0 <= n < len(td.records)):
+        return set()
+    td.records[n] = rec
+    parent = td.parent_id_of.get(n)
+    if parent is None:
+        return set()
+    tag, _sess, key = parent
+    if tag == 'tool' and key == n:     # the call record itself: a turn member
+        members = td.turn_direct.get(td.tool_to_turn_root_line.get(n), [])
+    else:
+        members = {'tool': td.tool_children, 'prompt': td.turn_direct,
+                   'span': td.span_records}[tag].get(key, [])
+    for i, member in enumerate(members):
+        if member.key == n:
+            members[i] = rec
+    if tag == 'prompt' and key == n:
+        for entry in td.roots_in_order:
+            if entry['kind'] == 'turn' and entry['line'] == n:
+                entry['rec'] = rec
+    if rec.is_voice and (td.latest_voice_line is None or n > td.latest_voice_line):
+        td.latest_voice_line = n
+    td.voice_count = None
+    td.link_map = None
+    dirty = {parent}
+    if tag == 'tool':
+        root = td.tool_to_turn_root_line.get(key)
+        if root is not None:
+            dirty.add(('prompt', sess, root))
+        # A spawn result that settled after its placeholder links its
+        # child now rather than at the next full read.
+        if key != n and _maybe_link_subagent(td, rec, key, sess):
+            dirty.add(('session', sess))
+    return dirty
+
+
+# Row fields a changed record can alter; ``_mod_ops`` emits a ``mod`` op
+# carrying only the ones that differ from the framework's cached Item,
+# plus a preview-cache drop so a revisited row renders its new body.
+_REFRESH_FIELDS = ('title', 'tag', 'tag_style', 'row_bg', 'hidden', 'has_children')
+
+
+def _mod_ops(cached, item_id, fields):
+    diff = {k: v for k, v in fields.items()
+            if k in _REFRESH_FIELDS and getattr(cached, k, None) != v}
+    if not diff:
+        return []
+    return [mod(item_id, **diff), ('drop_preview_cache', item_id)]
 
 
 def _refresh_hidden_in_op(op):
@@ -4070,10 +4120,11 @@ def _item_to_upsert_kwargs(item):
 def _push_tail_diffs(b, dirty_parents):
     """Apply ``update_data`` patches for every dirty umbrella's new kids.
 
-    For each parent id whose child list grew during the fold step, we
-    compare the live ``get_children(parent)`` output against what the
-    framework already has cached and ``upsert`` only the new entries,
-    each positioned after its predecessor in the fresh listing (so a
+    For each parent id whose child list grew (or whose children changed)
+    during the fold step, we compare the live ``get_children(parent)``
+    output against what the framework already has cached, ``upsert`` the
+    new entries and ``mod`` the cached ones whose row fields moved, each
+    new entry positioned after its predecessor in the fresh listing (so a
     tail-linked subagent lands INSIDE the session's top block — the
     divider sentinel ids double as pivots — and a first subagent
     brings the whole block in at the top, refetch-identical). Ops
@@ -4104,18 +4155,20 @@ def _push_tail_diffs(b, dirty_parents):
         cached = b.cached_children(parent_id)
         if cached is None:
             continue
-        existing_ids = {it.id for it in cached}
+        existing = {it.id: it for it in cached}
         try:
             fresh = get_children(parent_id)
         except Exception:
             continue
         prev_id = None
         for child in fresh:
-            if child.id not in existing_ids:
+            if child.id not in existing:
                 where = (('first', None) if prev_id is None
                          else ('after', None, prev_id))
                 ops.append(upsert(child.id, parent_id, where=where,
                                   **_item_to_upsert_kwargs(child)))
+            else:
+                ops.extend(_mod_ops(existing[child.id], child.id, vars(child)))
             prev_id = child.id
     if ops:
         b.update_data(ops)
@@ -4186,7 +4239,8 @@ def _push_flat_inserts(b, sess, records):
     first, latest at the bottom — same as tree mode). New tail
     records belong at the **end** of the list. ``where=None`` uses
     the framework's default "append at the end of the parent's
-    children" behaviour.
+    children" behaviour. A record the store reported as changed is
+    already listed: its row gets a ``mod`` with the fields that moved.
 
     The whole batch goes through one ``update_data`` call so the
     framework's cursor anchor runs exactly once at the end and the
@@ -4198,20 +4252,18 @@ def _push_flat_inserts(b, sess, records):
     existing = b.cached_children(session_id)
     if existing is None:
         return
-    existing_ids = {it.id for it in existing}
+    existing_ids = {it.id: it for it in existing}
 
     ops = []
     for n, rec in records:
         if rec is None:
             continue
         item_id = ('msg', sess, n)
-        if item_id in existing_ids:
-            continue
         fields = {
             'title': _oneline(_summarise_message(rec)),
-            'tag': rec.tag,
+            'tag': _row_tag(rec),
             'tag_style': _record_tag_style(rec),
-            'has_children': False,
+            'has_children': _md_has_children(rec),
             'hidden': not _passes_filter(item_id),
             'kind': 'message',
             'line_no': n,
@@ -4220,7 +4272,10 @@ def _push_flat_inserts(b, sess, records):
         bg = _record_row_bg(rec)
         if bg is not None:
             fields['row_bg'] = bg
-        ops.append(upsert(item_id, session_id, **fields))
+        if item_id in existing_ids:
+            ops.extend(_mod_ops(existing_ids[item_id], item_id, fields))
+        else:
+            ops.append(upsert(item_id, session_id, **fields))
     if ops:
         b.update_data(ops)
 
@@ -8476,10 +8531,11 @@ def _link_label(target_id):
     _src, line = store_source_locator(sess, n)
     td = _scan_tree(sess)
     rec = td.records[n] if 0 <= n < len(td.records) else None
-    what = _oneline(_summarise_message(rec)) if rec is not None else f'line {line}'
+    what = _oneline(_summarise_message(rec)) if rec is not None else f'record {n + 1}'
     if len(what) > 60:
         what = what[:59] + '…'
-    return f'↗ {name}:{line}  {what}'
+    at = f':{line}' if line is not None else ''
+    return f'↗ {name}{at}  {what}'
 
 
 def _link_menu_rows(item_id):

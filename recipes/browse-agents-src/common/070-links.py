@@ -329,10 +329,11 @@ def _link_label(target_id):
     _src, line = store_source_locator(sess, n)
     td = _scan_tree(sess)
     rec = td.records[n] if 0 <= n < len(td.records) else None
-    what = _oneline(_summarise_message(rec)) if rec is not None else f'line {line}'
+    what = _oneline(_summarise_message(rec)) if rec is not None else f'record {n + 1}'
     if len(what) > 60:
         what = what[:59] + '…'
-    return f'↗ {name}:{line}  {what}'
+    at = f':{line}' if line is not None else ''
+    return f'↗ {name}{at}  {what}'
 
 
 def _link_menu_rows(item_id):

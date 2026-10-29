@@ -56,10 +56,10 @@ the newest `opencode*.db` under `$XDG_DATA_HOME/opencode` (default
 **Format notes.** The transcript lives in DB rows, not files: `E` / `V` on a
 session open a pretty-printed JSON dump of its message rows, and on
 selected records a dump of just those records. The tail polls the
-session's row count, max `seq` and max `time_updated` every second, so new
-messages appear as they land; a running tool shows a `(running)` result
-placeholder that refreshes on Ctrl-R or when its turn is re-expanded
-(live in-place refresh is tracked in #1303). Tool inputs are
+session's row count, max `seq` and max `time_updated` every second; new
+messages appear as they land, a message still streaming is re-read in
+place, and a running tool shows a `(running)` result placeholder that
+turns into the result when it completes. Tool inputs are
 normalised to the shared names (`path` → `file_path`, `oldString` →
 `old_string`) so the common formatters render them; an `edit` result
 carries the patch from its metadata as the diff.

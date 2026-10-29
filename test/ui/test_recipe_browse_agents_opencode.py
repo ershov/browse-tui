@@ -15,7 +15,9 @@ import tempfile
 import unittest
 
 from test.ui.fixtures.tmux import TmuxFixture
-from test.unit.test_browse_agents_opencode_store import make_fake_opencode, S1, S3, T0
+from test.unit.test_browse_agents_opencode_store import (
+    _v2_rows, make_fake_opencode, S1, S3, T0,
+)
 
 
 _REPO = os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
@@ -97,6 +99,49 @@ class TestBrowseAgentsOpenCode(unittest.TestCase):
                 con.commit()
                 con.close()
                 t.wait_for('PROBE_APPENDED', timeout=5.0)
+                t.send('q')
+
+    def _complete_streaming_row(self, db):
+        """The running ``read`` of msg_05 completes and a final text lands."""
+        rows = {mid: data for sid, mid, _t, _s, _c, _u, data in _v2_rows() if sid == S1}
+        grown = rows['msg_05']
+        grown['content'][0]['state'] = {
+            'status': 'completed', 'input': {'path': '/home/test/projA/b.py'},
+            'content': [{'type': 'text', 'text': 'PROBE_B_BODY'}], 'metadata': {}}
+        grown['content'].append({'type': 'text', 'text': 'PROBE_ANSWER_TWO b is fine'})
+        grown['finish'] = 'stop'
+        con = sqlite3.connect(db)
+        con.execute('UPDATE session_message SET data = ?, time_updated = ? WHERE id = ?',
+                    (json.dumps(grown), T0 + 25000, 'msg_05'))
+        con.commit()
+        con.close()
+
+    def test_live_tail_refreshes_a_streaming_row_in_tree_mode(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            share, db = make_fake_opencode(tmp)
+            with TmuxFixture(cols=160, rows=30, env=self._env(tmp, share)) as t:
+                t.launch(_BIN, '--run-py', _RECIPE, '--tree', '--detail', 'tools',
+                         '--session', S1)
+                t.wait_for('PROBE_PROMPT_TWO', timeout=5.0)
+                t.send('Down')          # the <tool:read> umbrella
+                t.send('Right')         # expand it: the (running) placeholder row
+                t.wait_for('(running)', timeout=3.0)
+                self._complete_streaming_row(db)
+                t.wait_for('PROBE_B_BODY', timeout=5.0)   # the row refreshed in place
+                t.send('q')
+
+    def test_live_tail_refreshes_a_streaming_row_in_flat_mode(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            share, db = make_fake_opencode(tmp)
+            with TmuxFixture(cols=160, rows=30, env=self._env(tmp, share)) as t:
+                t.launch(_BIN, '--run-py', _RECIPE, '--no-tree', '--detail', 'tools',
+                         '--session', S1)
+                t.wait_for('PROBE_PROMPT_TWO', timeout=5.0)
+                t.send('Down')          # the read call …
+                t.send('Down')          # … and its (running) placeholder, into view
+                t.wait_for('(running)', timeout=3.0)
+                self._complete_streaming_row(db)
+                t.wait_for('PROBE_B_BODY', timeout=5.0)   # the row refreshed in place
                 t.send('q')
 
 

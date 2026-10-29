@@ -508,9 +508,14 @@ The common tail worker (`common/040-tree` + `090-main`) is poll-based: a
 daemon thread resolves the cursor's session, makes sure `_scan_tree` has
 opened it (`store_tail_open`), then every `store_tail_interval()` seconds
 calls `store_tail_poll`, folds `new` records into the cached tree data,
-replaces `changed` ones in place, and pushes `upsert` patches for
-umbrellas whose visible children changed. A stop event ends the thread
-before `sys.exit`.
+swaps `changed` ones in everywhere the fold placed them (`records`, the
+umbrella member lists, a turn root entry; `latest_voice_line` advances
+when the record became voice), and pushes patches: `upsert` for new rows,
+`mod` for cached rows whose title / tag / style / visibility moved (tree
+mode: the dirty umbrellas — a changed tool call also dirties its
+`<prompt>` umbrella, whose `<tool:>` row title derives from it; flat
+mode: the changed record rows). A stop event ends the thread before
+`sys.exit`.
 
 * Claude, Codex (`045-tail`): stat size and mtime, read from the saved byte
   offset, parse complete lines, keep a partial trailing line for the next
