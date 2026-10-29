@@ -3945,7 +3945,7 @@ class TestLiveTail(unittest.TestCase):
              'message': {'role': 'user', 'content': 'hi'}},
         ])
         try:
-            self.r._TAIL_STATE[path] = self.r._TailState(
+            self.r._TAIL_STATE[path] = self.r._FileTailState(
                 byte_offset=0, last_size=0, start_line=0,
                 cursor=self.r._ScanCursor(), error=False,
             )

@@ -14,7 +14,6 @@
 
 import atexit
 import pathlib
-import tempfile
 
 try:
     import sqlite3

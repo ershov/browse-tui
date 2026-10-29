@@ -35,7 +35,7 @@ Non-goals now:
 ```
 recipes/browse-agents-src/
   DESIGN.md
-  common/      015-imports 020-helpers 030-model 040-tree 050-preview-core 050-render 070-links 080-actions 085-menus 090-main
+  common/      015-imports 020-helpers 030-model 040-tail-file 040-tree 050-preview-core 050-render 070-links 080-actions 085-menus 090-main
   claude/      010-prelude 025-store 035-parse 045-tail 055-extras
   codex/       010-prelude 025-store 035-parse 045-tail 055-extras
   opencode/    010-prelude 025-store 035-parse 045-tail 055-extras
@@ -52,7 +52,8 @@ Numbering convention:
   sorts before `050-render` by name and `050-render` depends on it (helpers
   such as `_rule` / `_md_voice` / `_record_at`), so neither may be renamed
   in a way that flips that order; `050-render` holds the registries
-  `055-extras` fills.
+  `055-extras` fills. `040-tail-file` (the file-append tail helper) and
+  `040-tree` share a number the same way, both sorting before `045-tail`.
 * Agent parts use the 5s and sort right after the common part they extend:
   `025-store` after `020-helpers`, `035-parse` after `030-model`, `045-tail`
   after `040-tree`, `055-extras` after `050-render`.
@@ -340,7 +341,8 @@ chrome, snapshots and the selection events are `meta` rows.
   (tag `agent-send`), a `<task-notification>` user record → `agent_voice
   'reply'`, a `<teammate-message>` / `<agent-message>` / `origin.kind ==
   peer` user record → `'peer'` (`'idle'` for an idle-notification body).
-* Tail: file append; byte offset per file, partial last line kept.
+* Tail: file append through the common `040-tail-file` helper; byte offset
+  per file, partial last line kept.
 
 ### Codex CLI
 
@@ -424,8 +426,8 @@ chrome, snapshots and the selection events are `meta` rows.
   (interrupted) · …` / `turn failed: <error>`. `session_meta`,
   `turn_context`, `thread_settings_applied` → `meta` level 5; `token_count`,
   `token_usage_record`, `world_state` → `meta` level 6.
-* Tail: file append, same mechanism as Claude (`045-tail` is a near copy
-  with the parse context on the state; a shared helper is a follow-up).
+* Tail: file append through the common `040-tail-file` helper, with the
+  `_ParseCtx` on the state.
 
 ### OpenCode
 
@@ -517,10 +519,17 @@ mode: the dirty umbrellas — a changed tool call also dirties its
 mode: the changed record rows). A stop event ends the thread before
 `sys.exit`.
 
-* Claude, Codex (`045-tail`): stat size and mtime, read from the saved byte
-  offset, parse complete lines, keep a partial trailing line for the next
-  poll. `changed` is always empty. The per-line byte offsets recorded
-  while reading serve `store_source_excerpt`.
+* Claude, Codex (`045-tail`): the common helper `common/040-tail-file`
+  (`_FileTailState`, `_file_tail_open` / `_file_tail_poll` /
+  `_file_tail_excerpt`, the `_FILE_INDEX` of states per path) stats the
+  size, reads from the saved byte offset, parses complete lines through
+  the agent's `parse(raw, key, state)` callback and keeps a partial
+  trailing line for the next poll; `changed` is always empty; the per-line
+  byte offsets recorded while reading serve `store_source_excerpt`. Each
+  agent's `045-tail` is a thin binding: `store_tail_interval` plus the
+  three contract functions delegating to the helper with its parser
+  (Codex passes `_FileTailState(ctx=_ParseCtx())` and parses with
+  `state.ctx`); `store_reset` clears `_FILE_INDEX`.
 * OpenCode (`045-tail`): watermark `(count, max(seq), max(time_updated))`
   of `session_message` for the session (v1: `(count, max(time_updated))`
   of `part`). On change, rows past the watermark become `new`; rows
