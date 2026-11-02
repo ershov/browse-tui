@@ -22,10 +22,10 @@ install() {
     echo "Installing into $DEST ..." 1>&2
     for FILE in "${FILES[@]}"; do
       printf ' %q' "$@" "$(relpath "$DEST" "$FILE")" ./ 1>&2; echo 1>&2
-      "$@" "$(relpath "$DEST" "$FILE")" ./
+      "$@" "$(relpath "$DEST" "$FILE")" ./ || continue
       if file_alias "$(basename "$FILE")"; then
         echo " symlink $ALIAS"
-        (cd "$DEST"; ln -s "$FILE" "$ALIAS")
+        (cd "$DEST"; ln -s "$FILE" "$ALIAS") || continue
       fi
     done
     [[ ":$PATH:" == *":$DEST:"* ]] || echo "NOTE: $DEST is not in your \$PATH." 1>&2
