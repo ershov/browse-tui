@@ -1178,9 +1178,9 @@ class TestBrowseGitStdin(unittest.TestCase):
                 self.assertRegex(row, r'\b[0-9a-f]{7}\b')
                 t.send('q')
 
-    def test_piped_log_p_block_previews_its_patch(self):
-        # `git log -p` → the newest commit's preview carries its own
-        # patch text from the slurped block (delta or verbatim).
+    def test_piped_log_p_commit_drills_into_file_rows(self):
+        # `git log -p` → the newest commit previews its header + stat;
+        # expanding it lists its file rows, each previewing its patch.
         with tempfile.TemporaryDirectory() as repo, \
                 tempfile.TemporaryDirectory() as elsewhere:
             _make_stdin_repo(repo)
@@ -1188,15 +1188,19 @@ class TestBrowseGitStdin(unittest.TestCase):
             with TmuxFixture(cols=200, rows=30) as t:
                 self._launch_stdin(t, elsewhere, payload)
                 t.wait_for('second commit change alpha', timeout=8.0)
-                # Cursor starts on the newest commit; its block contains
-                # the alpha v1→v2 patch.
+                t.wait_for('1 file changed', timeout=5.0)
+                t.send('Enter')
+                cap = t.wait_for('[M]', timeout=5.0)
+                row = next(ln for ln in cap.splitlines() if '[M]' in ln)
+                self.assertIn('alpha.txt', row)
+                t.send('Down')
                 t.wait_for('alpha payload v2', timeout=5.0)
                 t.send('q')
 
     def test_piped_git_show_commit_row_over_file_rows(self):
-        # `git show` → the umbrella is the commit row (subject + sha),
-        # auto-expanded over the file rows; its preview leads with the
-        # commit header and ends with the stat footer.
+        # `git show` → a one-commit log row (subject + sha), auto-expanded
+        # over its file rows; its preview leads with the commit header and
+        # ends with the stat footer.
         with tempfile.TemporaryDirectory() as repo, \
                 tempfile.TemporaryDirectory() as elsewhere:
             _make_stdin_repo(repo)

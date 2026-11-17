@@ -83,7 +83,8 @@ Coverage (ticket #862 — ``browse-git -``, git output from stdin):
   A/M/D/R letters, new-path display, headerless ``--- a/`` fragments,
   GNU ``\\t<timestamp>`` suffixes, ``--color=always`` input
 * ``_parse_stdin_log``       ``commit <sha>`` blocks → (sha, author, date,
-  subject, deco) rows; --stat / -p payload stays in the block
+  subject, deco) rows; --stat stays in the header, a -p patch parses
+  into the commit's own diff group
 * ``_parse_porcelain_lines`` line porcelain → (XY, path), rename arrow
 * ``_parse_human_status``    human sections / verbs → porcelain-style rows
 * stdin tree + previews      the root builders / ``get_preview`` serve the
@@ -94,7 +95,7 @@ Coverage (ticket #862 — ``browse-git -``, git output from stdin):
   bare and ``--help`` invocations never read stdin; ``--tty -`` /
   ``--tty=-`` (the framework flag's value) is NOT the stdin positional
 * action gating              `` ` `` / ``t`` flash in stdin mode (no state
-  change); ``E`` covers ('sfile', i, path) rows; the stdin window title
+  change); ``E`` covers ('sfile', g, i, path) rows; the stdin window title
 * ``_run_git`` gitless       a missing git binary folds into a failed
   CompletedProcess (rc 127) — ``E`` degrades to the cwd-relative path
   and previews surface the message instead of crashing the key dispatch
@@ -542,10 +543,20 @@ class TestOnResize(unittest.TestCase):
         self.assertEqual(self._fire(ctx, 170), 1)   # crosses 160 → full
         self.assertEqual(ctx.drop_ids, [None])
 
+    def test_stdin_log_p_drops_only_patch_commits(self):
+        self.r.HAVE_DELTA = None
+        self.r._STDIN_KIND = 'log'
+        self.r._STDIN_DIFFS = [([('M', 'a')], ['x']), ([], []),
+                               ([('A', 'b')], ['y'])]
+        ctx = _ResizeCtx()
+        self._fire(ctx, 100)            # baseline
+        self.assertEqual(self._fire(ctx, 120), 2)
+        self.assertEqual(ctx.drop_ids, [('slog', 0), ('slog', 2)])
+
     def test_stdin_log_does_not_drop_on_unified_change(self):
-        # A piped LOG (not diff) has no width-scaled umbrella, so it
-        # behaves like repo mode: a unified-only change with delta absent
-        # does not drop.
+        # A patch-free piped LOG has no width-scaled stat, so it behaves
+        # like repo mode: a unified-only change with delta absent does
+        # not drop.
         self.r.HAVE_DELTA = None
         self.r._STDIN_KIND = 'log'
         ctx = _ResizeCtx()
@@ -3981,6 +3992,10 @@ Date:   Wed Jun 10 09:00:00 2026 +0000
 # ``git show``: the decorated newest commit of ``_LOG_TEXT`` + its patch.
 _SHOW_TEXT = _LOG_TEXT.split('\ncommit ')[0] + '\n' + _DIFF_TEXT
 
+# ``git log -p``: both ``_LOG_TEXT`` commits, each carrying ``_DIFF_TEXT``.
+_LOG_P_TEXT = (_SHOW_TEXT + 'commit ' + _LOG_TEXT.split('\ncommit ')[1]
+               + '\n' + _DIFF_TEXT)
+
 # Human ``git status`` covering every section + verb the parser maps.
 _HUMAN_STATUS_TEXT = """\
 On branch main
@@ -4083,18 +4098,8 @@ class TestSniffStdinKind(unittest.TestCase):
             self.r._sniff_stdin_kind(_colored(_LOG_TEXT, ('commit ',))),
             'log')
 
-    def test_git_show_single_commit_with_patch_is_diff(self):
-        self.assertEqual(self.r._sniff_stdin_kind(_SHOW_TEXT), 'diff')
-        self.assertEqual(
-            self.r._sniff_stdin_kind(
-                _colored(_SHOW_TEXT, ('commit ', 'diff --git'))), 'diff')
-
-    def test_multi_commit_patch_stays_log(self):
-        self.assertEqual(self.r._sniff_stdin_kind(_LOG_TEXT + _DIFF_TEXT), 'log')
-
-    def test_single_commit_without_patch_stays_log(self):
-        self.assertEqual(
-            self.r._sniff_stdin_kind(_LOG_TEXT.split('\ncommit ')[0]), 'log')
+    def test_git_show_is_log(self):
+        self.assertEqual(self.r._sniff_stdin_kind(_SHOW_TEXT), 'log')
 
     def test_unrecognized_inputs_are_none(self):
         for text in ('hello world\n',           # prose
@@ -4104,34 +4109,6 @@ class TestSniffStdinKind(unittest.TestCase):
                      '## main...origin/main\n', # status -sb branch line
                      '', '   \n\n'):            # empty / whitespace-only
             self.assertIsNone(self.r._sniff_stdin_kind(text), repr(text))
-
-
-class TestSplitCommitHeader(unittest.TestCase):
-    """``_split_commit_header`` peels a ``git show`` header off a diff."""
-
-    @classmethod
-    def setUpClass(cls):
-        cls.r = _load_recipe()
-
-    def test_show_splits_header_and_diff(self):
-        header, diff = self.r._split_commit_header(_SHOW_TEXT)
-        self.assertEqual(header + diff, _SHOW_TEXT)
-        self.assertEqual(diff, _DIFF_TEXT)
-        self.assertTrue(header.startswith('commit deadbeef'))
-        self.assertIn('    second subject line', header)
-
-    def test_colored_show_splits_the_same(self):
-        colored = _colored(_SHOW_TEXT, ('commit ', 'diff --git'))
-        header, diff = self.r._split_commit_header(colored)
-        self.assertEqual(header, _colored(_SHOW_TEXT.split('diff --git')[0],
-                                          ('commit ',)))
-        self.assertTrue(diff.startswith('\x1b[1mdiff --git a/keep.txt'))
-
-    def test_plain_diff_has_no_header(self):
-        self.assertEqual(self.r._split_commit_header(_DIFF_TEXT),
-                         (None, _DIFF_TEXT))
-        frag = '--- a/x.txt\n+++ b/x.txt\n@@ -1 +1 @@\n-o\n+n\n'
-        self.assertEqual(self.r._split_commit_header(frag), (None, frag))
 
 
 class TestParseStdinDiff(unittest.TestCase):
@@ -4349,7 +4326,7 @@ class TestStdinDiffUmbrella(unittest.TestCase):
     def _seed(self, text):
         rows, blocks = self.r._parse_stdin_diff(text)
         self.r._STDIN_KIND = 'diff'
-        self.r._STDIN_ROWS, self.r._STDIN_BLOCKS = rows, blocks
+        self.r._STDIN_DIFFS = [(rows, blocks)]
         return rows, blocks
 
     def _title(self):
@@ -4379,7 +4356,7 @@ class TestStdinDiffUmbrella(unittest.TestCase):
         rows, _blocks = self._seed(_DIFF_TEXT)
         kids = self.r.get_children(('sdiff',))
         self.assertEqual([it.id for it in kids],
-                         [('sfile', i, p) for i, (_l, p) in enumerate(rows)])
+                         [('sfile', 0, i, p) for i, (_l, p) in enumerate(rows)])
 
     def test_main_auto_expands_the_umbrella(self):
         # main() issues a posted ``b.expand(('sdiff',))`` before run() for
@@ -4415,10 +4392,11 @@ class TestStdinDiffUmbrella(unittest.TestCase):
             self.r.sys.argv[:] = saved_argv
         self.assertEqual(expanded, [('sdiff',)])
 
-    def test_main_does_not_auto_expand_for_log_or_status(self):
-        # The umbrella + auto-expand are diff-only. A log / status stdin
-        # builds no umbrella and issues no expand.
-        for text in (_LOG_TEXT, ' M beta.txt\n'):
+    def test_main_auto_expands_only_a_single_patch_commit_log(self):
+        # Besides the diff umbrella, only a one-commit log carrying a patch
+        # (``git show``) is auto-expanded; other log / status input is not.
+        for text, want in ((_LOG_TEXT, []), (' M beta.txt\n', []),
+                           (_LOG_P_TEXT, []), (_SHOW_TEXT, [('slog', 0)])):
             self.r = _load_recipe()
             expanded = []
 
@@ -4445,7 +4423,7 @@ class TestStdinDiffUmbrella(unittest.TestCase):
             finally:
                 self.r.sys.stdin = saved_in
                 self.r.sys.argv[:] = saved_argv
-            self.assertEqual(expanded, [], text)
+            self.assertEqual(expanded, want, text)
 
     # ---- stat preview ----------------------------------------------------
 
@@ -4459,14 +4437,14 @@ class TestStdinDiffUmbrella(unittest.TestCase):
         self.r._browser = types.SimpleNamespace(preview_width=80)
         seen = {}
         self.r._stdin_diff_stat = (
-            lambda w: seen.__setitem__('w', w) or 'STAT')
+            lambda g, w: seen.__setitem__('w', w) or 'STAT')
         self.assertEqual(self.r.get_preview(('sdiff',)), 'STAT')
         self.assertEqual(seen['w'], 80)        # current preview width
 
     def test_stat_rows_and_summary(self):
         # Option B (#938): per file ``<path> | +N -M`` then the footer.
         self._seed(_DIFF_TEXT)
-        out = self.r._stdin_diff_stat(80).splitlines()
+        out = self.r._stdin_diff_stat(0, 80).splitlines()
         # One row per file (4) + the summary footer.
         self.assertEqual(len(out), 5)
         plain = [self._plain(ln) for ln in out]
@@ -4483,7 +4461,7 @@ class TestStdinDiffUmbrella(unittest.TestCase):
         # raw escapes, not a screenshot. (The framework strips them when
         # ANSI is off; see the row-render test in the UI suite.)
         self._seed(_DIFF_TEXT)
-        rows = self.r._stdin_diff_stat(80).splitlines()
+        rows = self.r._stdin_diff_stat(0, 80).splitlines()
         self.assertIn('\x1b[32m+1\x1b[m', rows[0])    # keep.txt added
         self.assertIn('\x1b[31m-1\x1b[m', rows[0])    # keep.txt removed
         # A zero side is still colored (the number is the signal — #938).
@@ -4495,25 +4473,24 @@ class TestStdinDiffUmbrella(unittest.TestCase):
         # escape-sanitiser (kept SGR, dropped other CSI) leaves them whole
         # — the green/red reaches the rendered preview unchanged.
         self._seed(_DIFF_TEXT)
-        out = self.r._stdin_diff_stat(80)
+        out = self.r._stdin_diff_stat(0, 80)
         self.assertEqual(self.r.sanitize_ansi(out), out)
 
     def test_stat_no_histogram_bars(self):
         # Option B dropped the bars: after the colored ``+N -M`` there is
         # no trailing run of bare '+'/'-' glyphs.
         self._seed(_DIFF_SCALING)        # big.txt 9/3, small.txt 1/1
-        for ln in self.r._stdin_diff_stat(80).splitlines()[:-1]:
+        for ln in self.r._stdin_diff_stat(0, 80).splitlines()[:-1]:
             self.assertRegex(self._plain(ln), r'\| \+\d+ -\d+$')
 
     def test_stat_long_path_is_front_elided(self):
         self.r._STDIN_KIND = 'diff'
         long_path = 'very/deeply/nested/dir/longfilename.txt'
-        self.r._STDIN_ROWS = [('M', long_path)]
-        self.r._STDIN_BLOCKS = [
+        self.r._STDIN_DIFFS = [([('M', long_path)], [
             f'diff --git a/{long_path} b/{long_path}\n'
             f'--- a/{long_path}\n+++ b/{long_path}\n'
-            '@@ -1 +1 @@\n-old\n+new\n']
-        row = self._plain(self.r._stdin_diff_stat(30).splitlines()[0])
+            '@@ -1 +1 @@\n-old\n+new\n'])]
+        row = self._plain(self.r._stdin_diff_stat(0, 30).splitlines()[0])
         # The readable tail is kept behind a ``...`` prefix (no '/'-snap):
         # whatever fits the name budget, ending at the path's tail.
         self.assertTrue(row.lstrip().startswith('...'), row)
@@ -4521,18 +4498,18 @@ class TestStdinDiffUmbrella(unittest.TestCase):
         # The counts always follow, whatever the path length.
         self.assertRegex(row, r'\| \+1 -1$')
         # A wider pane keeps more of the path.
-        wide = self._plain(self.r._stdin_diff_stat(80).splitlines()[0])
+        wide = self._plain(self.r._stdin_diff_stat(0, 80).splitlines()[0])
         self.assertEqual(wide, f' {long_path} | +1 -1')
 
     def test_stat_short_path_is_not_padded(self):
         # No fixed-width name column any more — a short path is verbatim.
         self._seed(_DIFF_RENAME_HUNKS)       # new.txt, 1/1
-        row = self._plain(self.r._stdin_diff_stat(80).splitlines()[0])
+        row = self._plain(self.r._stdin_diff_stat(0, 80).splitlines()[0])
         self.assertEqual(row, ' new.txt | +1 -1')
 
     def test_stat_binary_row_shows_Bin_no_counts(self):
         self._seed(_DIFF_BINARY)
-        rows = self.r._stdin_diff_stat(80).splitlines()
+        rows = self.r._stdin_diff_stat(0, 80).splitlines()
         self.assertEqual(self._plain(rows[0]), ' img.bin | Bin')
         # No +/- counts for a binary file, and no color either.
         self.assertNotIn('\x1b[', rows[0])
@@ -4556,14 +4533,14 @@ class TestStdinDiffUmbrella(unittest.TestCase):
 
     def test_stat_hunkless_rename_row_shows_zero_counts(self):
         self._seed(_DIFF_RENAME_HUNKLESS)
-        rows = self.r._stdin_diff_stat(80).splitlines()
+        rows = self.r._stdin_diff_stat(0, 80).splitlines()
         # The rename file's count is +0 -0 (no hunks → no changes).
         self.assertEqual(self._plain(rows[0]), ' new.txt | +0 -0')
 
     def test_stat_empty_diff_is_just_the_summary(self):
         self.r._STDIN_KIND = 'diff'
-        self.r._STDIN_ROWS, self.r._STDIN_BLOCKS = [], []
-        self.assertEqual(self.r._stdin_diff_stat(80),
+        self.r._STDIN_DIFFS = [([], [])]
+        self.assertEqual(self.r._stdin_diff_stat(0, 80),
                          ' 0 files changed, 0 insertions(+), 0 deletions(-)')
 
     # ---- umbrella title color -------------------------------------------
@@ -4588,7 +4565,7 @@ class TestParseStdinLog(unittest.TestCase):
         cls.r = _load_recipe()
 
     def test_rows_fields_and_block_alignment(self):
-        rows, blocks = self.r._parse_stdin_log(_LOG_TEXT)
+        rows, blocks, diffs = self.r._parse_stdin_log(_LOG_TEXT)
         self.assertEqual(rows, [
             ('deadbeefcafe1234567890abcdef000000000000', 'Alice Dev',
              'Thu Jun 11 10:00:00 2026 +0000', 'second subject line',
@@ -4601,26 +4578,40 @@ class TestParseStdinLog(unittest.TestCase):
         self.assertIn('body paragraph that is not the subject', blocks[0])
         self.assertNotIn('first subject', blocks[0])
         self.assertEqual(''.join(blocks), _LOG_TEXT)
+        self.assertEqual(diffs, [([], []), ([], [])])
 
     def test_stat_payload_stays_in_block_not_fields(self):
         text = (_LOG_TEXT.split('\ncommit ')[0]
                 + '\n a.txt | 2 +-\n 1 file changed, 1 insertion(+)\n')
-        rows, blocks = self.r._parse_stdin_log(text)
+        rows, blocks, _diffs = self.r._parse_stdin_log(text)
         self.assertEqual(len(rows), 1)
         self.assertEqual(rows[0][3], 'second subject line')
         self.assertIn(' a.txt | 2 +-', blocks[0])
 
-    def test_patch_payload_stays_in_block(self):
-        # log -p: the diff rides in the block; commit fields untouched.
-        text = _LOG_TEXT + 'diff --git a/x b/x\n--- a/x\n+++ b/x\n+new\n'
-        rows, blocks = self.r._parse_stdin_log(text)
-        self.assertEqual(len(rows), 2)
-        self.assertEqual(rows[1][3], 'first subject')
-        self.assertIn('diff --git a/x b/x', blocks[1])
+    def test_patch_splits_into_header_and_file_blocks(self):
+        # log -p: each commit's patch parses into its own diff group; the
+        # header keeps the message and the commit fields are untouched.
+        rows, headers, diffs = self.r._parse_stdin_log(_LOG_P_TEXT)
+        self.assertEqual([r[3] for r in rows],
+                         ['second subject line', 'first subject'])
+        self.assertEqual(headers[0], _SHOW_TEXT.split('diff --git')[0])
+        self.assertNotIn('diff --git', headers[1])
+        self.assertEqual(headers[0] + ''.join(diffs[0][1]), _SHOW_TEXT)
+        for rows_g, _blocks in diffs:
+            self.assertEqual(rows_g, [('M', 'keep.txt'), ('A', 'brand.txt'),
+                                      ('D', 'gone.txt'), ('R', 'new.txt')])
+
+    def test_log_m_from_parent_is_not_a_decoration(self):
+        text = _LOG_TEXT.replace(
+            'commit 0123456789abcdef0123456789abcdef01234567',
+            'commit 0123456789abcdef0123456789abcdef01234567 (from deadbee)')
+        rows, _h, _d = self.r._parse_stdin_log(text)
+        self.assertEqual(rows[1][0], '0123456789abcdef0123456789abcdef01234567')
+        self.assertEqual(rows[1][4], '')
 
     def test_colored_input_parses_the_same(self):
         colored = _colored(_LOG_TEXT, ('commit ',))
-        rows, _blocks = self.r._parse_stdin_log(colored)
+        rows, _blocks, _diffs = self.r._parse_stdin_log(colored)
         self.assertEqual([row[3] for row in rows],
                          ['second subject line', 'first subject'])
         self.assertEqual(rows[0][4], 'HEAD -> main, tag: v1.0')
@@ -4731,7 +4722,7 @@ class TestStdinTreeAndPreviews(unittest.TestCase):
     def test_diff_root_is_one_umbrella_over_sfile_leaves(self):
         rows, blocks = self.r._parse_stdin_diff(_DIFF_TEXT)
         self.r._STDIN_KIND = 'diff'
-        self.r._STDIN_ROWS, self.r._STDIN_BLOCKS = rows, blocks
+        self.r._STDIN_DIFFS = [(rows, blocks)]
         # Root is a single synthetic ('sdiff',) umbrella, expandable.
         root = self.r.get_children(None)
         self.assertEqual([it.id for it in root], [('sdiff',)])
@@ -4739,10 +4730,10 @@ class TestStdinTreeAndPreviews(unittest.TestCase):
         # Its children are the per-file ('sfile', …) leaves.
         items = self.r.get_children(('sdiff',))
         self.assertEqual([it.id for it in items], [
-            ('sfile', 0, 'keep.txt'),
-            ('sfile', 1, 'brand.txt'),
-            ('sfile', 2, 'gone.txt'),
-            ('sfile', 3, 'new.txt'),
+            ('sfile', 0, 0, 'keep.txt'),
+            ('sfile', 0, 1, 'brand.txt'),
+            ('sfile', 0, 2, 'gone.txt'),
+            ('sfile', 0, 3, 'new.txt'),
         ])
         self.assertEqual([it.tag for it in items], ['M', 'A', 'D', 'R'])
         self.assertEqual(items[0].tag_style, 'yellow')
@@ -4761,51 +4752,48 @@ class TestStdinTreeAndPreviews(unittest.TestCase):
         finally:
             self.r.sys.stdin = saved
 
-    def test_git_show_umbrella_is_a_commit_row_over_sfile_leaves(self):
-        self._ingest(_SHOW_TEXT)
-        self.assertEqual(self.r._STDIN_KIND, 'diff')
+    def test_log_p_commits_drill_into_their_sfile_leaves(self):
+        self._ingest(_LOG_P_TEXT)
+        self.assertEqual(self.r._STDIN_KIND, 'log')
         root = self.r.get_children(None)
-        self.assertEqual([it.id for it in root], [('sdiff',)])
-        row = root[0]
-        self.assertTrue(row.has_children)
-        self.assertEqual(row.title, 'second subject line')
-        self.assertEqual(row.col_sha, 'deadbee')
-        self.assertEqual(row.col_author, 'Alice Dev')
-        self.assertEqual(row.col_date, 'Thu Jun 11 10:00:00 2026 +0000')
-        self.assertEqual(row.chips, [
-            ('HEAD', 'green'), ('main', 'cyan'), ('v1.0', 'yellow')])
-        # The header is not a file row.
-        self.assertEqual(
-            [it.id for it in self.r.get_children(('sdiff',))],
-            [('sfile', 0, 'keep.txt'), ('sfile', 1, 'brand.txt'),
-             ('sfile', 2, 'gone.txt'), ('sfile', 3, 'new.txt')])
+        self.assertEqual([it.id for it in root], [('slog', 0), ('slog', 1)])
+        self.assertTrue(all(it.has_children for it in root))
+        self.assertEqual(root[0].col_sha, 'deadbee')
+        self.assertEqual(root[1].title, 'first subject')
+        kids = self.r.get_children(('slog', 1))
+        self.assertEqual([it.id for it in kids], [
+            ('sfile', 1, 0, 'keep.txt'), ('sfile', 1, 1, 'brand.txt'),
+            ('sfile', 1, 2, 'gone.txt'), ('sfile', 1, 3, 'new.txt')])
+        self.assertEqual([it.tag for it in kids], ['M', 'A', 'D', 'R'])
+        self.assertIn('+brand new', self.r.get_preview(kids[1].id))
+        self.assertEqual(self.r.get_preview(kids[0].id),
+                         self.r._STDIN_DIFFS[1][1][0])
 
-    def test_git_show_umbrella_preview_is_header_then_stat(self):
-        self._ingest(_SHOW_TEXT)
+    def test_log_p_commit_preview_is_header_then_stat(self):
+        self._ingest(_LOG_P_TEXT)
         header = _SHOW_TEXT.split('diff --git')[0]
-        self.assertEqual(self.r.get_preview(('sdiff',)),
+        self.assertEqual(self.r.get_preview(('slog', 0)),
                          header.rstrip('\n') + '\n\n'
-                         + self.r._stdin_diff_stat(80))
+                         + self.r._stdin_diff_stat(0, 80))
 
-    def test_git_show_with_stat_previews_only_gits_stat(self):
+    def test_log_stat_p_previews_only_gits_stat(self):
         stat = '---\n keep.txt | 2 +-\n 1 file changed, 1 insertion(+)\n\n'
         head = _SHOW_TEXT.split('diff --git')[0]
         self._ingest(head + stat + _DIFF_TEXT)
-        self.assertEqual(self.r.get_preview(('sdiff',)),
+        self.assertEqual(self.r.get_preview(('slog', 0)),
                          (head + stat).rstrip('\n'))
 
-    def test_plain_diff_umbrella_unchanged(self):
-        self._ingest(_DIFF_TEXT)
-        self.assertIsNone(self.r._STDIN_COMMIT)
+    def test_git_show_is_a_one_commit_log(self):
+        self._ingest(_SHOW_TEXT)
+        self.assertEqual(self.r._STDIN_KIND, 'log')
         root = self.r.get_children(None)
-        self.assertIsNone(getattr(root[0], 'col_sha', None))
-        self.assertEqual(self.r.get_preview(('sdiff',)),
-                         self.r._stdin_diff_stat(80))
+        self.assertEqual([it.id for it in root], [('slog', 0)])
+        self.assertTrue(root[0].has_children)
+        self.assertEqual(len(self.r.get_children(('slog', 0))), 4)
 
     def test_log_rows_carry_columns_chips_and_block_previews(self):
-        rows, blocks = self.r._parse_stdin_log(_LOG_TEXT)
-        self.r._STDIN_KIND = 'log'
-        self.r._STDIN_ROWS, self.r._STDIN_BLOCKS = rows, blocks
+        self._ingest(_LOG_TEXT)
+        blocks = self.r._STDIN_BLOCKS
         items = self.r.get_children(None)
         self.assertEqual([it.id for it in items],
                          [('slog', 0), ('slog', 1)])
@@ -4821,20 +4809,6 @@ class TestStdinTreeAndPreviews(unittest.TestCase):
         self.assertFalse(first.has_children)
         # A plain log block previews verbatim (no delta involved).
         self.assertEqual(self.r.get_preview(('slog', 0)), blocks[0])
-
-    def test_log_p_block_routes_through_colorize_diff(self):
-        text = _LOG_TEXT + 'diff --git a/x b/x\n--- a/x\n+++ b/x\n+new\n'
-        rows, blocks = self.r._parse_stdin_log(text)
-        self.r._STDIN_KIND = 'log'
-        self.r._STDIN_ROWS, self.r._STDIN_BLOCKS = rows, blocks
-        seen = []
-        self.r._colorize_diff = lambda raw: seen.append(raw) or 'RENDERED'
-        # Block 1 carries the patch → goes through the diff pipeline.
-        self.assertEqual(self.r.get_preview(('slog', 1)), 'RENDERED')
-        self.assertEqual(seen, [blocks[1]])
-        # Block 0 is patch-free → verbatim, pipeline untouched.
-        self.assertEqual(self.r.get_preview(('slog', 0)), blocks[0])
-        self.assertEqual(len(seen), 1)
 
     def test_status_rows_reuse_status_leaf_shape_and_text_preview(self):
         self.r._STDIN_KIND = 'status'
@@ -4941,28 +4915,29 @@ class TestStdinRealGitOutputs(unittest.TestCase):
                      ['log', '--decorate']):
             text = self.git(*args)
             self.assertEqual(self.r._sniff_stdin_kind(text), 'log', args)
-            rows, blocks = self.r._parse_stdin_log(text)
+            rows, blocks, _diffs = self.r._parse_stdin_log(text)
             self.assertEqual(
                 [row[3] for row in rows],
                 ['second commit adds delta', 'first commit'], args)
             self.assertEqual([row[1] for row in rows], ['T', 'T'], args)
             self.assertEqual(len(blocks), 2, args)
-        # -p blocks carry their patch; --decorate carries the HEAD deco.
-        _rows, blocks = self.r._parse_stdin_log(self.git('log', '-p'))
-        self.assertIn('diff --git a/delta.txt b/delta.txt', blocks[0])
-        rows, _blocks = self.r._parse_stdin_log(self.git('log', '--decorate'))
+        # -p commits carry their files; --decorate carries the HEAD deco.
+        _rows, _blocks, diffs = self.r._parse_stdin_log(self.git('log', '-p'))
+        self.assertEqual([d[0] for d in diffs],
+                         [[('A', 'delta.txt')],
+                          [('A', 'alpha.txt'), ('A', 'beta.txt'),
+                           ('A', 'gamma.txt')]])
+        rows, _b, _d = self.r._parse_stdin_log(self.git('log', '--decorate'))
         self.assertIn('HEAD', rows[0][4])
 
     def test_real_git_show(self):
         for args in (['show'], ['show', '--decorate'], ['log', '-1', '-p']):
             text = self.git(*args)
-            self.assertEqual(self.r._sniff_stdin_kind(text), 'diff', args)
-            header, diff = self.r._split_commit_header(text)
-            row = self.r._log_block_row(header)
-            self.assertEqual(row[3], 'second commit adds delta', args)
-            self.assertEqual(row[1], 'T', args)
-            rows, _blocks = self.r._parse_stdin_diff(diff)
-            self.assertEqual(rows, [('A', 'delta.txt')], args)
+            self.assertEqual(self.r._sniff_stdin_kind(text), 'log', args)
+            rows, _blocks, diffs = self.r._parse_stdin_log(text)
+            self.assertEqual([r[3] for r in rows],
+                             ['second commit adds delta'], args)
+            self.assertEqual(diffs[0][0], [('A', 'delta.txt')], args)
 
     def test_real_porcelain_line_and_z_forms_agree(self):
         line_text = self.git('status', '--porcelain')
@@ -5041,7 +5016,7 @@ class TestStdinMain(unittest.TestCase):
         self.assertIsNone(code)
         self.assertEqual(err, '')
         self.assertEqual(self.r._STDIN_KIND, 'diff')
-        self.assertEqual([row[1] for row in self.r._STDIN_ROWS],
+        self.assertEqual([row[1] for row in self.r._STDIN_DIFFS[0][0]],
                          ['keep.txt', 'brand.txt', 'gone.txt', 'new.txt'])
         # The Browser was constructed with the stdin window title.
         self.assertEqual(self.r._browser._args[0].title,
@@ -5271,7 +5246,7 @@ class TestStdinActionGating(unittest.TestCase):
         opened = []
 
         class Ctx:
-            cursor = self.r.Item(id=('sfile', 0, 'keep.txt'))
+            cursor = self.r.Item(id=('sfile', 0, 0, 'keep.txt'))
 
             def run_external(self, argv):
                 opened.append(argv)
@@ -5365,7 +5340,7 @@ class TestRunGitWithoutGit(unittest.TestCase):
         opened = []
 
         class Ctx:
-            cursor = self.r.Item(id=('sfile', 0, 'keep.txt'))
+            cursor = self.r.Item(id=('sfile', 0, 0, 'keep.txt'))
 
             def run_external(self, argv):
                 opened.append(argv)

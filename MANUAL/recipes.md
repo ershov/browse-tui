@@ -81,8 +81,7 @@ interactive terminal still browses the cwd / repo without touching stdin.
   | Sniffed kind | Recognised by | Tree |
   | --- | --- | --- |
   | **diff** | a `diff --git` header or a bare `--- a/` hunk | an auto-expanded umbrella row (`diff: N files +X -Y`) over one row per file; its preview is a per-file `path \| +N -M` table with green adds / red removes plus the `N files changed …` summary, and each file row previews its delta-rendered block |
-  | **diff** (`git show`) | exactly one `commit <sha>` block carrying a `diff --git` patch | the same diff tree, but the umbrella is a commit row (sha / author / date / ref chips + subject) whose preview is the commit header followed by the stat table |
-  | **log** | `commit <sha>` blocks (`--stat` / `-p` included; a single patch-carrying block is `git show` above) | one row per commit block; the whole block as the preview |
+  | **log** | `commit <sha>` blocks (`git log`, `--stat` / `-p` included, and `git show`) | one row per commit (sha / author / date / ref chips + subject). A patch-free commit previews its whole block; a commit carrying a patch expands into one row per file (each previewing its delta-rendered block) and previews its header followed by the stat table. A single such commit (`git show`) starts expanded |
   | **status** | porcelain `XY path` lines (the `-z` form too) or the human `On branch …` / `HEAD detached …` prose | the status view's leaf rows |
 
   The slurped text is the only data source — git is never run, no repo is
