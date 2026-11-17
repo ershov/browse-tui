@@ -1193,6 +1193,27 @@ class TestBrowseGitStdin(unittest.TestCase):
                 t.wait_for('alpha payload v2', timeout=5.0)
                 t.send('q')
 
+    def test_piped_git_show_commit_row_over_file_rows(self):
+        # `git show` → the umbrella is the commit row (subject + sha),
+        # auto-expanded over the file rows; its preview leads with the
+        # commit header and ends with the stat footer.
+        with tempfile.TemporaryDirectory() as repo, \
+                tempfile.TemporaryDirectory() as elsewhere:
+            _make_stdin_repo(repo)
+            payload = self._payload(elsewhere, _git_stdout(repo, 'show'))
+            with TmuxFixture(cols=200, rows=30) as t:
+                self._launch_stdin(t, elsewhere, payload)
+                cap = t.wait_for('second commit change alpha', timeout=8.0)
+                row = next(ln for ln in cap.splitlines()
+                           if 'second commit change alpha' in ln)
+                self.assertRegex(row, r'\b[0-9a-f]{7}\b')
+                file_row = next(ln for ln in cap.splitlines()
+                                if 'alpha.txt' in ln and '[M]' in ln)
+                self.assertNotIn('|', file_row)
+                cap = t.wait_for('1 file changed', timeout=5.0)
+                self.assertIn('Author: Test', cap)
+                t.send('q')
+
     def test_piped_porcelain_status_rows(self):
         with tempfile.TemporaryDirectory() as repo, \
                 tempfile.TemporaryDirectory() as elsewhere:

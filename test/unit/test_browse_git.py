@@ -3978,6 +3978,9 @@ Date:   Wed Jun 10 09:00:00 2026 +0000
     first subject
 """
 
+# ``git show``: the decorated newest commit of ``_LOG_TEXT`` + its patch.
+_SHOW_TEXT = _LOG_TEXT.split('\ncommit ')[0] + '\n' + _DIFF_TEXT
+
 # Human ``git status`` covering every section + verb the parser maps.
 _HUMAN_STATUS_TEXT = """\
 On branch main
@@ -4080,6 +4083,19 @@ class TestSniffStdinKind(unittest.TestCase):
             self.r._sniff_stdin_kind(_colored(_LOG_TEXT, ('commit ',))),
             'log')
 
+    def test_git_show_single_commit_with_patch_is_diff(self):
+        self.assertEqual(self.r._sniff_stdin_kind(_SHOW_TEXT), 'diff')
+        self.assertEqual(
+            self.r._sniff_stdin_kind(
+                _colored(_SHOW_TEXT, ('commit ', 'diff --git'))), 'diff')
+
+    def test_multi_commit_patch_stays_log(self):
+        self.assertEqual(self.r._sniff_stdin_kind(_LOG_TEXT + _DIFF_TEXT), 'log')
+
+    def test_single_commit_without_patch_stays_log(self):
+        self.assertEqual(
+            self.r._sniff_stdin_kind(_LOG_TEXT.split('\ncommit ')[0]), 'log')
+
     def test_unrecognized_inputs_are_none(self):
         for text in ('hello world\n',           # prose
                      'abc1234 subject\n',       # git log --oneline
@@ -4088,6 +4104,34 @@ class TestSniffStdinKind(unittest.TestCase):
                      '## main...origin/main\n', # status -sb branch line
                      '', '   \n\n'):            # empty / whitespace-only
             self.assertIsNone(self.r._sniff_stdin_kind(text), repr(text))
+
+
+class TestSplitCommitHeader(unittest.TestCase):
+    """``_split_commit_header`` peels a ``git show`` header off a diff."""
+
+    @classmethod
+    def setUpClass(cls):
+        cls.r = _load_recipe()
+
+    def test_show_splits_header_and_diff(self):
+        header, diff = self.r._split_commit_header(_SHOW_TEXT)
+        self.assertEqual(header + diff, _SHOW_TEXT)
+        self.assertEqual(diff, _DIFF_TEXT)
+        self.assertTrue(header.startswith('commit deadbeef'))
+        self.assertIn('    second subject line', header)
+
+    def test_colored_show_splits_the_same(self):
+        colored = _colored(_SHOW_TEXT, ('commit ', 'diff --git'))
+        header, diff = self.r._split_commit_header(colored)
+        self.assertEqual(header, _colored(_SHOW_TEXT.split('diff --git')[0],
+                                          ('commit ',)))
+        self.assertTrue(diff.startswith('\x1b[1mdiff --git a/keep.txt'))
+
+    def test_plain_diff_has_no_header(self):
+        self.assertEqual(self.r._split_commit_header(_DIFF_TEXT),
+                         (None, _DIFF_TEXT))
+        frag = '--- a/x.txt\n+++ b/x.txt\n@@ -1 +1 @@\n-o\n+n\n'
+        self.assertEqual(self.r._split_commit_header(frag), (None, frag))
 
 
 class TestParseStdinDiff(unittest.TestCase):
@@ -4709,6 +4753,55 @@ class TestStdinTreeAndPreviews(unittest.TestCase):
         self.assertEqual(self.r.get_preview(items[0].id), blocks[0])
         self.assertIn('+brand new', self.r.get_preview(items[1].id))
 
+    def _ingest(self, text):
+        saved = self.r.sys.stdin
+        try:
+            self.r.sys.stdin = io.StringIO(text)
+            self.r._ingest_stdin()
+        finally:
+            self.r.sys.stdin = saved
+
+    def test_git_show_umbrella_is_a_commit_row_over_sfile_leaves(self):
+        self._ingest(_SHOW_TEXT)
+        self.assertEqual(self.r._STDIN_KIND, 'diff')
+        root = self.r.get_children(None)
+        self.assertEqual([it.id for it in root], [('sdiff',)])
+        row = root[0]
+        self.assertTrue(row.has_children)
+        self.assertEqual(row.title, 'second subject line')
+        self.assertEqual(row.col_sha, 'deadbee')
+        self.assertEqual(row.col_author, 'Alice Dev')
+        self.assertEqual(row.col_date, 'Thu Jun 11 10:00:00 2026 +0000')
+        self.assertEqual(row.chips, [
+            ('HEAD', 'green'), ('main', 'cyan'), ('v1.0', 'yellow')])
+        # The header is not a file row.
+        self.assertEqual(
+            [it.id for it in self.r.get_children(('sdiff',))],
+            [('sfile', 0, 'keep.txt'), ('sfile', 1, 'brand.txt'),
+             ('sfile', 2, 'gone.txt'), ('sfile', 3, 'new.txt')])
+
+    def test_git_show_umbrella_preview_is_header_then_stat(self):
+        self._ingest(_SHOW_TEXT)
+        header = _SHOW_TEXT.split('diff --git')[0]
+        self.assertEqual(self.r.get_preview(('sdiff',)),
+                         header.rstrip('\n') + '\n\n'
+                         + self.r._stdin_diff_stat(80))
+
+    def test_git_show_with_stat_previews_only_gits_stat(self):
+        stat = '---\n keep.txt | 2 +-\n 1 file changed, 1 insertion(+)\n\n'
+        head = _SHOW_TEXT.split('diff --git')[0]
+        self._ingest(head + stat + _DIFF_TEXT)
+        self.assertEqual(self.r.get_preview(('sdiff',)),
+                         (head + stat).rstrip('\n'))
+
+    def test_plain_diff_umbrella_unchanged(self):
+        self._ingest(_DIFF_TEXT)
+        self.assertIsNone(self.r._STDIN_COMMIT)
+        root = self.r.get_children(None)
+        self.assertIsNone(getattr(root[0], 'col_sha', None))
+        self.assertEqual(self.r.get_preview(('sdiff',)),
+                         self.r._stdin_diff_stat(80))
+
     def test_log_rows_carry_columns_chips_and_block_previews(self):
         rows, blocks = self.r._parse_stdin_log(_LOG_TEXT)
         self.r._STDIN_KIND = 'log'
@@ -4859,6 +4952,17 @@ class TestStdinRealGitOutputs(unittest.TestCase):
         self.assertIn('diff --git a/delta.txt b/delta.txt', blocks[0])
         rows, _blocks = self.r._parse_stdin_log(self.git('log', '--decorate'))
         self.assertIn('HEAD', rows[0][4])
+
+    def test_real_git_show(self):
+        for args in (['show'], ['show', '--decorate'], ['log', '-1', '-p']):
+            text = self.git(*args)
+            self.assertEqual(self.r._sniff_stdin_kind(text), 'diff', args)
+            header, diff = self.r._split_commit_header(text)
+            row = self.r._log_block_row(header)
+            self.assertEqual(row[3], 'second commit adds delta', args)
+            self.assertEqual(row[1], 'T', args)
+            rows, _blocks = self.r._parse_stdin_diff(diff)
+            self.assertEqual(rows, [('A', 'delta.txt')], args)
 
     def test_real_porcelain_line_and_z_forms_agree(self):
         line_text = self.git('status', '--porcelain')

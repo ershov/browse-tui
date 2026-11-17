@@ -30,8 +30,13 @@ non-blank line —
   diff      a ``diff --git`` header or ``--- a/`` hunk → an auto-expanded
             ``diff: N files +X -Y`` umbrella (a synthesised ``--stat``
             table as its preview) over one row per file block, each
-            block (delta-rendered) as that row's preview
-  log       ``commit <sha>`` blocks (--stat / -p included) → one commit
+            block (delta-rendered) as that row's preview. ``git show``
+            output (ONE ``commit <sha>`` block carrying a patch) is a
+            diff too: its commit header turns the umbrella into a commit
+            row (sha / author / date / chips + subject) whose preview is
+            the header followed by the stat table
+  log       ``commit <sha>`` blocks (--stat / -p included; a single
+            patch-carrying block is ``git show`` → diff above) → one commit
             row per block (sha / author / date columns + decoration
             chips), the whole block as the preview
   status    porcelain ``XY path`` lines (the ``-z`` form too) or the
@@ -89,7 +94,8 @@ access — never a hex-vs-word heuristic or substring scan:
                              open subtrees sharing a sha don't collide)
   ('launch', anchor, *spec)  a [md ↗] launcher row -> opens a .md in browse-md
   ('filler', ns, n)          an inert tree-mode connector row (meta; no children)
-  ('sdiff',)                 the piped-diff --stat umbrella -> its sfile rows
+  ('sdiff',)                 the piped-diff --stat umbrella (a commit row for
+                             piped ``git show``) -> its sfile rows
   ('sfile', i, path)         a file block of a piped diff (leaf; stdin mode)
   ('slog', i)                a commit block of a piped log (leaf; stdin mode)
   ('status_clean',)          the "working tree clean" sentinel (no children)
@@ -147,7 +153,7 @@ log's ``--branches``) — equivalent to ``browse-git $(git branch
 
 Usage:
   browse-git [<dir>] [-n NUMBER] [--commits|--status|--reflog|--branches|--stash] [--no-tree] [--all] [<revs>…] [-- <paths>…]
-  git diff | browse-git -      (also git log / log -p / status output)
+  git diff | browse-git -      (also git show / log / log -p / status output)
 """
 
 import os
@@ -274,6 +280,7 @@ _DISPLAY_MODE = 3
 _STDIN_KIND = None   # None | 'diff' | 'log' | 'status'
 _STDIN_ROWS = []     # per-row parsed spec (kind-specific tuples, see parsers)
 _STDIN_BLOCKS = []   # per-row verbatim slice of the slurped text (previews)
+_STDIN_COMMIT = None # piped ``git show``: (log row spec, header text) | None
 
 
 # ---- argv helper ---------------------------------------------------------
@@ -1130,13 +1137,18 @@ _COMMIT_LINE_RE = re.compile(r'commit ([0-9a-f]{7,40})\b(?: \((.*)\))?')
 # A ``diff --git a/… b/…`` per-file header (block splitter for diff input).
 _DIFF_HEADER_RE = re.compile(r'diff --git ')
 
+# git's ``--stat`` summary footer line (`` N file(s) changed, …``).
+_GIT_STAT_FOOTER_RE = re.compile(r'^ \d+ files? changed', re.MULTILINE)
+
 
 def _sniff_stdin_kind(text):
     """Classify slurped stdin by its first non-blank line.
 
     Returns 'diff' (a ``diff --git`` header or a bare ``--- a/`` hunk
-    fragment), 'log' (a ``commit <sha>`` block), 'porcelain' (a status
-    ``XY path`` line — the NUL ``-z`` form matches too, its first "line"
+    fragment, or ``git show`` output — exactly one ``commit <sha>`` block
+    that carries a ``diff --git`` patch), 'log' (``commit <sha>`` blocks),
+    'porcelain' (a status ``XY path`` line — the NUL ``-z`` form matches
+    too, its first "line"
     being the whole record stream), 'human' (``git status`` prose
     starting ``On branch`` / ``HEAD detached``), or ``None`` when the
     first non-blank line is none of those (including empty input). The
@@ -1150,13 +1162,37 @@ def _sniff_stdin_kind(text):
         if plain.startswith('diff --git ') or plain.startswith('--- a/'):
             return 'diff'
         if _COMMIT_LINE_RE.match(plain):
-            return 'log'
+            return 'diff' if _is_git_show(text) else 'log'
         if plain.startswith('On branch ') or plain.startswith('HEAD detached'):
             return 'human'
         if _PORCELAIN_LINE_RE.match(plain):
             return 'porcelain'
         return None
     return None
+
+
+def _is_git_show(text):
+    """True for a single ``commit <sha>`` block carrying a ``diff --git`` patch."""
+    lines = _SGR_RE.sub('', text).splitlines()
+    return (sum(1 for l in lines if _COMMIT_LINE_RE.match(l)) == 1
+            and any(_DIFF_HEADER_RE.match(l) for l in lines))
+
+
+def _split_commit_header(text):
+    """Split a leading ``commit <sha>`` header off diff text.
+
+    Returns ``(header, diff_text)``: ``header`` is everything before the
+    first ``diff --git`` line when the first non-blank line is a commit
+    line (``git show``), else ``None`` with ``text`` unchanged.
+    """
+    lines = text.splitlines(keepends=True)
+    plain = [_SGR_RE.sub('', l) for l in lines]
+    first = next((p for p in plain if p.strip()), '')
+    if not _COMMIT_LINE_RE.match(first):
+        return None, text
+    i = next((i for i, p in enumerate(plain) if _DIFF_HEADER_RE.match(p)),
+             len(lines))
+    return ''.join(lines[:i]), ''.join(lines[i:])
 
 
 def _split_blocks(text, header_re):
@@ -1509,7 +1545,7 @@ def _ingest_stdin():
     Empty or unrecognized input is fatal: a clean message on stderr +
     exit 2, before any UI exists.
     """
-    global _STDIN_KIND, _STDIN_ROWS, _STDIN_BLOCKS
+    global _STDIN_KIND, _STDIN_ROWS, _STDIN_BLOCKS, _STDIN_COMMIT
     text = sys.stdin.read()
     kind = _sniff_stdin_kind(text)
     if kind is None:
@@ -1519,6 +1555,9 @@ def _ingest_stdin():
         sys.stderr.write(f'browse-git: {reason}\n')
         sys.exit(2)
     if kind == 'diff':
+        header, text = _split_commit_header(text)
+        if header is not None:
+            _STDIN_COMMIT = (_log_block_row(header), header)
         _STDIN_ROWS, _STDIN_BLOCKS = _parse_stdin_diff(text)
     elif kind == 'log':
         _STDIN_ROWS, _STDIN_BLOCKS = _parse_stdin_log(text)
@@ -1549,7 +1588,19 @@ def _stdin_diff_root():
     (``default_row_content`` → ``_normalize_content`` keeps the segment's
     SGR, ``_write_segments`` truncates it ANSI-aware and adds a trailing
     reset). The codes are zero-width, so list-row width math is unchanged.
+
+    Piped ``git show`` (``_STDIN_COMMIT`` set) renders the same umbrella
+    as a commit row instead — the ``_stdin_log_root`` columns + chips with
+    the subject as its title.
     """
+    if _STDIN_COMMIT is not None:
+        (sha, author, date, subject, deco), _header = _STDIN_COMMIT
+        item = Item(id=('sdiff',), title=subject, has_children=True)
+        item.col_sha = sha[:7]
+        item.col_author = author
+        item.col_date = date
+        item.chips = _parse_decorations(deco, remotes=set())
+        return [item]
     added = removed = 0
     for i in range(len(_STDIN_ROWS)):
         a, r, _bin = _diff_block_counts(_STDIN_BLOCKS[i])
@@ -2615,8 +2666,16 @@ def get_preview(item_id):
         # The piped-diff umbrella — a synthesised stat table (per-file
         # colored +N -M) over all files, fit to the current preview width
         # for long-path elision (re-rendered on a width change via
-        # ``_on_resize``). id = ('sdiff',).
-        return _stdin_diff_stat((_browser.preview_width if _browser else 0) or 80)
+        # ``_on_resize``). A piped ``git show`` prefixes its commit header,
+        # which replaces the table when it already holds git's own --stat.
+        # id = ('sdiff',).
+        stat = _stdin_diff_stat((_browser.preview_width if _browser else 0) or 80)
+        if _STDIN_COMMIT is not None:
+            header = _STDIN_COMMIT[1].rstrip('\n')
+            if _GIT_STAT_FOOTER_RE.search(_SGR_RE.sub('', header)):
+                return header
+            return header + '\n\n' + stat
+        return stat
     if kind == 'sfile':
         # A per-file block of a piped diff — the same delta pipeline as a
         # repo diff, fed from the slurped text. id = ('sfile', i, path).
