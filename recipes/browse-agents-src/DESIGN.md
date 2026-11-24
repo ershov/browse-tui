@@ -2,8 +2,10 @@
 
 Parts-built transcript browsers for Claude Code, Codex CLI and OpenCode.
 Source lives here; `build-agents.sh` generates one single-file recipe per
-agent into `recipes/`. The frozen `recipes/browse-claude` is the ancestor
-and stays untouched.
+agent into `recipes/`. `recipes/browse-claude` is the ancestor;
+for some time it is kept and supported in parallel with
+`browse-agents-claude` (user-visible features such as cost reporting are
+ported to it), until `browse-agents-claude` replaces it.
 
 ## Goals and non-goals
 
@@ -621,7 +623,7 @@ mode: the changed record rows). A stop event ends the thread before
   `recipes/browse-agents-<agent>` with `importlib` and a stubbed `browse_tui`,
   exactly as `test/unit/test_browse_claude_render.py` does. The stub trap in
   `TESTING.md` applies: `discover` loads `test_browse_agents_*` before
-  `test_browse_claude_*`, so the new stubs must expose every name the frozen
+  `test_browse_claude_*`, so the new stubs must expose every name
   `browse-claude` imports too.
 * UI suites `test/ui/test_recipe_browse_agents_<agent>.py` run
   `./browse-tui --run-py recipes/browse-agents-<agent>` under tmux against a

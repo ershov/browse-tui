@@ -26,7 +26,7 @@ def _stub_browse_tui():
     ...
 ```
 
-Because the stub is process-wide, **whichever recipe test module loads first wins**, and its stub is reused by every recipe test loaded afterward in the same process. The `test_browse_agents_*` suites install a **full** stub (every name the generated recipes and the frozen `browse-claude` import) and do not return early, so they are safe in any position; the trap is between the older suites.
+Because the stub is process-wide, **whichever recipe test module loads first wins**, and its stub is reused by every recipe test loaded afterward in the same process. The `test_browse_agents_*` suites install a **full** stub (every name the generated recipes and `browse-claude` import) and do not return early, so they are safe in any position; the trap is between the older suites.
 
 ### Symptom
 

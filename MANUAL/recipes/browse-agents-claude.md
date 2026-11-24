@@ -6,7 +6,7 @@ Claude Code project / session / message browser.
 `~/.claude/projects/<encoded-path>/<session>.jsonl` files, with per-message
 JSON pretty-print preview.
 
-**Parts build.** Unlike the frozen `recipes/browse-claude` it forked from,
+**Parts build.** Unlike `recipes/browse-claude` it forked from,
 this recipe is a generated file: `./build-agents.sh` concatenates the
 numbered parts in `recipes/browse-agents-src/common/` (view code shared by
 every agent flavour) and `recipes/browse-agents-src/claude/` (Claude Code

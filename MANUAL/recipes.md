@@ -15,7 +15,7 @@ family is generated from the parts in `recipes/browse-agents-src/` by
 | [`browse-agents-claude`](recipes/browse-agents-claude.md) | Claude Code transcripts — projects → sessions → turns, subagents and cross-links, a `1`-`7` detail filter and a live tail; the parts-built successor of `browse-claude`. |
 | [`browse-agents-codex`](recipes/browse-agents-codex.md) | Codex CLI rollouts — projects (by cwd) → threads → turns, commands and patches, spawned subthreads from `state_5.sqlite`. |
 | [`browse-agents-opencode`](recipes/browse-agents-opencode.md) | OpenCode sessions read from its SQLite store — projects → sessions → turns with tool calls, child sessions and a 1 s poll tail. |
-| [`browse-claude`](recipes/browse-claude.md) | Claude Code history — projects → sessions → messages, with per-message JSON preview and a `1`-`6` detail filter (summary / voice / edits / tools / detailed / all); the frozen predecessor of `browse-agents-claude`. |
+| [`browse-claude`](recipes/browse-claude.md) | Claude Code history — projects → sessions → messages, with per-message JSON preview and a `1`-`6` detail filter (summary / voice / edits / tools / detailed / all); the predecessor of `browse-agents-claude`. |
 | [`browse-md`](recipes/browse-md.md) | Markdown files as a navigable heading tree, previewed through md2ansi; `FILE.md#section` deep-links. |
 | [`browse-fs`](recipes/browse-fs.md) | Filesystem browser — metadata columns, sort & detail modes, a live mtime watcher, and edit / open / delete actions. |
 | [`browse-plan`](recipes/browse-plan.md) | A project ticket tree over the `plan` CLI — status / edit / create / move flows. |

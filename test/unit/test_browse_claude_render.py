@@ -356,6 +356,17 @@ class TestRenderers(unittest.TestCase):
         self.assertIn('usage:', lines[-1])
         self.assertIn('input: 5', lines[-1])
 
+    def test_chrome_usage_thinking_tokens(self):
+        obj = {'type': 'assistant', 'message': {'usage': {
+            'input_tokens': 5, 'output_tokens': 40,
+            'output_tokens_details': {'thinking_tokens': 1218}}}}
+        import re as _re
+        plain = _re.sub(r'\x1b\[[0-9;]*m', '', self.r._fmt_chrome(obj))
+        self.assertIn('output: 40   cache read: 0   cache new: 0   think: 1,218', plain)
+        obj['message']['usage'].pop('output_tokens_details')
+        plain = _re.sub(r'\x1b\[[0-9;]*m', '', self.r._fmt_chrome(obj))
+        self.assertNotIn('think', plain)
+
     def test_chrome_no_usage_no_rows_returns_empty(self):
         # No chrome-relevant fields and no usage → empty chrome (no
         # bare rule emitted).
@@ -6103,6 +6114,221 @@ class TestScopeCard(unittest.TestCase):
             self.assertIn('s-uuid', out)
         finally:
             os.unlink(path)
+
+
+class TestCostUsage(unittest.TestCase):
+    """Scope-card cost / tokens rows and the composed usage line."""
+
+    @classmethod
+    def setUpClass(cls):
+        cls.r = _load_recipe()
+
+    def setUp(self):
+        self._saved_level = self.r._DETAIL_LEVEL
+        self.r._TREE_CACHE.clear()
+
+    def tearDown(self):
+        self.r._DETAIL_LEVEL = self._saved_level
+        self.r._TREE_CACHE.clear()
+
+    def _write(self, records):
+        import json as _json
+        import tempfile
+        f = tempfile.NamedTemporaryFile('w', suffix='.jsonl', delete=False)
+        for r in records:
+            f.write(_json.dumps(r) + '\n')
+        f.close()
+        self.addCleanup(os.unlink, f.name)
+        return f.name
+
+    @staticmethod
+    def _prompt(text='go'):
+        return {'type': 'user', 'uuid': 'u' + text,
+                'message': {'role': 'user', 'content': text}}
+
+    @staticmethod
+    def _cost_state(models=None):
+        models = models or {'m1': {'inputTokens': 10, 'outputTokens': 5,
+                                   'costUSD': 1.5}}
+        return {'type': 'cost-state', 'totalCostUSD': 1.5, 'modelUsage': models}
+
+    def _card(self, records):
+        import re
+        path = self._write(records)
+        card = self.r._fmt_scope_card(path, self.r._scan_tree(path))
+        return re.sub(r'\x1b\[[0-9;]*m', '', card)
+
+    def test_session_row_tag_cost(self):
+        import json as _json
+        import tempfile
+
+        def tag(records):
+            f = tempfile.NamedTemporaryFile('w', suffix='.jsonl', delete=False,
+                                            prefix='abcd1234-')
+            self.addCleanup(os.unlink, f.name)
+            for r in records:
+                f.write(_json.dumps(r, separators=(',', ':')) + '\n')
+            f.close()
+            return self.r._session_item(f.name).tag
+
+        cs = self._cost_state()
+        self.assertIn(' msg · $1.50 · ', tag([self._prompt(), cs]))
+        later = dict(cs, totalCostUSD=2.25)
+        out = tag([self._prompt(), cs, self._prompt('b'), later])
+        self.assertIn('$2.25', out)
+        self.assertNotIn('$1.50', out)
+        self.assertNotIn('$', tag([self._prompt()]))
+        self.assertNotIn('$', tag([self._prompt(), dict(cs, totalCostUSD='x')]))
+
+    def test_td_captures_last_cost_state(self):
+        first = self._cost_state()
+        second = dict(self._cost_state(), totalCostUSD=2.0)
+        path = self._write([self._prompt(), first, self._prompt('b'), second])
+        td = self.r._scan_tree(path)
+        self.assertEqual(td.session_cost['totalCostUSD'], 2.0)
+        self.assertEqual(td.session_cost_line, 3)
+
+    @staticmethod
+    def _turn_duration(uuid='td1'):
+        return {'type': 'system', 'subtype': 'turn_duration', 'uuid': uuid,
+                'durationMs': 1000, 'messageCount': 2}
+
+    @staticmethod
+    def _assistant(uuid='a1', msg_id='m1'):
+        return {'type': 'assistant', 'uuid': uuid, 'message': {
+            'role': 'assistant', 'id': msg_id, 'stop_reason': 'end_turn',
+            'content': [{'type': 'text', 'text': 'done'}],
+            'usage': {'input_tokens': 3, 'output_tokens': 4}}}
+
+    def test_end_turn_session_cost_footer(self):
+        import re
+
+        def footer(td, i):
+            return re.sub(r'\x1b\[[0-9;]*m', '',
+                          self.r._fmt_chrome(td.records[i]))
+
+        td = self.r._scan_tree(self._write(
+            [self._prompt(), self._assistant(), self._turn_duration(),
+             self._cost_state()]))
+        out = footer(td, 1)
+        self.assertRegex(out, r'session cost\s*: \$1\.50')
+        self.assertLess(out.index('session cost'), out.index('usage'))
+        self.assertNotIn('$', self.r._summarise_message(td.records[2]))
+        path = self._write(
+            [self._prompt(), self._assistant(), self._cost_state()])
+        prompt = next(i for i in self.r._list_tree_roots(path)
+                      if i.id[0] == 'prompt')
+        self.assertNotIn('$', prompt.tag)
+
+        later = dict(self._cost_state(), totalCostUSD=2.25)
+        td = self.r._scan_tree(self._write(
+            [self._prompt('a'), self._assistant(), self._cost_state(),
+             self._prompt('b'), self._assistant('a2', 'm2'), later]))
+        self.assertRegex(footer(td, 1), r'session cost\s*: \$1\.50')
+        self.assertRegex(footer(td, 4), r'session cost\s*: \$2\.25')
+
+    def test_card_cost_and_tokens(self):
+        out = self._card([self._prompt(), self._cost_state()])
+        self.assertRegex(out, r'cost\s*: \$1\.50\n')
+        self.assertRegex(out, r'tokens\s*: in 10 · out 5\n')
+
+    def test_card_per_model_breakdown(self):
+        out = self._card([self._prompt(), self._cost_state({
+            'a': {'inputTokens': 10, 'outputTokens': 5, 'costUSD': 1.0},
+            'b': {'inputTokens': 20, 'cacheReadInputTokens': 2000,
+                  'thinkingTokens': 7, 'costUSD': 0.5}})])
+        self.assertIn('$1.50  (a $1.00 · b $0.5000)', out)
+        self.assertRegex(out, r'tokens\s*: in 30 · out 5 · cache r 2\.0K · think 7\n')
+
+    def test_card_stale_note_after_resume(self):
+        out = self._card([self._prompt(), self._cost_state(), self._prompt('b'),
+                          {'type': 'ai-title', 'aiTitle': 't'}])
+        self.assertIn('$1.50  as of exit', out)
+        self.assertIn('+1 records after', out)
+
+    def test_card_no_stale_note_after_metadata_only(self):
+        out = self._card([self._prompt(), self._cost_state(),
+                          {'type': 'ai-title', 'aiTitle': 't'}])
+        self.assertNotIn('as of exit', out)
+
+    def test_card_no_cost_row_without_cost_state(self):
+        out = self._card([self._prompt()])
+        self.assertNotRegex(out, r'(?m)^\s*cost\s*:')
+
+    def test_card_subagent_has_no_cost_row(self):
+        import json as _json
+        import tempfile
+        with tempfile.TemporaryDirectory() as tmp:
+            sub_dir = os.path.join(tmp, 'parent', 'subagents')
+            os.makedirs(sub_dir)
+            path = os.path.join(sub_dir, 'agent-A1.jsonl')
+            with open(path, 'w') as f:
+                f.write(_json.dumps(self._prompt()) + '\n')
+            with open(os.path.join(sub_dir, 'agent-A1.meta.json'), 'w') as f:
+                f.write(_json.dumps({'agentType': 'Explore'}))
+            card = self.r._fmt_scope_card(path, self.r._scan_tree(path))
+            self.assertNotRegex(card, r'(?m)^\s*cost\s*:')
+
+    @staticmethod
+    def _block(uuid, mid, out, text, extra=None):
+        usage = {'input_tokens': 1, 'output_tokens': out}
+        usage.update(extra or {})
+        return {'type': 'assistant', 'uuid': uuid, 'message': {
+            'id': mid, 'role': 'assistant', 'usage': usage,
+            'content': [{'type': 'text', 'text': text}]}}
+
+    def _cascade(self, path, n, level=5):
+        import re
+        self.r._DETAIL_LEVEL = level
+        return re.sub(r'\x1b\[[0-9;]*m', '', self.r._render_record_with_rule(path, n))
+
+    def test_cascade_usage_once_per_message(self):
+        path = self._write([self._block('a1', 'mA', 5, 'one'),
+                            self._block('a2', 'mA', 368, 'two'),
+                            self._block('b1', 'mB', 7, 'three')])
+        self.assertNotIn('💰', self._cascade(path, 0))
+        self.assertIn('💰 in 1 · out 368', self._cascade(path, 1))
+        self.assertIn('💰 in 1 · out 7', self._cascade(path, 2))
+
+    def test_cascade_usage_last_line_with_interleaved_records(self):
+        path = self._write([self._block('a1', 'mA', 5, 'one'),
+                            self._prompt('x'), self._prompt('y'),
+                            self._block('a2', 'mA', 9, 'two'),
+                            self._block('a3', 'mA', 368, 'three',
+                                        {'cache_read_input_tokens': 3000})])
+        for n in (0, 3):
+            self.assertNotIn('💰', self._cascade(path, n))
+        self.assertIn('💰 in 1 · out 368 · cache r 3.0K', self._cascade(path, 4))
+
+    def test_cascade_usage_hidden_below_detail_5(self):
+        path = self._write([self._block('a1', 'mA', 5, 'one')])
+        self.assertNotIn('💰', self._cascade(path, 0, level=4))
+
+    def test_cascade_usage_under_fused_tool_umbrella(self):
+        import re
+        tool = {'type': 'assistant', 'uuid': 'a2', 'message': {
+            'id': 'mA', 'role': 'assistant',
+            'usage': {'input_tokens': 1, 'output_tokens': 42},
+            'content': [{'type': 'tool_use', 'id': 't1', 'name': 'Bash',
+                         'input': {'command': 'PROBE_CMD'}}]}}
+        result = {'type': 'user', 'uuid': 'u2', 'message': {'role': 'user', 'content': [
+            {'type': 'tool_result', 'tool_use_id': 't1', 'content': 'PROBE_OUT'}]}}
+        path = self._write([self._prompt(), self._block('a1', 'mA', 5, 'one'),
+                            tool, result, self._block('b1', 'mB', 7, 'done')])
+        saved = self.r._TREE_MODE
+        self.r._TREE_MODE = True
+        self.r._DETAIL_LEVEL = 5
+        try:
+            plain = lambda it: re.sub(r'\x1b\[[0-9;]*m', '', ''.join(it))
+            out = plain(self.r._preview_umbrella(('prompt', path, 0)))
+            self.assertIn('tool: Bash', out)
+            self.assertEqual(out.count('💰 in 1 · out 42'), 1)
+            self.assertLess(out.index('PROBE_OUT'), out.index('💰 in 1 · out 42'))
+            self.assertEqual(out.count('💰'), 2)
+            self.assertIn('💰 in 1 · out 42',
+                          plain(self.r._preview_umbrella(('tool', path, 2))))
+        finally:
+            self.r._TREE_MODE = saved
 
 
 class TestToolResultFallback(unittest.TestCase):
