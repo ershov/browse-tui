@@ -942,6 +942,29 @@ def store_session_item(session_key):
     return _session_item(session_key)
 
 
+_COST_STATE_PREFIX = b'{"type":"cost-state"'
+
+
+def _count_lines_and_cost(path):
+    """``(line count, totalCostUSD of the last cost-state line or None)``."""
+    count, last = 0, None
+    try:
+        with open(path, 'rb') as f:
+            for line in f:
+                count += 1
+                if line.startswith(_COST_STATE_PREFIX):
+                    last = line
+    except OSError:
+        return 0, None
+    cost = None
+    if last is not None:
+        try:
+            cost = json.loads(last).get('totalCostUSD')
+        except (ValueError, AttributeError):
+            pass
+    return count, cost
+
+
 def _session_item(full, st=None):
     """Build the rich session-row Item for the ``.jsonl`` at ``full``.
 
@@ -961,11 +984,7 @@ def _session_item(full, st=None):
     # Line count is a fast O(file-size) proxy for message count and
     # subsumes the "is this session non-empty?" check we need for
     # has_children. Cheaper than json-parsing every line just to count.
-    try:
-        with open(full, 'rb') as f:
-            count = sum(1 for _ in f)
-    except OSError:
-        count = 0
+    count, cost = _count_lines_and_cost(full)
     sid = os.path.basename(full)[:-len('.jsonl')]
     running_meta = _RUNNING_INDEX.get(sid)
     # Team workers never write a ``sessions/<pid>.json`` — their
@@ -979,6 +998,8 @@ def _session_item(full, st=None):
     tag = f'{count} msg'
     if n_subs:
         tag += f' · {n_subs} sub'
+    if _fmt_cost(cost):
+        tag += f' · {_fmt_cost(cost)}'
     tag += f' · {_human_time(st.st_mtime)}'
     if running_meta:
         tag = f'pid {running_meta["pid"]} · ' + tag
@@ -2761,6 +2782,45 @@ def _tur_diff(tur):
         return None
 
 
+_MODEL_USAGE_KEYS = (('inputTokens', 'input'), ('outputTokens', 'output'),
+                     ('cacheReadInputTokens', 'cache_read'),
+                     ('cacheCreationInputTokens', 'cache_write'),
+                     ('thinkingTokens', 'reasoning'))
+
+
+def _int_usage(src, keys):
+    """``{canonical: n}`` for the int values of ``src`` under ``keys``
+    (``(raw_key, canonical)`` pairs); non-ints are skipped."""
+    out = {}
+    if isinstance(src, dict):
+        for raw_key, name in keys:
+            v = src.get(raw_key)
+            if isinstance(v, int) and not isinstance(v, bool):
+                out[name] = v
+    return out
+
+
+def _cost_state_usage(raw):
+    """``meta['session_usage']`` for a ``cost-state`` record."""
+    total = {}
+    by_model = {}
+    model_usage = raw.get('modelUsage')
+    for model, u in (model_usage.items() if isinstance(model_usage, dict) else ()):
+        norm = _int_usage(u, _MODEL_USAGE_KEYS)
+        for k, v in norm.items():
+            total[k] = total.get(k, 0) + v
+        cost = u.get('costUSD') if isinstance(u, dict) else None
+        by_model[model] = {'cost': cost if _is_num(cost) else None, 'usage': norm}
+    cost = raw.get('totalCostUSD')
+    return {'cost': float(cost) if _is_num(cost) else None, 'usage': total,
+            'by_model': by_model, 'snapshot': True}
+
+
+_MESSAGE_USAGE_KEYS = (('input_tokens', 'input'), ('output_tokens', 'output'),
+                       ('cache_read_input_tokens', 'cache_read'),
+                       ('cache_creation_input_tokens', 'cache_write'))
+
+
 def _parse_record(raw, key=None):
     """Map one raw Claude record to a ``Record``."""
     label = _row_label(raw)
@@ -2831,6 +2891,14 @@ def _parse_record(raw, key=None):
         rec.end_turn = msg.get('stop_reason') == 'end_turn'
         if raw.get('attributionAgent'):
             rec.meta['agent'] = raw['attributionAgent']
+        raw_usage = msg.get('usage') if isinstance(msg.get('usage'), dict) else {}
+        usage = _int_usage(raw_usage, _MESSAGE_USAGE_KEYS)
+        usage.update(_int_usage(raw_usage.get('output_tokens_details'),
+                                (('thinking_tokens', 'reasoning'),)))
+        if usage:
+            rec.meta['usage'] = usage
+        if msg.get('id'):
+            rec.meta['msg_id'] = msg['id']
         rec.tools = [_tool_from_part(p) for p in parts
                      if p.get('type') == 'tool_use']
         spoken = _text_parts(content)
@@ -2892,6 +2960,8 @@ def _parse_record(raw, key=None):
         elif t == 'custom-title':
             rec.meta['title'] = raw.get('customTitle')
             rec.meta['title_by'] = 'user'
+        elif t == 'cost-state':
+            rec.meta['session_usage'] = _cost_state_usage(raw)
         return rec
 
     # Unrecognised: keep whatever text it carries.
@@ -8269,12 +8339,13 @@ def _ts_offset(root_ts, ts):
         return None
     return _fmt_elapsed((b - a).total_seconds())
 
-def _fmt_chrome(obj, turn_root_ts=None):
+def _fmt_chrome(obj, turn_root_ts=None, session_cost=''):
     """Common metadata footer appended to every per-message preview.
 
     ``turn_root_ts`` is the ISO timestamp of the message's umbrella user
     request (from ``_turn_root_ts``); when set, an ``offset`` row showing the
     elapsed time since that request is emitted right after ``timestamp``.
+    ``session_cost`` is an already formatted cost for a ``session cost`` row.
     """
     if not isinstance(obj, dict):
         return ''
@@ -8305,6 +8376,8 @@ def _fmt_chrome(obj, turn_root_ts=None):
     if obj.get('isMeta'):      flags.append('meta')
     if flags:
         rows.append(('flags', ', '.join(flags)))
+    if session_cost:
+        rows.append(('session cost', session_cost))
 
     msg = obj.get('message') if isinstance(obj.get('message'), dict) else {}
     usage = msg.get('usage') or {}
@@ -8319,12 +8392,17 @@ def _fmt_chrome(obj, turn_root_ts=None):
             f'{MUTE}{k.ljust(w)}:{RESET} {v}' for k, v in rows
         ))
     if usage:
-        usage_str = '   '.join([
+        usage_parts = [
             f'{MUTE}input:{RESET} {usage.get("input_tokens", 0):,}',
             f'{MUTE}output:{RESET} {usage.get("output_tokens", 0):,}',
             f'{MUTE}cache read:{RESET} {usage.get("cache_read_input_tokens", 0):,}',
             f'{MUTE}cache new:{RESET} {usage.get("cache_creation_input_tokens", 0):,}',
-        ])
+        ]
+        details = usage.get('output_tokens_details')
+        think = details.get('thinking_tokens') if isinstance(details, dict) else None
+        if isinstance(think, int) and not isinstance(think, bool):
+            usage_parts.append(f'{MUTE}think:{RESET} {think:,}')
+        usage_str = '   '.join(usage_parts)
         parts.append(f'{MUTE}{"usage".ljust(w)}:{RESET} {usage_str}')
     return '\n'.join(parts)
 
@@ -8352,7 +8430,8 @@ def extras_render(rec, bg='0'):
 
 def extras_chrome(rec, root):
     return _fmt_chrome(
-        rec.raw, root.raw.get('timestamp') if root is not None else None)
+        rec.raw, root.raw.get('timestamp') if root is not None else None,
+        session_cost=_fmt_cost(rec.meta.get('session_cost')))
 
 
 def _claude_umbrella(fmt):

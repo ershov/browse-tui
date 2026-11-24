@@ -1405,12 +1405,13 @@ def _ts_offset(root_ts, ts):
         return None
     return _fmt_elapsed((b - a).total_seconds())
 
-def _fmt_chrome(obj, turn_root_ts=None):
+def _fmt_chrome(obj, turn_root_ts=None, session_cost=''):
     """Common metadata footer appended to every per-message preview.
 
     ``turn_root_ts`` is the ISO timestamp of the message's umbrella user
     request (from ``_turn_root_ts``); when set, an ``offset`` row showing the
     elapsed time since that request is emitted right after ``timestamp``.
+    ``session_cost`` is an already formatted cost for a ``session cost`` row.
     """
     if not isinstance(obj, dict):
         return ''
@@ -1441,6 +1442,8 @@ def _fmt_chrome(obj, turn_root_ts=None):
     if obj.get('isMeta'):      flags.append('meta')
     if flags:
         rows.append(('flags', ', '.join(flags)))
+    if session_cost:
+        rows.append(('session cost', session_cost))
 
     msg = obj.get('message') if isinstance(obj.get('message'), dict) else {}
     usage = msg.get('usage') or {}
@@ -1455,12 +1458,17 @@ def _fmt_chrome(obj, turn_root_ts=None):
             f'{MUTE}{k.ljust(w)}:{RESET} {v}' for k, v in rows
         ))
     if usage:
-        usage_str = '   '.join([
+        usage_parts = [
             f'{MUTE}input:{RESET} {usage.get("input_tokens", 0):,}',
             f'{MUTE}output:{RESET} {usage.get("output_tokens", 0):,}',
             f'{MUTE}cache read:{RESET} {usage.get("cache_read_input_tokens", 0):,}',
             f'{MUTE}cache new:{RESET} {usage.get("cache_creation_input_tokens", 0):,}',
-        ])
+        ]
+        details = usage.get('output_tokens_details')
+        think = details.get('thinking_tokens') if isinstance(details, dict) else None
+        if isinstance(think, int) and not isinstance(think, bool):
+            usage_parts.append(f'{MUTE}think:{RESET} {think:,}')
+        usage_str = '   '.join(usage_parts)
         parts.append(f'{MUTE}{"usage".ljust(w)}:{RESET} {usage_str}')
     return '\n'.join(parts)
 
@@ -1488,7 +1496,8 @@ def extras_render(rec, bg='0'):
 
 def extras_chrome(rec, root):
     return _fmt_chrome(
-        rec.raw, root.raw.get('timestamp') if root is not None else None)
+        rec.raw, root.raw.get('timestamp') if root is not None else None,
+        session_cost=_fmt_cost(rec.meta.get('session_cost')))
 
 
 def _claude_umbrella(fmt):

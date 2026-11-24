@@ -375,6 +375,28 @@ chrome, snapshots and the selection events are `meta` rows.
   peer` user record → `'peer'` (`'idle'` for an idle-notification body).
 * Tail: file append through the common `040-tail-file` helper; byte offset
   per file, partial last line kept.
+* Cost and usage: nothing is inferred. A `cost-state` record (no `uuid` /
+  `timestamp`; Claude Code writes it when a session exits, a resumed
+  session appends a newer cumulative one; it covers the subagents too) →
+  `meta['session_usage']` `{cost: totalCostUSD, usage: token sums over
+  modelUsage, by_model, snapshot: True}` (`inputTokens` / `outputTokens` /
+  `cacheReadInputTokens` / `cacheCreationInputTokens` / `thinkingTokens` →
+  `input` / `output` / `cache_read` / `cache_write` / `reasoning`);
+  `hasUnknownModelCost` is ignored. An assistant record gets
+  `meta['usage']` from `message.usage` (plus
+  `output_tokens_details.thinking_tokens` → `reasoning`) and
+  `meta['msg_id']` from `message.id`; one line is written per content
+  block and all share the id, so the cascade shows the usage once, under
+  the last block. No per-message / per-turn dollar cost exists, so
+  `meta['cost']` is never set; the common fold puts the `cost-state`
+  total on the preceding `end_turn` record as `meta['session_cost']`
+  (see the fold notes), and `extras_chrome` shows it as a
+  `session cost` row. `extras_chrome` keeps its own raw `usage` row.
+  A session without a `cost-state` (and a subagent transcript) has no scope
+  card `cost` row.
+  The session row tag carries the last `cost-state`'s `totalCostUSD`
+  (`_count_lines_and_cost`, found during the row's line count; no extra
+  read).
 
 ### Codex CLI
 

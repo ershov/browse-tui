@@ -88,6 +88,22 @@ the same jump rows also lead the row's context menu (`\` / F1 /
 right-click). A target hidden by the active detail level lands on its
 nearest visible row instead. `Enter` on an unmarked row does nothing.
 
+**Cost and usage.** Only what Claude Code recorded is shown; nothing is
+computed from token counts. The session's scope card (the top row of an
+expanded session) has a `cost` row from the last `cost-state` record, which
+Claude Code writes when a session exits; it includes the subagents' spend.
+The session row tag shows the same figure (`$1.20`). The figure of a live or
+resumed session is the one from its last exit, so it can be underestimated.
+A session resumed after that shows the figure as `as of exit · +N records
+after`. A session that never exited, and a subagent, has no `cost` row. With
+two or more models the row adds a per-model breakdown, and a `tokens` row sums
+the token counts. Each assistant message shows its token `usage` in the record
+footer and, at detail 5 and above, as a one-line summary under the message in
+composed previews. Claude Code records no per-turn or per-message dollar cost.
+The session total written at an exit is also shown where it was recorded:
+the footer of the last `end_turn` assistant message before that exit has a
+`session cost` row above `usage`.
+
 Keys: `Enter` follow a `[↗]` cross-link, `1`-`7` set the detail level,
 `e` / `o` open in `$EDITOR`, `y` show id (debugging).
 

@@ -16,7 +16,9 @@ constants zeroed.
 
 import datetime
 import importlib.util
+import json as _json
 import os
+import re
 import sys
 import time
 import types
@@ -27,6 +29,10 @@ from pathlib import Path
 
 _REPO = Path(__file__).resolve().parents[2]
 _RECIPE = _REPO / 'recipes' / 'browse-agents-claude'
+
+
+def _strip_ansi(text):
+    return re.sub(r'\x1b\[[0-9;]*m', '', text)
 
 
 # ---- markdown id helpers (mirror the recipe's inline tuple construction) ----
@@ -379,6 +385,17 @@ class TestRenderers(unittest.TestCase):
         lines = sgr.sub('', chrome).split('\n')
         self.assertIn('usage:', lines[-1])
         self.assertIn('input: 5', lines[-1])
+
+    def test_chrome_usage_thinking_tokens(self):
+        obj = {'type': 'assistant', 'message': {'usage': {
+            'input_tokens': 5, 'output_tokens': 40,
+            'output_tokens_details': {'thinking_tokens': 1218}}}}
+        import re as _re
+        plain = _re.sub(r'\x1b\[[0-9;]*m', '', self.r._fmt_chrome(obj))
+        self.assertIn('output: 40   cache read: 0   cache new: 0   think: 1,218', plain)
+        obj['message']['usage'].pop('output_tokens_details')
+        plain = _re.sub(r'\x1b\[[0-9;]*m', '', self.r._fmt_chrome(obj))
+        self.assertNotIn('think', plain)
 
     def test_chrome_no_usage_no_rows_returns_empty(self):
         # No chrome-relevant fields and no usage → empty chrome (no
@@ -1878,6 +1895,38 @@ class TestTreeChildrenPreview(unittest.TestCase):
         finally:
             os.unlink(path)
 
+    def test_cascade_usage_under_fused_tool_umbrella(self):
+        def asst(uuid, mid, out, part):
+            return {'type': 'assistant', 'uuid': uuid, 'message': {
+                'id': mid, 'role': 'assistant', 'content': [part],
+                'usage': {'input_tokens': 1, 'output_tokens': out}}}
+        path = self._write_jsonl([
+            {'type': 'user', 'uuid': 'u1',
+             'message': {'role': 'user', 'content': 'go'}},
+            asst('a1', 'mA', 5, {'type': 'text', 'text': 'one'}),
+            asst('a2', 'mA', 42, {'type': 'tool_use', 'id': 't1', 'name': 'Bash',
+                                  'input': {'command': 'PROBE_CMD'}}),
+            {'type': 'user', 'uuid': 'u2',
+             'message': {'role': 'user', 'content': [
+                 {'type': 'tool_result', 'tool_use_id': 't1',
+                  'content': 'PROBE_OUT'}]}},
+            asst('b1', 'mB', 7, {'type': 'text', 'text': 'done'}),
+        ])
+        saved = self.r._TREE_MODE
+        try:
+            self.r._TREE_MODE = True
+            self.r._DETAIL_LEVEL = 5
+            out = _strip_ansi(''.join(self.r._preview_umbrella(('prompt', path, 0))))
+            self.assertIn('tool: Bash', out)
+            self.assertEqual(out.count('💰 in 1 · out 42'), 1)
+            self.assertLess(out.index('PROBE_OUT'), out.index('💰 in 1 · out 42'))
+            self.assertEqual(out.count('💰'), 2)
+            tool = _strip_ansi(''.join(self.r._preview_umbrella(('tool', path, 2))))
+            self.assertIn('💰 in 1 · out 42', tool)
+        finally:
+            self.r._TREE_MODE = saved
+            os.unlink(path)
+
     def test_tool_umbrella_preview_includes_assistant_and_result(self):
         # ``<tool>`` umbrella preview = concat of [assistant tool_use
         # leaf, tool_result leaf].
@@ -2639,6 +2688,173 @@ class TestMdPagerResolution(unittest.TestCase):
         finally:
             os.environ['PATH'] = saved_path
             restore()
+
+
+class TestUsageRender(unittest.TestCase):
+
+    @classmethod
+    def setUpClass(cls):
+        cls.r = _load_recipe()
+
+    def _write_jsonl(self, records):
+        import json as _json
+        import tempfile
+        f = tempfile.NamedTemporaryFile('w', suffix='.jsonl', delete=False,
+                                        prefix='abcd1234-')
+        for r in records:
+            f.write(_json.dumps(r) + '\n')
+        f.close()
+        return f.name
+
+    @staticmethod
+    def _prompt(text='go'):
+        return {'type': 'user', 'uuid': 'u' + text,
+                'message': {'role': 'user', 'content': text}}
+
+    @staticmethod
+    def _cost_state():
+        return {'type': 'cost-state', 'totalCostUSD': 1.5, 'modelUsage': {
+            'm1': {'inputTokens': 10, 'outputTokens': 5, 'costUSD': 1.5}}}
+
+    def _card(self, records):
+        path = self._write_jsonl(records)
+        try:
+            return _strip_ansi(self.r._fmt_scope_card(path, self.r._scan_tree(path)))
+        finally:
+            self.r._TREE_CACHE.pop(path, None)
+            os.unlink(path)
+
+    def test_session_row_tag_cost(self):
+        import tempfile
+
+        def tag(records):
+            f = tempfile.NamedTemporaryFile('w', suffix='.jsonl', delete=False,
+                                            prefix='abcd1234-')
+            self.addCleanup(os.unlink, f.name)
+            for r in records:
+                f.write(_json.dumps(r, separators=(',', ':')) + '\n')
+            f.close()
+            return self.r.store_session_item(f.name).tag
+
+        cs = self._cost_state()
+        self.assertIn(' msg · $1.50 · ', tag([self._prompt(), cs]))
+        later = dict(cs, totalCostUSD=2.25)
+        out = tag([self._prompt(), cs, self._prompt('b'), later])
+        self.assertIn('$2.25', out)
+        self.assertNotIn('$1.50', out)
+        self.assertNotIn('$', tag([self._prompt()]))
+        self.assertNotIn('$', tag([self._prompt(), dict(cs, totalCostUSD='x')]))
+
+    def test_end_turn_session_cost_footer(self):
+        assistant = {'type': 'assistant', 'uuid': 'a1', 'message': {
+            'role': 'assistant', 'id': 'm1', 'stop_reason': 'end_turn',
+            'content': [{'type': 'text', 'text': 'done'}],
+            'usage': {'input_tokens': 3, 'output_tokens': 4}}}
+        turn_duration = {'type': 'system', 'subtype': 'turn_duration',
+                         'uuid': 'td1', 'durationMs': 1000, 'messageCount': 2}
+        path = self._write_jsonl(
+            [self._prompt(), assistant, turn_duration, self._cost_state()])
+        try:
+            td = self.r._scan_tree(path)
+            out = _strip_ansi(self.r._record_chrome(td.records[1]))
+            self.assertRegex(out, r'session cost\s*: \$1\.50')
+            self.assertLess(out.index('session cost'), out.index('usage'))
+            self.assertNotIn('$', self.r._summarise_message(td.records[2]))
+            prompt = next(i for i in self.r._list_tree_roots(path)
+                          if i.id[0] == 'prompt')
+            self.assertNotIn('$', prompt.tag)
+        finally:
+            self.r._TREE_CACHE.pop(path, None)
+            os.unlink(path)
+
+    def test_scope_card_cost_state(self):
+        out = self._card([self._prompt(), self._cost_state()])
+        self.assertRegex(out, r'cost\s*: \$1\.50\n')
+        self.assertRegex(out, r'tokens\s*: in 10 · out 5\n')
+
+    def test_scope_card_stale_note_after_resume(self):
+        out = self._card([self._prompt(), self._cost_state(), self._prompt('more')])
+        self.assertIn('$1.50  as of exit', out)
+        self.assertIn('+1 records after', out)
+
+    def test_scope_card_no_cost_row_without_cost_state(self):
+        out = self._card([self._prompt()])
+        self.assertNotRegex(out, r'(?m)^\s*cost\s*:')
+
+    def test_subagent_card_has_no_cost_row(self):
+        import tempfile
+        tmp = tempfile.mkdtemp(prefix='sub-usage-')
+        try:
+            sub_dir = os.path.join(tmp, 'parent', 'subagents')
+            os.makedirs(sub_dir)
+            path = os.path.join(sub_dir, 'agent-A1.jsonl')
+            with open(path, 'w') as f:
+                f.write(_json.dumps(self._prompt()) + '\n')
+            with open(os.path.join(sub_dir, 'agent-A1.meta.json'), 'w') as f:
+                f.write(_json.dumps({'agentType': 'Explore'}))
+            out = _strip_ansi(self.r._fmt_scope_card(path, self.r._scan_tree(path)))
+            self.assertNotRegex(out, r'(?m)^\s*cost\s*:')
+        finally:
+            import shutil
+            self.r._TREE_CACHE.pop(path, None)
+            shutil.rmtree(tmp, ignore_errors=True)
+
+    def test_store_session_info_subagent_has_no_cost(self):
+        import tempfile
+        tmp = tempfile.mkdtemp(prefix='sub-info-')
+        try:
+            sub_dir = os.path.join(tmp, 'parent', 'subagents')
+            os.makedirs(sub_dir)
+            sub = os.path.join(sub_dir, 'agent-A1.jsonl')
+            top = os.path.join(tmp, 'parent.jsonl')
+            for p in (sub, top):
+                with open(p, 'w') as f:
+                    f.write(_json.dumps(self._prompt()) + '\n')
+            with open(os.path.join(sub_dir, 'agent-A1.meta.json'), 'w') as f:
+                f.write(_json.dumps({'agentType': 'Explore'}))
+            info = self.r.store_session_info(sub)
+            self.assertTrue(info['is_child'])
+            self.assertNotIn('cost', dict(info['meta']))
+            self.assertNotIn('cost', dict(self.r.store_session_info(top)['meta']))
+        finally:
+            import shutil
+            shutil.rmtree(tmp, ignore_errors=True)
+
+    def test_cascade_usage_once_per_message(self):
+        r = self.r
+
+        def block(uuid, mid, out, text):
+            return {'type': 'assistant', 'uuid': uuid, 'message': {
+                'id': mid, 'role': 'assistant',
+                'content': [{'type': 'text', 'text': text}],
+                'usage': {'input_tokens': 1, 'output_tokens': out}}}
+
+        def cascade(recs, n):
+            last = {rec.meta['msg_id']: k for k, rec in enumerate(recs)
+                    if rec.meta.get('msg_id') is not None}
+            saved = (r._record_at, r._scan_tree, r._owner_call, r._DETAIL_LEVEL)
+            r._record_at = lambda sess, k: recs[k]
+            r._scan_tree = lambda sess: types.SimpleNamespace(records=recs, msg_last_key=last)
+            r._owner_call = lambda sess, rec: None
+            r._DETAIL_LEVEL = 5
+            try:
+                return _strip_ansi(r._render_record_with_rule('s', n))
+            finally:
+                r._record_at, r._scan_tree, r._owner_call, r._DETAIL_LEVEL = saved
+
+        recs = _parse_all(r, [block('a1', 'mA', 5, 'one'), block('a2', 'mA', 368, 'two'),
+                              block('b1', 'mB', 7, 'three')])
+        self.assertNotIn('💰', cascade(recs, 0))
+        self.assertIn('💰 in 1 · out 368', cascade(recs, 1))
+        self.assertIn('💰 in 1 · out 7', cascade(recs, 2))
+
+        user = {'type': 'user', 'uuid': 'u1', 'message': {
+            'role': 'user', 'content': [{'type': 'text', 'text': 'hello'}]}}
+        recs = _parse_all(r, [block('a1', 'mA', 5, 'one'), user, user,
+                              block('a2', 'mA', 9, 'two'), block('a3', 'mA', 368, 'three')])
+        for n in (0, 3):
+            self.assertNotIn('💰', cascade(recs, n))
+        self.assertIn('💰 in 1 · out 368', cascade(recs, 4))
 
 
 class TestScanTree(unittest.TestCase):

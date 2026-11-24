@@ -512,6 +512,29 @@ def store_session_item(session_key):
     return _session_item(session_key)
 
 
+_COST_STATE_PREFIX = b'{"type":"cost-state"'
+
+
+def _count_lines_and_cost(path):
+    """``(line count, totalCostUSD of the last cost-state line or None)``."""
+    count, last = 0, None
+    try:
+        with open(path, 'rb') as f:
+            for line in f:
+                count += 1
+                if line.startswith(_COST_STATE_PREFIX):
+                    last = line
+    except OSError:
+        return 0, None
+    cost = None
+    if last is not None:
+        try:
+            cost = json.loads(last).get('totalCostUSD')
+        except (ValueError, AttributeError):
+            pass
+    return count, cost
+
+
 def _session_item(full, st=None):
     """Build the rich session-row Item for the ``.jsonl`` at ``full``.
 
@@ -531,11 +554,7 @@ def _session_item(full, st=None):
     # Line count is a fast O(file-size) proxy for message count and
     # subsumes the "is this session non-empty?" check we need for
     # has_children. Cheaper than json-parsing every line just to count.
-    try:
-        with open(full, 'rb') as f:
-            count = sum(1 for _ in f)
-    except OSError:
-        count = 0
+    count, cost = _count_lines_and_cost(full)
     sid = os.path.basename(full)[:-len('.jsonl')]
     running_meta = _RUNNING_INDEX.get(sid)
     # Team workers never write a ``sessions/<pid>.json`` — their
@@ -549,6 +568,8 @@ def _session_item(full, st=None):
     tag = f'{count} msg'
     if n_subs:
         tag += f' · {n_subs} sub'
+    if _fmt_cost(cost):
+        tag += f' · {_fmt_cost(cost)}'
     tag += f' · {_human_time(st.st_mtime)}'
     if running_meta:
         tag = f'pid {running_meta["pid"]} · ' + tag

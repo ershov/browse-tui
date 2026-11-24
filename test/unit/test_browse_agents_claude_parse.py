@@ -297,5 +297,80 @@ class TestParseRecord(unittest.TestCase):
         self.assertEqual(self.r._record_min_level(edit), 3)
 
 
+class TestUsageParse(unittest.TestCase):
+
+    @classmethod
+    def setUpClass(cls):
+        cls.r = _load_recipe()
+
+    def parse(self, raw):
+        return self.r._parse_record(raw, 0)
+
+    def _cost_state(self, models, **extra):
+        return {'type': 'cost-state', 'sessionId': 's', 'modelUsage': models, **extra}
+
+    def test_cost_state_single_model(self):
+        rec = self.parse(self._cost_state({'m1': {
+            'inputTokens': 264, 'outputTokens': 20640, 'thinkingTokens': 3753,
+            'cacheReadInputTokens': 6511220, 'cacheCreationInputTokens': 631654,
+            'webSearchRequests': 0, 'costUSD': 15.25}},
+            totalCostUSD=15.295525, hasUnknownModelCost=True))
+        self.assertEqual(rec.kind, 'meta')
+        su = rec.meta['session_usage']
+        full = {'input': 264, 'output': 20640, 'reasoning': 3753,
+                'cache_read': 6511220, 'cache_write': 631654}
+        self.assertEqual(su, {'cost': 15.295525, 'usage': full, 'snapshot': True,
+                              'by_model': {'m1': {'cost': 15.25, 'usage': full}}})
+        self.assertEqual(self.r._summarise_message(rec), '💰 $15.30 · 0+/0−')
+
+    def test_cost_state_two_models_sum(self):
+        rec = self.parse(self._cost_state({
+            'a': {'inputTokens': 10, 'outputTokens': 5, 'costUSD': 1.0},
+            'b': {'inputTokens': 3, 'cacheReadInputTokens': 7, 'costUSD': 0.5}},
+            totalCostUSD=1.5))
+        su = rec.meta['session_usage']
+        self.assertEqual(su['usage'], {'input': 13, 'output': 5, 'cache_read': 7})
+        self.assertEqual(su['by_model']['a']['usage'], {'input': 10, 'output': 5})
+        self.assertEqual(su['by_model']['b']['cost'], 0.5)
+
+    def test_cost_state_skips_bad_values_and_missing_cost(self):
+        rec = self.parse(self._cost_state({
+            'a': {'inputTokens': '9', 'outputTokens': None, 'thinkingTokens': True,
+                  'cacheReadInputTokens': 4}}))
+        su = rec.meta['session_usage']
+        self.assertIsNone(su['cost'])
+        self.assertEqual(su['usage'], {'cache_read': 4})
+        self.assertIsNone(su['by_model']['a']['cost'])
+        for bad in ('1.5', True, None):
+            su = self.parse(self._cost_state({'a': {'costUSD': bad}})).meta['session_usage']
+            self.assertIsNone(su['by_model']['a']['cost'])
+        bare = self.parse({'type': 'cost-state'})
+        self.assertEqual(bare.meta['session_usage'],
+                         {'cost': None, 'usage': {}, 'by_model': {}, 'snapshot': True})
+
+    def test_assistant_usage_and_msg_id(self):
+        raw = _asst([{'type': 'text', 'text': 'hi'}])
+        raw['message']['id'] = 'msg_01'
+        raw['message']['usage'] = {
+            'input_tokens': 2, 'cache_creation_input_tokens': 41208,
+            'cache_read_input_tokens': 0, 'output_tokens': 312,
+            'output_tokens_details': {'thinking_tokens': 218},
+            'service_tier': 'standard'}
+        rec = self.parse(raw)
+        self.assertEqual(rec.meta['usage'], {
+            'input': 2, 'output': 312, 'cache_read': 0, 'cache_write': 41208,
+            'reasoning': 218})
+        self.assertEqual(rec.meta['msg_id'], 'msg_01')
+        self.assertNotIn('cost', rec.meta)
+
+    def test_assistant_without_usage(self):
+        rec = self.parse(_asst([{'type': 'text', 'text': 'hi'}]))
+        self.assertNotIn('usage', rec.meta)
+        self.assertNotIn('msg_id', rec.meta)
+        raw = _asst([{'type': 'text', 'text': 'hi'}])
+        raw['message']['usage'] = {'input_tokens': 'x', 'service_tier': 'standard'}
+        self.assertNotIn('usage', self.parse(raw).meta)
+
+
 if __name__ == '__main__':
     unittest.main()

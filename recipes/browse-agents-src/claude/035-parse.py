@@ -563,6 +563,45 @@ def _tur_diff(tur):
         return None
 
 
+_MODEL_USAGE_KEYS = (('inputTokens', 'input'), ('outputTokens', 'output'),
+                     ('cacheReadInputTokens', 'cache_read'),
+                     ('cacheCreationInputTokens', 'cache_write'),
+                     ('thinkingTokens', 'reasoning'))
+
+
+def _int_usage(src, keys):
+    """``{canonical: n}`` for the int values of ``src`` under ``keys``
+    (``(raw_key, canonical)`` pairs); non-ints are skipped."""
+    out = {}
+    if isinstance(src, dict):
+        for raw_key, name in keys:
+            v = src.get(raw_key)
+            if isinstance(v, int) and not isinstance(v, bool):
+                out[name] = v
+    return out
+
+
+def _cost_state_usage(raw):
+    """``meta['session_usage']`` for a ``cost-state`` record."""
+    total = {}
+    by_model = {}
+    model_usage = raw.get('modelUsage')
+    for model, u in (model_usage.items() if isinstance(model_usage, dict) else ()):
+        norm = _int_usage(u, _MODEL_USAGE_KEYS)
+        for k, v in norm.items():
+            total[k] = total.get(k, 0) + v
+        cost = u.get('costUSD') if isinstance(u, dict) else None
+        by_model[model] = {'cost': cost if _is_num(cost) else None, 'usage': norm}
+    cost = raw.get('totalCostUSD')
+    return {'cost': float(cost) if _is_num(cost) else None, 'usage': total,
+            'by_model': by_model, 'snapshot': True}
+
+
+_MESSAGE_USAGE_KEYS = (('input_tokens', 'input'), ('output_tokens', 'output'),
+                       ('cache_read_input_tokens', 'cache_read'),
+                       ('cache_creation_input_tokens', 'cache_write'))
+
+
 def _parse_record(raw, key=None):
     """Map one raw Claude record to a ``Record``."""
     label = _row_label(raw)
@@ -633,6 +672,14 @@ def _parse_record(raw, key=None):
         rec.end_turn = msg.get('stop_reason') == 'end_turn'
         if raw.get('attributionAgent'):
             rec.meta['agent'] = raw['attributionAgent']
+        raw_usage = msg.get('usage') if isinstance(msg.get('usage'), dict) else {}
+        usage = _int_usage(raw_usage, _MESSAGE_USAGE_KEYS)
+        usage.update(_int_usage(raw_usage.get('output_tokens_details'),
+                                (('thinking_tokens', 'reasoning'),)))
+        if usage:
+            rec.meta['usage'] = usage
+        if msg.get('id'):
+            rec.meta['msg_id'] = msg['id']
         rec.tools = [_tool_from_part(p) for p in parts
                      if p.get('type') == 'tool_use']
         spoken = _text_parts(content)
@@ -694,6 +741,8 @@ def _parse_record(raw, key=None):
         elif t == 'custom-title':
             rec.meta['title'] = raw.get('customTitle')
             rec.meta['title_by'] = 'user'
+        elif t == 'cost-state':
+            rec.meta['session_usage'] = _cost_state_usage(raw)
         return rec
 
     # Unrecognised: keep whatever text it carries.
