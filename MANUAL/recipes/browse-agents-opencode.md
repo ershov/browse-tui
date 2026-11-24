@@ -64,6 +64,15 @@ normalised to the shared names (`path` → `file_path`, `oldString` →
 `old_string`) so the common formatters render them; an `edit` result
 carries the patch from its metadata as the diff.
 
+**Cost and usage.** Only what OpenCode wrote is shown; nothing is computed
+from tokens. A session row (and a child row) tags the session's cost
+(`$0.0488`), and the session card shows `cost` and `tokens` from the store.
+Each assistant message's last row carries its cost and token usage in the
+footer (and, at detail 5 and above, in a `💰` line under it in a composed
+preview). A turn end row (`idle`) shows the sum of its messages' costs
+(` · $0.0300`; the footer marks it `sum of messages`). On 1.x stores the
+`step-finish` row carries its own cost and tokens.
+
 Keys: `Enter` follow a `[↗]` link to a child session, `1`-`7` set the
 detail level, `J` / `K` jump between voice rows, `t` toggle tree / flat,
 `e` / `E` open the preview / the JSON dump in `$EDITOR`, `y` show the row id.

@@ -285,7 +285,7 @@ class OpenCodeV2StoreTests(_Base):
         self.assertEqual([s.id for s in sessions], [('session', S1)])
         s = sessions[0]
         self.assertEqual(s.title, 'PROBE_TITLE_ONE fix the build')
-        self.assertTrue(s.tag.startswith('build · fireworks-ai/glm-latest · 5 msg · 1 sub · '), s.tag)
+        self.assertTrue(s.tag.startswith('build · fireworks-ai/glm-latest · 5 msg · 1 sub · $0.0123 · '), s.tag)
         self.assertTrue(s.boundary)
         self.assertEqual((s.kind, s.line_count, s.subagent_count), ('session', 5, 1))
         self.assertEqual(r.store_session_item(S2).title, 'PROBE_TITLE_B hello')
@@ -294,6 +294,49 @@ class OpenCodeV2StoreTests(_Base):
         self.assertFalse(r.store_session_exists('nope'))
         self.assertEqual(r._index()['gen'], 'v2')
 
+    def test_turn_end_sums_message_costs(self):
+        r = self.r
+        rows = [
+            ('msg_31', 'assistant', 2, {'time': {'created': T0 + 700}, 'cost': 0.01,
+                                        'content': [{'type': 'text', 'text': 'first'}]}),
+            ('msg_32', 'assistant', 3, {'time': {'created': T0 + 800}, 'cost': 0.02,
+                                        'content': [{'type': 'text', 'text': 'second'}]}),
+            ('msg_33', 'idle', 4, {'time': {'created': T0 + 900}, 'outcome': 'completed'}),
+        ]
+        for mid, typ, seq, data in rows:
+            self._write('INSERT INTO session_message VALUES (?,?,?,?,?,?,?)',
+                        (mid, S2, typ, seq, T0 + 700 + seq, T0 + 700 + seq, json.dumps(data)))
+        r.store_reset()
+        r._TREE_CACHE.clear()
+        td = r._scan_tree(S2)
+        end = next(rec for rec in td.records if rec.kind == 'turn_end')
+        self.assertAlmostEqual(end.meta['cost'], 0.03)
+        self.assertTrue(end.meta['cost_summed'])
+        self.assertTrue(r._summarise_message(end).endswith(' · $0.0300'))
+
+    def test_tail_turn_end_sums_cost_settled_in_same_poll(self):
+        r = self.r
+        td = r._scan_tree(S1)
+        self.assertEqual(len(td.records), 11)
+        grown = {mid: data for sid, mid, _t, _s, _c, _u, data in _v2_rows()
+                 if sid == S1}['msg_05']
+        grown['content'][0]['state'] = {
+            'status': 'completed', 'input': {'path': '/home/test/projA/b.py'},
+            'content': [{'type': 'text', 'text': 'PROBE_B_BODY'}], 'metadata': {}}
+        grown['cost'] = 0.5
+        self._write('UPDATE session_message SET data = ?, time_updated = ? WHERE id = ?',
+                    (json.dumps(grown), T0 + 25000, 'msg_05'))
+        self._write('INSERT INTO session_message VALUES (?,?,?,?,?,?,?)',
+                    ('msg_06', S1, 'idle', 5, T0 + 26000, T0 + 26000,
+                     json.dumps({'time': {'created': T0 + 26000}, 'outcome': 'completed'})))
+        records, _dirty = r._read_new_records(S1)
+        self.assertEqual([(k, rec.kind) for k, rec in records],
+                         [(11, 'turn_end'), (9, 'tool_call'), (10, 'tool_result')])
+        end = td.records[11]
+        self.assertAlmostEqual(end.meta['cost'], 0.5)
+        self.assertTrue(end.meta['cost_summed'])
+        self.assertTrue(r._summarise_message(end).endswith(' · $0.5000'))
+
     def test_children(self):
         r = self.r
         kids = r.store_child_sessions(S1)
@@ -301,10 +344,17 @@ class OpenCodeV2StoreTests(_Base):
         kid = kids[0]
         self.assertEqual(kid.title, 'PROBE_CHILD_TITLE run the suite')
         self.assertTrue(kid.tag.startswith('explore · 2 msg · '))
+        self.assertNotIn('$', kid.tag)
         self.assertEqual((kid.kind, kid.agent_id, kid.agent_type), ('subagent', S3, 'explore'))
         self.assertEqual(kid.row_bg, r._ROW_BG_SPAWN)
         r.store_mark_orphan(kid)
         self.assertIn('orphan', kid.tag)
+        self._write('UPDATE session_v2 SET cost = 0.5 WHERE id = ?', (S3,))
+        r.store_reset()
+        kid = r.store_child_sessions(S1)[0]
+        self.assertTrue(kid.tag.startswith('explore · 2 msg · $0.5000 · '), kid.tag)
+        r.store_mark_orphan(kid)
+        self.assertRegex(kid.tag, r'^explore · 2 msg · \$0\.5000 · orphan · ')
         self.assertEqual(r.store_child_session(S1, S3), S3)
         self.assertIsNone(r.store_child_session(S2, S3))
         self.assertEqual(r.store_parent_of_child(S3), (S1, S3))
@@ -346,7 +396,7 @@ class OpenCodeV2StoreTests(_Base):
         self.assertEqual(info['meta'], [
             ('session', S1), ('title', 'PROBE_TITLE_ONE fix the build'), ('directory', CWD_A),
             ('agent', 'build'), ('model', 'fireworks-ai/glm-latest'), ('version', '2.2.0'),
-            ('cost', '0.0123'), ('tokens', '150')])
+            ('cost', '$0.0123'), ('tokens', '150')])
         self.assertAlmostEqual(info['mtime'], (T0 + 21000) / 1000)
         child = r.store_session_info(S3)
         self.assertTrue(child['is_child'])
@@ -420,8 +470,9 @@ class OpenCodeV2StoreTests(_Base):
         self.assertEqual(roots, [('turn', 0), ('turn', 8)])
         self.assertEqual(sorted(td.tool_children), [2, 4, 9])
         self.assertEqual([rec.key for rec in td.tool_children[4]], [5])
-        self.assertEqual(td.records[6].meta, {'model': 'fireworks-ai/glm-latest', 'agent': 'build',
-                                              'tokens': 160, 'cost': '$0.0123'})
+        self.assertEqual(td.records[6].meta, {
+            'model': 'fireworks-ai/glm-latest', 'agent': 'build', 'cost': 0.0123,
+            'usage': {'input': 100, 'output': 50, 'reasoning': 10}})
         self.assertEqual(td.latest_voice_line, 8)
         have_delta = r.HAVE_DELTA
         r.HAVE_DELTA = False          # plain unified-diff colouring
@@ -457,8 +508,9 @@ class OpenCodeV1StoreTests(_Base):
         self.assertEqual(records[3][1].tool['input']['file_path'], '/home/test/projA/a.py')
         self.assertEqual(records[4][1].tool['output'], 'PROBE_FILE_BODY')
         self.assertTrue(records[5][1].end_turn)
-        self.assertEqual(records[6][1].meta, {'model': 'fireworks-ai/glm-latest', 'agent': 'build',
-                                              'tokens': 160, 'cost': '$0.0100'})
+        self.assertEqual(records[6][1].meta, {
+            'model': 'fireworks-ai/glm-latest', 'agent': 'build', 'cost': 0.01,
+            'usage': {'input': 100, 'output': 50, 'reasoning': 10, 'total': 160}})
         self.assertEqual(r.store_tail_poll(S1, state), ([], []))
         self._write('UPDATE part SET data = ?, time_updated = ? WHERE id = ?',
                     (json.dumps({'type': 'text', 'text': 'PROBE_ANSWER_ONE all green, really'}),

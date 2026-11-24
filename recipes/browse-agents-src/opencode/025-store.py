@@ -215,6 +215,8 @@ def _session_item(s):
     bits.append(f'{s.count} msg')
     if s.children:
         bits.append(f'{len(s.children)} sub')
+    if s.cost > 0:
+        bits.append(_fmt_cost(s.cost))
     bits.append(_human_time(s.updated))
     title = _trim(_oneline(_clean_title(s.title)), 80) or s.id
     item = Item(
@@ -245,13 +247,17 @@ def store_session_item(session_key):
     return _session_item(s) if s is not None else None
 
 
+def _cost_bit(s):
+    return f'{_fmt_cost(s.cost)} · ' if s.cost > 0 else ''
+
+
 def _child_item(parent_key, s):
     kind = s.agent or 'session'
     item = Item(
         id=('agent', parent_key, s.id),
         title=_link_marker(('agent', parent_key, s.id))
               + (_trim(_oneline(_clean_title(s.title)), 80) or s.id),
-        tag=f'{kind} · {s.count} msg · {_human_time(s.updated)}',
+        tag=f'{kind} · {s.count} msg · {_cost_bit(s)}{_human_time(s.updated)}',
         tag_style='magenta',
         has_children=s.count > 0,
         boundary=True,
@@ -259,6 +265,7 @@ def _child_item(parent_key, s):
     item.kind = 'subagent'
     item.agent_id = s.id
     item.agent_type = kind
+    item.cost_bit = _cost_bit(s)
     item.session_path = parent_key
     item.line_count = s.count
     item.mtime = s.updated
@@ -275,8 +282,8 @@ def store_child_sessions(session_key):
 
 
 def store_mark_orphan(item):
-    item.tag = (f'{item.agent_type} · {item.line_count} msg · orphan · '
-                f'{_human_time(item.mtime)}')
+    item.tag = (f'{item.agent_type} · {item.line_count} msg · {item.cost_bit}'
+                f'orphan · {_human_time(item.mtime)}')
 
 
 def store_child_session(session_key, child_key):
@@ -444,8 +451,8 @@ def store_session_info(session_key):
         for key in ('directory', 'agent', 'model', 'version'):
             if getattr(s, key):
                 meta.append((key, getattr(s, key)))
-        if s.cost:
-            meta.append(('cost', f'{s.cost:.4f}'))
+        if s.cost > 0:
+            meta.append(('cost', _fmt_cost(s.cost)))
         if s.tokens:
             meta.append(('tokens', f'{s.tokens:,}'))
     return {'path': _db_path(), 'label': session_key,

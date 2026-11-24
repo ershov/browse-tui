@@ -117,7 +117,8 @@ class OpenCodeParseTests(unittest.TestCase):
         self.assertEqual(self.level(first), 2)
         self.assertTrue(last.end_turn)
         self.assertEqual(self.level(last), 1)
-        self.assertEqual(last.meta, {'model': 'fw/glm', 'agent': 'build', 'tokens': 16, 'cost': '$0.2500'})
+        self.assertEqual(last.meta, {'model': 'fw/glm', 'agent': 'build', 'cost': 0.25,
+                                     'usage': {'input': 10, 'output': 5, 'reasoning': 1}})
         self.assertEqual(first.meta, {'model': 'fw/glm', 'agent': 'build'})
         self.assertEqual((call.tool['canon'], call.tool['name'], call.tool['call_id']),
                          ('bash', 'shell', 'call_1'))
@@ -254,9 +255,12 @@ class OpenCodeParseTests(unittest.TestCase):
         not_stop = r._expand('v1', _v1({'type': 'text', 'text': 'x'}, finish='tool-calls', last_text=True))[0]
         self.assertFalse(not_stop.end_turn)
         fin = r._expand('v1', _v1({'type': 'step-finish', 'reason': 'stop', 'cost': 0.5,
-                                   'tokens': {'total': 30, 'input': 20, 'output': 10}}))[0]
+                                   'tokens': {'total': 30, 'input': 20, 'output': 10,
+                                              'cache': {'read': 7, 'write': 0}}}))[0]
         self.assertEqual((fin.kind, fin.summary, self.level(fin)), ('turn_end', 'step finish · stop', 4))
-        self.assertEqual((fin.meta['tokens'], fin.meta['cost']), (30, '$0.5000'))
+        self.assertEqual(fin.meta['cost'], 0.5)
+        self.assertEqual(fin.meta['usage'], {'input': 20, 'output': 10, 'cache_read': 7, 'total': 30})
+        self.assertNotIn('tokens', fin.meta)
         retry = r._expand('v1', _v1({'type': 'retry', 'error': {'message': 'again'}}))[0]
         self.assertEqual((retry.kind, self.level(retry)), ('meta', 5))
         snap = r._expand('v1', _v1({'type': 'snapshot', 'snapshot': 'x'}))[0]

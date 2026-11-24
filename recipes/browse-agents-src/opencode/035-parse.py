@@ -134,14 +134,22 @@ def _assistant_meta(d, v1=False):
 
 
 def _stamp_usage(rec, d):
-    """Cost and token total on the message's last record."""
+    """Reported cost and token usage on the message's last record."""
+    cost = d.get('cost')
+    if _is_num(cost) and cost > 0:
+        rec.meta['cost'] = float(cost)
     tokens = d.get('tokens') if isinstance(d.get('tokens'), dict) else {}
-    total = tokens.get('total') or sum(
-        v for k, v in tokens.items() if k != 'cache' and isinstance(v, (int, float)))
-    if total:
-        rec.meta['tokens'] = int(total)
-    if d.get('cost'):
-        rec.meta['cost'] = f'${d["cost"]:.4f}'
+    cache = tokens.get('cache') if isinstance(tokens.get('cache'), dict) else {}
+    usage = {}
+    for key, v in (('input', tokens.get('input')), ('output', tokens.get('output')),
+                   ('reasoning', tokens.get('reasoning')),
+                   ('cache_read', cache.get('read')),
+                   ('cache_write', cache.get('write')),
+                   ('total', tokens.get('total'))):
+        if _is_num(v) and v > 0:
+            usage[key] = int(v)
+    if usage:
+        rec.meta['usage'] = usage
 
 
 def _text_record(kind, text, raw, ts, meta, tag):

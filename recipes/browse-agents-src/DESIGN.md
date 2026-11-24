@@ -327,9 +327,9 @@ the generic renderers carry every record; the only entry is
 status line (exit code, duration, cwd, `parsed_cmd` kinds) from the
 agent-private result keys `exit_code`, `duration`, `cwd`, `status`,
 `parsed_cmd`. Token counts and rate limits are row summaries of the
-`token_count` / `token_usage_record` meta records and the `tokens` chrome
-on `turn_end`. OpenCode has no extras: step cost and tokens are `meta`
-chrome, snapshots and the selection events are `meta` rows.
+`token_count` / `token_usage_record` meta records; their usage is `meta`
+chrome (see "Codex CLI" notes). OpenCode has no extras: message cost and usage
+are `meta` chrome, snapshots and the selection events are `meta` rows.
 
 ## What the common view expects from records
 
@@ -539,13 +539,20 @@ chrome, snapshots and the selection events are `meta` rows.
   `N matches`, `N files`, `N file(s): …` — else the output; edit results
   level 3), `assistant_text` per text element (the last text of a message
   with `finish == stop` is `end_turn`, level 1); `meta.model`
-  (`provider/id`) and `meta.agent` on every assistant record, `tokens` /
-  `cost` on the message's last record; an assistant message with no
-  content is a level-6 `meta` row, or a level-4 `system` row tagged
-  `error` when it carries `error`; idle → `turn_end` (level 4, `idle ·
-  <outcome>`); system / skill / shell → `system` (level 5), synthetic →
-  `system` + `is_meta`; compaction → `compaction`; the selection events →
-  `meta` level 5; other message types and content element types →
+  (`provider/id`) and `meta.agent` on every assistant record; `meta.cost`
+  (float USD, only when > 0) and `meta.usage` (`input`, `output`,
+  `reasoning`, `cache.read` → `cache_read`, `cache.write` → `cache_write`,
+  `total`; ints > 0 only) from `_stamp_usage` on the message's last record
+  (v1: the `step-finish`). The common fold sums the message costs of a turn
+  into its `idle` `turn_end` (`cost_summed`). The session's `session_v2.cost`
+  / `tokens_*` are the `cost` (`_fmt_cost`) and `tokens` rows of
+  `store_session_info` and a cost part of the session / child row tags
+  (before the age; kept in the orphan re-tag), shown only when > 0; an
+  assistant message with no content is a level-6 `meta` row, or a level-4
+  `system` row tagged `error` when it carries `error`; idle → `turn_end`
+  (level 4, `idle · <outcome>`); system / skill / shell → `system` (level 5),
+  synthetic → `system` + `is_meta`; compaction → `compaction`; the selection
+  events → `meta` level 5; other message types and content element types →
   `unknown`. Tool inputs are normalised for the generic one-liners and
   bodies (`path` / `filePath` → `file_path`, `oldString` / `newString` /
   `replaceAll` → the snake_case names, list `command` joined, `name` →
@@ -560,8 +567,8 @@ chrome, snapshots and the selection events are `meta` rows.
   `finish == stop`), reasoning → `thinking`, tool{tool, callID,
   state{status, input, output, metadata}} → `tool_call` + `tool_result`
   (`metadata.diff` as the diff when present), step-start → `turn_start`,
-  step-finish{reason, cost, tokens} → `turn_end` (level 4, cost / tokens
-  in `meta`), compaction → `compaction`, retry → `meta` level 5,
+  step-finish{reason, cost, tokens} → `turn_end` (level 4, `meta.cost` /
+  `meta.usage` as above), compaction → `compaction`, retry → `meta` level 5,
   snapshot / patch / file / agent / subtask → `meta` level 6, else
   `unknown`. An upgraded 2.x install has migrated v1 rows into v2 (kv key
   `migration.v1-v2`), so v1 is read only when `session_v2` is absent.
