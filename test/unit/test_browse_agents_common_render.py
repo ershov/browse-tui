@@ -195,9 +195,9 @@ class TestGenericRecordRendering(unittest.TestCase):
         with _NoExtras(self.r) as r:
             root = R('user_prompt', {}, 0, ts=1000.0)
             rec = R('assistant_text', {}, 1, id='r1', ts=1090.0,
-                    meta={'model': 'm1', 'tokens': 1234, 'duration_ms': 500})
+                    meta={'model': 'm1', 'usage': {'input': 1234}, 'duration_ms': 500})
             out = r._record_chrome(rec, root)
-            for needle in ('id', 'r1', 'offset', '+1m30s', 'm1', '1,234', '0.50s'):
+            for needle in ('id', 'r1', 'offset', '+1m30s', 'm1', '1.2K', '0.50s'):
                 self.assertIn(needle, out)
             self.assertEqual(r._record_chrome(R('meta', {}, 2)), '')
 
@@ -222,6 +222,316 @@ class TestGenericRecordRendering(unittest.TestCase):
         out = self.r._render_record(rec)
         self.assertIn('▶ user', out)
         self.assertIn('[plan]', out)
+
+
+class TestUsageFormatting(unittest.TestCase):
+
+    @classmethod
+    def setUpClass(cls):
+        cls.r = _load_recipe()
+
+    def test_fmt_cost(self):
+        f = self.r._fmt_cost
+        self.assertEqual(f(None), '')
+        self.assertEqual(f('$0.0488'), '')
+        self.assertEqual(f(True), '')
+        self.assertEqual(f(0), '$0.0000')
+        self.assertEqual(f(0.0488), '$0.0488')
+        self.assertEqual(f(15.2955), '$15.30')
+        self.assertEqual(f(1234.5), '$1,234.50')
+
+    def test_fmt_usage(self):
+        f = self.r._fmt_usage
+        self.assertEqual(f(None), '')
+        self.assertEqual(f({}), '')
+        self.assertEqual(
+            f({'cache_read': 6_500_000, 'output': 204, 'input': 34_200, 'cache_write': 0}),
+            'in 34.2K · out 204 · cache r 6.5M')
+        self.assertEqual(f({'reasoning': 5, 'total': 9, 'cache_write': 7}),
+                         'cache w 7 · think 5 · total 9')
+
+    def test_usage_brief(self):
+        b = self.r._usage_brief
+        self.assertEqual(b({'cost': 0.12, 'usage': {'total': 5}}), '$0.1200')
+        self.assertEqual(b({'usage': {'total': 52_000, 'input': 1}}), '52.0K tok')
+        self.assertEqual(b({'usage': {'input': 800, 'output': 200}}), '')
+        self.assertEqual(b({}), '')
+        self.assertEqual(b({'usage': {'cache_read': 9}}), '')
+
+
+class TestUsageRendering(unittest.TestCase):
+
+    @classmethod
+    def setUpClass(cls):
+        cls.r = _load_recipe()
+
+    def test_chrome_rows(self):
+        R = self.r.Record
+        with _NoExtras(self.r) as r:
+            rec = R('assistant_text', {}, 1, meta={
+                'model': 'm1', 'cost': 0.0488,
+                'usage': {'input': 1500, 'output': 20}, 'duration_ms': 500})
+            out = _plain(r._record_chrome(rec))
+            self.assertRegex(out, r'cost\s*: \$0\.0488\n')
+            self.assertRegex(out, r'usage\s*: in 1.5K · out 20')
+            self.assertLess(out.index('model'), out.index('cost'))
+            self.assertLess(out.index('usage'), out.index('duration'))
+            summed = R('turn_end', {}, 2, meta={'cost': 2.5, 'cost_summed': True})
+            self.assertIn('$2.50  (sum of messages)', _plain(r._record_chrome(summed)))
+
+    def test_chrome_session_cost_row(self):
+        R = self.r.Record
+        with _NoExtras(self.r) as r:
+            rec = R('assistant_text', {}, 1,
+                    meta={'session_cost': 8.9, 'usage': {'input': 5}})
+            out = _plain(r._record_chrome(rec))
+            self.assertRegex(out, r'session cost\s*: \$8\.90')
+            self.assertLess(out.index('session cost'), out.index('usage'))
+
+    def test_turn_end_title_suffix(self):
+        R = self.r.Record
+        plain = R('turn_end', {}, 0, tag='turn', summary='done')
+        self.assertEqual(self.r._summarise_message(plain), 'done')
+        with_cost = R('turn_end', {}, 1, tag='turn', summary='done', meta={'cost': 0.12})
+        self.assertEqual(self.r._summarise_message(with_cost), 'done · $0.1200')
+        with_tok = R('turn_end', {}, 2, tag='turn', meta={'usage': {'total': 52_000}})
+        self.assertTrue(self.r._summarise_message(with_tok).endswith(' · 52.0K tok'))
+        other = R('assistant_text', {}, 3, tag='assistant', text='hi', meta={'cost': 1.0})
+        self.assertEqual(self.r._summarise_message(other), 'assistant: hi')
+
+    def _cascade(self, recs, n, level):
+        r = self.r
+        saved = (r._record_at, r._scan_tree, r._owner_call, r._DETAIL_LEVEL)
+        r._record_at = lambda sess, k: recs[k]
+        last = {}
+        for k, rec in enumerate(recs):
+            if rec is not None and rec.meta.get('msg_id') is not None:
+                last[rec.meta['msg_id']] = k
+        r._scan_tree = lambda sess: types.SimpleNamespace(records=recs, msg_last_key=last)
+        r._owner_call = lambda sess, rec: None
+        r._DETAIL_LEVEL = level
+        try:
+            return _plain(r._render_record_with_rule('s', n))
+        finally:
+            r._record_at, r._scan_tree, r._owner_call, r._DETAIL_LEVEL = saved
+
+    def test_cascade_usage_line(self):
+        R = self.r.Record
+        with _NoExtras(self.r):
+            rec = R('assistant_text', {}, 0, text='hi', meta={
+                'cost': 0.5, 'usage': {'input': 10, 'output': 2}})
+            self.assertIn('💰 $0.5000 · in 10 · out 2', self._cascade([rec], 0, 5))
+            self.assertNotIn('💰', self._cascade([rec], 0, 4))
+            end = R('turn_end', {}, 0, meta={'cost': 0.5})
+            self.assertIn('💰 $0.5000', self._cascade([end], 0, 5))
+            meta = R('meta', {}, 0, text='token_usage', meta={'usage': {'input': 10}})
+            self.assertNotIn('💰', self._cascade([meta], 0, 5))
+            bare = R('assistant_text', {}, 0, text='hi')
+            self.assertNotIn('💰', self._cascade([bare], 0, 5))
+
+    def test_cascade_usage_line_once_per_msg_id(self):
+        R = self.r.Record
+        meta = {'msg_id': 'm1', 'usage': {'input': 10}}
+        a = R('thinking', {}, 0, text='t', meta=dict(meta))
+        b = R('assistant_text', {}, 1, text='x', meta=dict(meta))
+        c = R('assistant_text', {}, 2, text='y', meta={'msg_id': 'm2', 'usage': {'input': 3}})
+        recs = [a, b, c]
+        with _NoExtras(self.r):
+            self.assertNotIn('💰', self._cascade(recs, 0, 5))
+            self.assertIn('💰 in 10', self._cascade(recs, 1, 5))
+            self.assertIn('💰 in 3', self._cascade(recs, 2, 5))
+
+    def test_cascade_usage_line_interleaved_blocks(self):
+        R = self.r.Record
+        meta = {'msg_id': 'mA', 'usage': {'input': 10}}
+        recs = [R('assistant_text', {}, 0, text='a0', meta=dict(meta)),
+                R('tool_result', {}, 1, text='res'),
+                R('user_text', {}, 2, text='u'),
+                R('assistant_text', {}, 3, text='a3', meta=dict(meta)),
+                R('assistant_text', {}, 4, text='a4', meta=dict(meta))]
+        with _NoExtras(self.r):
+            for n in (0, 3):
+                self.assertNotIn('💰', self._cascade(recs, n, 5))
+            self.assertIn('💰 in 10', self._cascade(recs, 4, 5))
+
+    def test_msg_last_key_fold_and_replace(self):
+        r = self.r
+        R = r.Record
+        td, cur = r._TreeData(), r._ScanCursor()
+        recs = [R('assistant_text', {}, 0, text='a', meta={'msg_id': 'mA'}),
+                R('assistant_text', {}, 1, text='b', meta={'msg_id': 'mB'}),
+                R('assistant_text', {}, 2, text='c', meta={'msg_id': 'mA'})]
+        for n, rec in enumerate(recs):
+            rec.key = n
+        r._fold_records(td, cur, list(enumerate(recs)), 's')
+        self.assertEqual(td.msg_last_key, {'mA': 2, 'mB': 1})
+        changed = R('assistant_text', {}, 0, text='a2', meta={'msg_id': 'mA'})
+        changed.key = 0
+        r._replace_record(td, changed, 0, 's')
+        self.assertEqual(td.msg_last_key, {'mA': 2, 'mB': 1})
+        self.assertIs(td.records[0], changed)
+
+
+class TestSessionUsageFold(unittest.TestCase):
+
+    @classmethod
+    def setUpClass(cls):
+        cls.r = _load_recipe()
+
+    def _fold(self, recs, sess='s'):
+        r = self.r
+        td, cur = r._TreeData(), r._ScanCursor()
+        for n, rec in enumerate(recs):
+            rec.key = n
+        r._fold_records(td, cur, list(enumerate(recs)), sess)
+        return td, cur
+
+    def _prompt(self, **kw):
+        return self.r.Record('user_prompt', {}, text='go', is_voice=True, **kw)
+
+    def _rec(self, kind='assistant_text', **meta):
+        return self.r.Record(kind, {}, text='x', meta=meta)
+
+    def _su(self, cost=None, usage=None, by_model=None, snapshot=False):
+        return {'cost': cost, 'usage': usage, 'by_model': by_model or {}, 'snapshot': snapshot}
+
+    def _card(self, td, meta=(), is_child=False):
+        r = self.r
+        saved = r.store_session_info
+        r.store_session_info = lambda sess: {
+            'path': '/p', 'label': 's', 'is_child': is_child,
+            'meta': list(meta), 'mtime': None}
+        try:
+            return _plain(r._fmt_scope_card('s', td))
+        finally:
+            r.store_session_info = saved
+
+    def test_last_session_usage_wins(self):
+        first, last = self._su(cost=1.0), self._su(cost=2.0)
+        td, _ = self._fold([self._prompt(), self._rec('meta', session_usage=first),
+                            self._rec(), self._rec('meta', session_usage=last)])
+        self.assertIs(td.session_usage, last)
+        self.assertEqual(td.session_usage_key, 3)
+
+    def test_scope_card_cost_with_and_without_models(self):
+        two = self._su(cost=1.5, by_model={'opus': {'cost': 1.0}, 'haiku': {'cost': 0.5}})
+        td, _ = self._fold([self._prompt(), self._rec('meta', session_usage=two)])
+        self.assertRegex(self._card(td), r'cost\s*: \$1\.50  \(opus \$1\.00 · haiku \$0\.5000\)\n')
+        one = self._su(cost=1.5, by_model={'opus': {'cost': 1.5}})
+        td, _ = self._fold([self._prompt(), self._rec('meta', session_usage=one)])
+        self.assertRegex(self._card(td), r'cost\s*: \$1\.50\n')
+
+    def test_scope_card_tokens_row(self):
+        su = self._su(usage={'input': 1500, 'output': 20})
+        td, _ = self._fold([self._prompt(), self._rec('meta', session_usage=su)])
+        out = self._card(td)
+        self.assertRegex(out, r'tokens\s*: in 1.5K · out 20\n')
+        self.assertNotRegex(out, r'\bcost\s*:')
+
+    def test_stale_note(self):
+        snap = self._su(cost=1.0, snapshot=True)
+        ts = self.r.datetime.datetime.now().timestamp() - 120
+        recs = [self._prompt(ts=ts), self._rec('meta', session_usage=snap), self._prompt(), self._rec()]
+        td, _ = self._fold(recs)
+        self.assertIn('$1.00  as of exit 2m ago · +2 records after', self._card(td))
+        td, _ = self._fold([self._prompt(), self._rec('meta', session_usage=snap), self._prompt()])
+        self.assertIn('as of exit · +1 records after', self._card(td))
+        td, _ = self._fold([self._prompt(), self._rec('meta', session_usage=snap), self._rec('meta')])
+        self.assertNotIn('as of exit', self._card(td))
+        fresh = self._su(cost=1.0)
+        td, _ = self._fold([self._prompt(), self._rec('meta', session_usage=fresh), self._rec()])
+        self.assertNotIn('as of exit', self._card(td))
+        tok = self._su(usage={'input': 5}, snapshot=True)
+        td, _ = self._fold([self._prompt(), self._rec('meta', session_usage=tok), self._rec()])
+        self.assertRegex(self._card(td), r'tokens\s*: in 5  as of exit · \+1 records after')
+
+    def test_fold_rows_replace_store_rows(self):
+        su = self._su(cost=2.0, usage={'input': 10})
+        td, _ = self._fold([self._prompt(), self._rec('meta', session_usage=su)])
+        out = self._card(td, meta=[('model', 'm'), ('cost', '9.9999'), ('tokens', '7')])
+        self.assertEqual(out.count('cost'), 1)
+        self.assertEqual(out.count('tokens'), 1)
+        self.assertIn('$2.00', out)
+        self.assertNotIn('9.9999', out)
+        self.assertRegex(out, r'model\s*: m')
+        td, _ = self._fold([self._prompt()])
+        self.assertIn('9.9999', self._card(td, meta=[('cost', '9.9999')]))
+
+    def test_no_cost_row_without_usage(self):
+        td, _ = self._fold([self._prompt()])
+        self.assertNotRegex(self._card(td), r'(?m)^\s*cost\s*:')
+        self.assertNotRegex(self._card(td, is_child=True), r'(?m)^\s*cost\s*:')
+
+    def test_turn_cost_sum(self):
+        end = self._rec('turn_end')
+        self._fold([self._prompt(), self._rec(cost=0.01), self._rec('tool_result', cost=0.02), end])
+        self.assertAlmostEqual(end.meta['cost'], 0.03)
+        self.assertTrue(end.meta['cost_summed'])
+        own = self._rec('turn_end', cost=0.5)
+        self._fold([self._prompt(), self._rec(cost=0.01), own])
+        self.assertEqual(own.meta, {'cost': 0.5})
+        bare = self._rec('turn_end')
+        self._fold([self._prompt(), self._rec(), bare])
+        self.assertNotIn('cost', bare.meta)
+        self.assertNotIn('cost_summed', bare.meta)
+
+    def test_session_cost_stamp(self):
+        def snap(cost):
+            return self._rec('meta', session_usage=self._su(cost=cost, snapshot=True))
+
+        def end():
+            return self.r.Record('assistant_text', {}, text='x', end_turn=True)
+
+        a = end()
+        self._fold([self._prompt(), a, snap(1.5)])
+        self.assertEqual(a.meta['session_cost'], 1.5)
+
+        a1, a2 = end(), end()
+        self._fold([self._prompt(), a1, self._prompt(), a2, snap(8.9)])
+        self.assertNotIn('session_cost', a1.meta)
+        self.assertEqual(a2.meta['session_cost'], 8.9)
+
+        a1, a2 = end(), end()
+        self._fold([self._prompt(), a1, snap(1.0), self._prompt(), a2, snap(1.75)])
+        self.assertEqual(a1.meta['session_cost'], 1.0)
+        self.assertEqual(a2.meta['session_cost'], 1.75)
+
+        a1 = end()
+        self._fold([self._prompt(), a1, snap(1.0), snap(2.0)])
+        self.assertEqual(a1.meta['session_cost'], 1.0)
+
+        a1, plain = end(), self._rec()
+        self._fold([self._prompt(), a1, snap(1.0), self._prompt(), plain, snap(2.0)])
+        self.assertEqual(a1.meta['session_cost'], 1.0)
+        self.assertNotIn('session_cost', plain.meta)
+
+        a = end()
+        self._fold([self._prompt(), a, self._rec('meta', session_usage=self._su(cost=1.0))])
+        self.assertNotIn('session_cost', a.meta)
+
+        self._fold([self._prompt(), self._rec(), snap(1.0)])
+
+    def test_tail_changed_cost_before_new_turn_end(self):
+        r = self.r
+        sess = 'tail-sess'
+        streaming = self._rec(cost=0.01)
+        td, cur = self._fold([self._prompt(), streaming], sess)
+        final = self._rec(cost=0.04)
+        final.key = 1
+        end = self._rec('turn_end')
+        end.key = 2
+        saved = r.store_tail_poll
+        r.store_tail_poll = lambda s, state: ([(2, end)], [(1, final)])
+        r._TREE_CACHE[sess] = td
+        r._TAIL_STATE[sess] = types.SimpleNamespace(cursor=cur)
+        try:
+            r._read_new_records(sess)
+        finally:
+            r.store_tail_poll = saved
+            r._TREE_CACHE.pop(sess, None)
+            r._TAIL_STATE.pop(sess, None)
+        self.assertIs(td.records[1], final)
+        self.assertAlmostEqual(end.meta['cost'], 0.04)
 
 
 class TestGenericPathSmoke(unittest.TestCase):

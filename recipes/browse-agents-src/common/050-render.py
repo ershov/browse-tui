@@ -428,7 +428,8 @@ def _render_tool_umbrella(item_id):
     the registered umbrella formatter for each. Returns the joined blocks
     ONLY when every call has a formatter and every formatter returns a
     string; any gap (unregistered tool, declining formatter, failure)
-    returns ``None`` so the caller falls back to the leaf cascade.
+    returns ``None`` so the caller falls back to the leaf cascade. The
+    call's and results' ``_cascade_usage_line`` follow the blocks.
     """
     try:
         _tag, sess, key = item_id
@@ -455,7 +456,9 @@ def _render_tool_umbrella(item_id):
         if block is None:
             return None
         blocks.append(block)
-    return '\n\n'.join(blocks)
+    usage = ''.join(_cascade_usage_line(sess, r.key, r)
+                    for r in [rec] + td.tool_children.get(key, []))
+    return '\n\n'.join(blocks) + usage
 
 
 # ---- message bodies ------------------------------------------------------
@@ -639,7 +642,8 @@ def _fmt_elapsed(secs):
 def _record_chrome(rec, root=None):
     """Metadata footer of a record preview: the agent's ``extras_chrome``
     when it answers, else the generic rows from ``id``, ``ts`` and ``meta``
-    (``model``, ``agent``, ``duration_ms``, ``tokens``, ``cost``).
+    (``model``, ``agent``, ``cost``, ``session_cost``, ``usage``,
+    ``duration_ms``).
 
     ``root`` is the turn-root record (``_turn_root_record``) whose ``ts``
     anchors the ``offset`` row; ``''`` when there is nothing to show.
@@ -661,11 +665,19 @@ def _record_chrome(rec, root=None):
         rows.append(('timestamp', shown))
         if root is not None and root.ts is not None:
             rows.append(('offset', _fmt_elapsed(rec.ts - root.ts)))
-    for key, label in (('model', 'model'), ('agent', 'agent'),
-                       ('tokens', 'tokens'), ('cost', 'cost')):
-        v = rec.meta.get(key)
-        if v not in (None, ''):
-            rows.append((label, f'{v:,}' if isinstance(v, int) else str(v)))
+    meta = rec.meta
+    for key in ('model', 'agent'):
+        if meta.get(key) not in (None, ''):
+            rows.append((key, str(meta[key])))
+    cost = _fmt_cost(meta.get('cost'))
+    if cost:
+        rows.append(('cost', cost + ('  (sum of messages)' if meta.get('cost_summed') else '')))
+    session_cost = _fmt_cost(meta.get('session_cost'))
+    if session_cost:
+        rows.append(('session cost', session_cost))
+    usage = _fmt_usage(meta.get('usage'))
+    if usage:
+        rows.append(('usage', usage))
     ms = rec.meta.get('duration_ms')
     if ms is not None:
         rows.append(('duration', f'{ms / 1000:.2f}s'))
@@ -726,6 +738,26 @@ def _preview_message(sess, n):
     return body + ('\n' + chrome if chrome else '')
 
 
+def _cascade_usage_line(sess, n, rec):
+    """One-line cost / usage under a cascaded record at detail >= 5, else ``''``.
+
+    Shown once per API message, on its last record in the session (blocks
+    of one message may interleave with other records). Skipped on ``meta``
+    records, whose summary already prints the same numbers.
+    """
+    if _DETAIL_LEVEL < 5 or rec.kind == 'meta':
+        return ''
+    meta = rec.meta
+    parts = [_fmt_cost(meta.get('cost')), _fmt_usage(meta.get('usage'))]
+    text = ' · '.join(p for p in parts if p)
+    if not text:
+        return ''
+    msg_id = meta.get('msg_id')
+    if msg_id is not None and _scan_tree(sess).msg_last_key.get(msg_id, n) != n:
+        return ''
+    return '\n' + MUTE + '💰 ' + text + RESET
+
+
 def _render_record_with_rule(sess, n):
     """Read one record, render its body, prefix with a section rule.
 
@@ -745,6 +777,6 @@ def _render_record_with_rule(sess, n):
         rule = _rule(rec.tag, BOLD + WHITE, width=width, bg=BLUE_BG)
         cs = BLUE_BG_PARAMS if BLUE_BG else '0'
         body = _band_block(_render_record(rec, bg=cs), BLUE_BG)
-        return rule + '\n' + body
+        return rule + '\n' + body + _cascade_usage_line(sess, n, rec)
     body = _render_record(rec, call=_owner_call(sess, rec))
-    return _rule(rec.tag, YELLOW) + '\n' + body
+    return _rule(rec.tag, YELLOW) + '\n' + body + _cascade_usage_line(sess, n, rec)

@@ -856,6 +856,36 @@ def _scope_card_session(item_id):
     return None
 
 
+def _session_usage_rows(td):
+    """``cost`` / ``tokens`` scope-card rows from ``td.session_usage``; a
+    ``snapshot`` followed by non-meta records gets a stale note."""
+    su = td.session_usage
+    if not su:
+        return []
+    rows = []
+    if su.get('cost') is not None:
+        text = _fmt_cost(su['cost'])
+        by_model = su.get('by_model') or {}
+        if len(by_model) >= 2:
+            parts = [f'{model} {_fmt_cost(m["cost"])}'
+                     for model, m in by_model.items() if m.get('cost') is not None]
+            if parts:
+                text += '  (' + ' · '.join(parts) + ')'
+        rows.append(('cost', text))
+    if su.get('usage'):
+        rows.append(('tokens', _fmt_usage(su['usage'])))
+    key = td.session_usage_key
+    if rows and su.get('snapshot') and key is not None:
+        after = sum(1 for r in td.records[key + 1:] if r is not None and r.kind != 'meta')
+        if after:
+            when = next((r.ts for r in reversed(td.records[:key + 1])
+                         if r is not None and r.ts is not None), None)
+            when = f' {_human_time(when)}' if when is not None else ''
+            label, text = rows[0]
+            rows[0] = (label, f'{text}  {MUTE}as of exit{when} · +{after} records after{RESET}')
+    return rows
+
+
 def _fmt_scope_card(sess, td):
     """One-block header identifying the session backing the synthetic top row.
 
@@ -870,7 +900,12 @@ def _fmt_scope_card(sess, td):
     name = _clean_title(td.custom_title or td.ai_title)
     if name:
         rows.append(('name', name))
-    rows.extend(info['meta'])
+    usage_rows = _session_usage_rows(td)
+    if usage_rows:
+        rows.extend(r for r in info['meta'] if r[0] not in ('cost', 'tokens'))
+        rows.extend(usage_rows)
+    else:
+        rows.extend(info['meta'])
     n_lines = sum(1 for r in td.records if r is not None)
     rows.append(('lines', str(n_lines)))
     if td.voice_count is None:

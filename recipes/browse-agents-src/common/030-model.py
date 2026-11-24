@@ -234,6 +234,15 @@ def _row_tag(rec):
 
 def _summarise_message(rec):
     """One-line row title (newlines kept; callers ``_oneline`` it)."""
+    title = _summarise_base(rec)
+    if rec.kind == 'turn_end':
+        brief = _usage_brief(rec.meta)
+        if brief:
+            return f'{title} · {brief}'
+    return title
+
+
+def _summarise_base(rec):
     if rec.summary is not None:
         return rec.summary
     kind = rec.kind

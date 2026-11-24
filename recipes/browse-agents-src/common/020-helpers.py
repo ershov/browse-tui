@@ -165,6 +165,43 @@ def _human_count(n):
     return str(n)
 
 
+def _is_num(v):
+    return isinstance(v, (int, float)) and not isinstance(v, bool)
+
+
+def _fmt_cost(v):
+    """Reported USD as ``$0.0488`` / ``$15.30``; ``''`` unless a number."""
+    if not _is_num(v):
+        return ''
+    return f'${v:,.2f}' if v >= 1 else f'${v:.4f}'
+
+
+_USAGE_PARTS = (('input', 'in'), ('output', 'out'), ('cache_read', 'cache r'),
+                ('cache_write', 'cache w'), ('reasoning', 'think'),
+                ('total', 'total'))
+
+
+def _fmt_usage(u):
+    """``in 34.2K · out 204 · cache r 6.5M`` from a usage dict; ``''`` when empty."""
+    if not u:
+        return ''
+    return ' · '.join(f'{label} {_human_count(u[key])}'
+                      for key, label in _USAGE_PARTS if u.get(key))
+
+
+def _usage_brief(meta):
+    """Short suffix for row titles: the cost, else reported total tokens, else ``''``."""
+    cost = _fmt_cost(meta.get('cost'))
+    if cost:
+        return cost
+    usage = meta.get('usage')
+    if usage:
+        total = usage.get('total')
+        if total:
+            return f'{_human_count(total)} tok'
+    return ''
+
+
 def _total_tokens_left(a):
     """Token count from a ``total_tokens_reminder`` attachment's text
     (``<total_tokens>N tokens left</total_tokens>``), or ``None``."""

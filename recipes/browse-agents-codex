@@ -259,6 +259,43 @@ def _human_count(n):
     return str(n)
 
 
+def _is_num(v):
+    return isinstance(v, (int, float)) and not isinstance(v, bool)
+
+
+def _fmt_cost(v):
+    """Reported USD as ``$0.0488`` / ``$15.30``; ``''`` unless a number."""
+    if not _is_num(v):
+        return ''
+    return f'${v:,.2f}' if v >= 1 else f'${v:.4f}'
+
+
+_USAGE_PARTS = (('input', 'in'), ('output', 'out'), ('cache_read', 'cache r'),
+                ('cache_write', 'cache w'), ('reasoning', 'think'),
+                ('total', 'total'))
+
+
+def _fmt_usage(u):
+    """``in 34.2K · out 204 · cache r 6.5M`` from a usage dict; ``''`` when empty."""
+    if not u:
+        return ''
+    return ' · '.join(f'{label} {_human_count(u[key])}'
+                      for key, label in _USAGE_PARTS if u.get(key))
+
+
+def _usage_brief(meta):
+    """Short suffix for row titles: the cost, else reported total tokens, else ``''``."""
+    cost = _fmt_cost(meta.get('cost'))
+    if cost:
+        return cost
+    usage = meta.get('usage')
+    if usage:
+        total = usage.get('total')
+        if total:
+            return f'{_human_count(total)} tok'
+    return ''
+
+
 def _total_tokens_left(a):
     """Token count from a ``total_tokens_reminder`` attachment's text
     (``<total_tokens>N tokens left</total_tokens>``), or ``None``."""
@@ -1126,6 +1163,15 @@ def _row_tag(rec):
 
 def _summarise_message(rec):
     """One-line row title (newlines kept; callers ``_oneline`` it)."""
+    title = _summarise_base(rec)
+    if rec.kind == 'turn_end':
+        brief = _usage_brief(rec.meta)
+        if brief:
+            return f'{title} · {brief}'
+    return title
+
+
+def _summarise_base(rec):
     if rec.summary is not None:
         return rec.summary
     kind = rec.kind
@@ -1928,7 +1974,8 @@ class _TreeData:
                  'agent_link', 'parent_id_of',
                  'tool_to_turn_root_line', 'agent_to_assistant_line',
                  'voice_count', 'latest_voice_line',
-                 'ai_title', 'custom_title', 'link_map')
+                 'ai_title', 'custom_title', 'session_usage',
+                 'session_usage_key', 'msg_last_key', 'link_map')
 
     def __init__(self):
         self.records = []
@@ -1954,6 +2001,13 @@ class _TreeData:
         # user's title outranks it). Tail appends keep them current.
         self.ai_title = None
         self.custom_title = None
+        # Session-to-date usage (``meta['session_usage']``) and the key of
+        # the record that reported it; last one wins, tail appends keep it
+        # current.
+        self.session_usage = None
+        self.session_usage_key = None
+        # ``{msg_id: key of the last record carrying it}``.
+        self.msg_last_key = {}
         # Lazy cross-link map (built by ``_link_map`` on first use,
         # invalidated by record growth — see its docstring).
         self.link_map = None
@@ -2001,6 +2055,14 @@ def _fold_record(td, cur, rec, n, path):
             td.custom_title = title
         else:
             td.ai_title = title
+    su = rec.meta.get('session_usage')
+    if isinstance(su, dict):
+        _stamp_session_cost(td, su, n)
+        td.session_usage = su
+        td.session_usage_key = n
+    msg_id = rec.meta.get('msg_id')
+    if msg_id is not None:
+        td.msg_last_key[msg_id] = n
 
     is_root = _is_turn_root(rec)
 
@@ -2040,6 +2102,8 @@ def _fold_record(td, cur, rec, n, path):
     # --- record inside an open turn.
     if cur.turn_open is not None:
         turn_key = cur.turn_open
+        if rec.kind == 'turn_end' and 'cost' not in rec.meta:
+            _sum_turn_cost(td, rec, turn_key, n)
 
         # (a) A record issuing tool calls: register each call id → this
         # record, and place it as a direct child of the turn (the
@@ -2098,6 +2162,37 @@ def _fold_record(td, cur, rec, n, path):
     td.parent_id_of[n] = ('span', path, span_start)
     dirty.add(('span', path, span_start))
     return dirty
+
+
+def _sum_turn_cost(td, rec, turn_key, n):
+    """Set ``rec.meta['cost']`` to the sum of the reported per-record costs
+    since the turn root (or the turn's previous ``turn_end``)."""
+    total = None
+    for i in range(n - 1, turn_key - 1, -1):
+        r = td.records[i]
+        if r is None:
+            continue
+        if r.kind == 'turn_end':
+            break
+        cost = r.meta.get('cost')
+        if _is_num(cost):
+            total = (total or 0) + cost
+    if total is not None:
+        rec.meta['cost'] = total
+        rec.meta['cost_summed'] = True
+
+
+def _stamp_session_cost(td, su, n):
+    """Put a snapshot's cost on the last ``end_turn`` record since the
+    previous ``session_usage`` record, as ``meta['session_cost']``."""
+    if not (su.get('snapshot') and _is_num(su.get('cost'))):
+        return
+    since = -1 if td.session_usage_key is None else td.session_usage_key
+    for i in range(n - 1, since, -1):
+        r = td.records[i]
+        if r is not None and r.end_turn:
+            r.meta['session_cost'] = su['cost']
+            return
 
 
 def _resolve_tool_owner(rec, tool_owner, td):
@@ -2616,10 +2711,11 @@ def _read_new_records(sess):
 
     ``records`` is the ``new`` list from ``store_tail_poll`` followed by
     its ``changed`` records, all ``(record_key, rec)``. When
-    ``_TREE_CACHE`` has an entry the new records are folded into it (so
-    tree-mode umbrellas, parent_id_of, agent_link … stay current) and a
-    changed record replaces the old object everywhere the fold placed it
-    (``records``, its umbrella's member list, a turn root entry);
+    ``_TREE_CACHE`` has an entry a changed record first replaces the old
+    object everywhere the fold placed it (``records``, its umbrella's
+    member list, a turn root entry), then the new records are folded in
+    (so tree-mode umbrellas, parent_id_of, agent_link … stay current, and
+    a ``turn_end`` in ``new`` sums the changed records' final costs);
     ``dirty_parents`` is the set of umbrella ids whose child list grew or
     whose children changed — for a changed tool call also its turn's
     ``<prompt>`` umbrella, whose ``<tool:>`` row title derives from it.
@@ -2634,9 +2730,9 @@ def _read_new_records(sess):
     td = _TREE_CACHE.get(sess)
     dirty = set()
     if td is not None:
-        dirty |= _fold_records(td, state.cursor, new, sess)
         for n, rec in changed:
             dirty |= _replace_record(td, rec, n, sess)
+        dirty |= _fold_records(td, state.cursor, new, sess)
     return (new + changed, dirty)
 
 
@@ -4089,6 +4185,36 @@ def _scope_card_session(item_id):
     return None
 
 
+def _session_usage_rows(td):
+    """``cost`` / ``tokens`` scope-card rows from ``td.session_usage``; a
+    ``snapshot`` followed by non-meta records gets a stale note."""
+    su = td.session_usage
+    if not su:
+        return []
+    rows = []
+    if su.get('cost') is not None:
+        text = _fmt_cost(su['cost'])
+        by_model = su.get('by_model') or {}
+        if len(by_model) >= 2:
+            parts = [f'{model} {_fmt_cost(m["cost"])}'
+                     for model, m in by_model.items() if m.get('cost') is not None]
+            if parts:
+                text += '  (' + ' · '.join(parts) + ')'
+        rows.append(('cost', text))
+    if su.get('usage'):
+        rows.append(('tokens', _fmt_usage(su['usage'])))
+    key = td.session_usage_key
+    if rows and su.get('snapshot') and key is not None:
+        after = sum(1 for r in td.records[key + 1:] if r is not None and r.kind != 'meta')
+        if after:
+            when = next((r.ts for r in reversed(td.records[:key + 1])
+                         if r is not None and r.ts is not None), None)
+            when = f' {_human_time(when)}' if when is not None else ''
+            label, text = rows[0]
+            rows[0] = (label, f'{text}  {MUTE}as of exit{when} · +{after} records after{RESET}')
+    return rows
+
+
 def _fmt_scope_card(sess, td):
     """One-block header identifying the session backing the synthetic top row.
 
@@ -4103,7 +4229,12 @@ def _fmt_scope_card(sess, td):
     name = _clean_title(td.custom_title or td.ai_title)
     if name:
         rows.append(('name', name))
-    rows.extend(info['meta'])
+    usage_rows = _session_usage_rows(td)
+    if usage_rows:
+        rows.extend(r for r in info['meta'] if r[0] not in ('cost', 'tokens'))
+        rows.extend(usage_rows)
+    else:
+        rows.extend(info['meta'])
     n_lines = sum(1 for r in td.records if r is not None)
     rows.append(('lines', str(n_lines)))
     if td.voice_count is None:
@@ -4807,7 +4938,8 @@ def _render_tool_umbrella(item_id):
     the registered umbrella formatter for each. Returns the joined blocks
     ONLY when every call has a formatter and every formatter returns a
     string; any gap (unregistered tool, declining formatter, failure)
-    returns ``None`` so the caller falls back to the leaf cascade.
+    returns ``None`` so the caller falls back to the leaf cascade. The
+    call's and results' ``_cascade_usage_line`` follow the blocks.
     """
     try:
         _tag, sess, key = item_id
@@ -4834,7 +4966,9 @@ def _render_tool_umbrella(item_id):
         if block is None:
             return None
         blocks.append(block)
-    return '\n\n'.join(blocks)
+    usage = ''.join(_cascade_usage_line(sess, r.key, r)
+                    for r in [rec] + td.tool_children.get(key, []))
+    return '\n\n'.join(blocks) + usage
 
 
 # ---- message bodies ------------------------------------------------------
@@ -5018,7 +5152,8 @@ def _fmt_elapsed(secs):
 def _record_chrome(rec, root=None):
     """Metadata footer of a record preview: the agent's ``extras_chrome``
     when it answers, else the generic rows from ``id``, ``ts`` and ``meta``
-    (``model``, ``agent``, ``duration_ms``, ``tokens``, ``cost``).
+    (``model``, ``agent``, ``cost``, ``session_cost``, ``usage``,
+    ``duration_ms``).
 
     ``root`` is the turn-root record (``_turn_root_record``) whose ``ts``
     anchors the ``offset`` row; ``''`` when there is nothing to show.
@@ -5040,11 +5175,19 @@ def _record_chrome(rec, root=None):
         rows.append(('timestamp', shown))
         if root is not None and root.ts is not None:
             rows.append(('offset', _fmt_elapsed(rec.ts - root.ts)))
-    for key, label in (('model', 'model'), ('agent', 'agent'),
-                       ('tokens', 'tokens'), ('cost', 'cost')):
-        v = rec.meta.get(key)
-        if v not in (None, ''):
-            rows.append((label, f'{v:,}' if isinstance(v, int) else str(v)))
+    meta = rec.meta
+    for key in ('model', 'agent'):
+        if meta.get(key) not in (None, ''):
+            rows.append((key, str(meta[key])))
+    cost = _fmt_cost(meta.get('cost'))
+    if cost:
+        rows.append(('cost', cost + ('  (sum of messages)' if meta.get('cost_summed') else '')))
+    session_cost = _fmt_cost(meta.get('session_cost'))
+    if session_cost:
+        rows.append(('session cost', session_cost))
+    usage = _fmt_usage(meta.get('usage'))
+    if usage:
+        rows.append(('usage', usage))
     ms = rec.meta.get('duration_ms')
     if ms is not None:
         rows.append(('duration', f'{ms / 1000:.2f}s'))
@@ -5105,6 +5248,26 @@ def _preview_message(sess, n):
     return body + ('\n' + chrome if chrome else '')
 
 
+def _cascade_usage_line(sess, n, rec):
+    """One-line cost / usage under a cascaded record at detail >= 5, else ``''``.
+
+    Shown once per API message, on its last record in the session (blocks
+    of one message may interleave with other records). Skipped on ``meta``
+    records, whose summary already prints the same numbers.
+    """
+    if _DETAIL_LEVEL < 5 or rec.kind == 'meta':
+        return ''
+    meta = rec.meta
+    parts = [_fmt_cost(meta.get('cost')), _fmt_usage(meta.get('usage'))]
+    text = ' · '.join(p for p in parts if p)
+    if not text:
+        return ''
+    msg_id = meta.get('msg_id')
+    if msg_id is not None and _scan_tree(sess).msg_last_key.get(msg_id, n) != n:
+        return ''
+    return '\n' + MUTE + '💰 ' + text + RESET
+
+
 def _render_record_with_rule(sess, n):
     """Read one record, render its body, prefix with a section rule.
 
@@ -5124,9 +5287,9 @@ def _render_record_with_rule(sess, n):
         rule = _rule(rec.tag, BOLD + WHITE, width=width, bg=BLUE_BG)
         cs = BLUE_BG_PARAMS if BLUE_BG else '0'
         body = _band_block(_render_record(rec, bg=cs), BLUE_BG)
-        return rule + '\n' + body
+        return rule + '\n' + body + _cascade_usage_line(sess, n, rec)
     body = _render_record(rec, call=_owner_call(sess, rec))
-    return _rule(rec.tag, YELLOW) + '\n' + body
+    return _rule(rec.tag, YELLOW) + '\n' + body + _cascade_usage_line(sess, n, rec)
 # }}} # SOURCE END: common/050-render.py
 
 # SOURCE START: codex/055-extras.py {{{

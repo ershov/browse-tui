@@ -65,7 +65,8 @@ class _TreeData:
                  'agent_link', 'parent_id_of',
                  'tool_to_turn_root_line', 'agent_to_assistant_line',
                  'voice_count', 'latest_voice_line',
-                 'ai_title', 'custom_title', 'link_map')
+                 'ai_title', 'custom_title', 'session_usage',
+                 'session_usage_key', 'msg_last_key', 'link_map')
 
     def __init__(self):
         self.records = []
@@ -91,6 +92,13 @@ class _TreeData:
         # user's title outranks it). Tail appends keep them current.
         self.ai_title = None
         self.custom_title = None
+        # Session-to-date usage (``meta['session_usage']``) and the key of
+        # the record that reported it; last one wins, tail appends keep it
+        # current.
+        self.session_usage = None
+        self.session_usage_key = None
+        # ``{msg_id: key of the last record carrying it}``.
+        self.msg_last_key = {}
         # Lazy cross-link map (built by ``_link_map`` on first use,
         # invalidated by record growth — see its docstring).
         self.link_map = None
@@ -138,6 +146,14 @@ def _fold_record(td, cur, rec, n, path):
             td.custom_title = title
         else:
             td.ai_title = title
+    su = rec.meta.get('session_usage')
+    if isinstance(su, dict):
+        _stamp_session_cost(td, su, n)
+        td.session_usage = su
+        td.session_usage_key = n
+    msg_id = rec.meta.get('msg_id')
+    if msg_id is not None:
+        td.msg_last_key[msg_id] = n
 
     is_root = _is_turn_root(rec)
 
@@ -177,6 +193,8 @@ def _fold_record(td, cur, rec, n, path):
     # --- record inside an open turn.
     if cur.turn_open is not None:
         turn_key = cur.turn_open
+        if rec.kind == 'turn_end' and 'cost' not in rec.meta:
+            _sum_turn_cost(td, rec, turn_key, n)
 
         # (a) A record issuing tool calls: register each call id → this
         # record, and place it as a direct child of the turn (the
@@ -235,6 +253,37 @@ def _fold_record(td, cur, rec, n, path):
     td.parent_id_of[n] = ('span', path, span_start)
     dirty.add(('span', path, span_start))
     return dirty
+
+
+def _sum_turn_cost(td, rec, turn_key, n):
+    """Set ``rec.meta['cost']`` to the sum of the reported per-record costs
+    since the turn root (or the turn's previous ``turn_end``)."""
+    total = None
+    for i in range(n - 1, turn_key - 1, -1):
+        r = td.records[i]
+        if r is None:
+            continue
+        if r.kind == 'turn_end':
+            break
+        cost = r.meta.get('cost')
+        if _is_num(cost):
+            total = (total or 0) + cost
+    if total is not None:
+        rec.meta['cost'] = total
+        rec.meta['cost_summed'] = True
+
+
+def _stamp_session_cost(td, su, n):
+    """Put a snapshot's cost on the last ``end_turn`` record since the
+    previous ``session_usage`` record, as ``meta['session_cost']``."""
+    if not (su.get('snapshot') and _is_num(su.get('cost'))):
+        return
+    since = -1 if td.session_usage_key is None else td.session_usage_key
+    for i in range(n - 1, since, -1):
+        r = td.records[i]
+        if r is not None and r.end_turn:
+            r.meta['session_cost'] = su['cost']
+            return
 
 
 def _resolve_tool_owner(rec, tool_owner, td):
@@ -753,10 +802,11 @@ def _read_new_records(sess):
 
     ``records`` is the ``new`` list from ``store_tail_poll`` followed by
     its ``changed`` records, all ``(record_key, rec)``. When
-    ``_TREE_CACHE`` has an entry the new records are folded into it (so
-    tree-mode umbrellas, parent_id_of, agent_link … stay current) and a
-    changed record replaces the old object everywhere the fold placed it
-    (``records``, its umbrella's member list, a turn root entry);
+    ``_TREE_CACHE`` has an entry a changed record first replaces the old
+    object everywhere the fold placed it (``records``, its umbrella's
+    member list, a turn root entry), then the new records are folded in
+    (so tree-mode umbrellas, parent_id_of, agent_link … stay current, and
+    a ``turn_end`` in ``new`` sums the changed records' final costs);
     ``dirty_parents`` is the set of umbrella ids whose child list grew or
     whose children changed — for a changed tool call also its turn's
     ``<prompt>`` umbrella, whose ``<tool:>`` row title derives from it.
@@ -771,9 +821,9 @@ def _read_new_records(sess):
     td = _TREE_CACHE.get(sess)
     dirty = set()
     if td is not None:
-        dirty |= _fold_records(td, state.cursor, new, sess)
         for n, rec in changed:
             dirty |= _replace_record(td, rec, n, sess)
+        dirty |= _fold_records(td, state.cursor, new, sess)
     return (new + changed, dirty)
 
 

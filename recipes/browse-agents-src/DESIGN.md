@@ -186,7 +186,7 @@ renderers (#1287 keys them on `tool.canon`) and the source view.
 | `is_meta` | bool | injected context, never typed or spoken (Claude `isMeta`, Codex `developer`, OpenCode `synthetic`) |
 | `end_turn` | bool | an assistant record that concluded its turn |
 | `min_level` | int or `None` | lowest detail level that shows the record; `None` means the per-kind default |
-| `meta` | dict | small facts: `agent` (attribution), `title` + `title_by` (`user`/`agent`: a session title stated by this record), `duration_ms`, `encrypted`, `thinking` (the readable thinking text, also when the record has spoken text → `· thinking` row tag and the thinking rule in the generic body), `span_label` (finer label for `<system>` span titles, Claude `att:<type>` / `sys:<subtype>`), and the generic chrome keys `model`, `tokens`, `cost` |
+| `meta` | dict | small facts: `agent` (attribution), `title` + `title_by` (`user`/`agent`: a session title stated by this record), `duration_ms`, `encrypted`, `thinking` (the readable thinking text, also when the record has spoken text → `· thinking` row tag and the thinking rule in the generic body), `span_label` (finer label for `<system>` span titles, Claude `att:<type>` / `sys:<subtype>`), and the generic chrome keys `model`, `cost` (float USD, directly reported for this message / step / turn; never inferred from tokens), `cost_summed` (`True` when a `turn_end` cost was summed by the common fold from the turn's records → chrome adds `(sum of messages)`), `session_cost` (float USD on an `end_turn` record: the session total a later snapshot reported, see the fold notes), `usage` (dict of int token counts, any subset of `input`, `output`, `cache_read`, `cache_write`, `reasoning`, `total`), `msg_id` (the agent's API message id when several records come from one message, so a cascade shows its usage once, on the last record carrying it), `session_usage` (session-to-date totals the agent reported on this record: `{'cost', 'usage', 'by_model': {name: {'cost', 'usage'}}, 'snapshot'}`; `snapshot=True` when the agent writes it only at session exit, so later records are not counted) |
 
 The fold does not consume `turn_id` yet (it derives turns from
 `user_prompt` / `turn_end` records); the generic chrome reads `ts`. Both
@@ -232,6 +232,32 @@ child_session, assistant_key}`), so agents without record ids work; the
 cross-link map (`070-links`) joins canon `message` / `spawn` tools with
 `agent_voice == 'peer'` records by `peer` and `text`.
 
+The fold also keeps session-level facts on `_TreeData`, last one wins and
+tail appends keep them current: `custom_title` / `ai_title` from
+`meta['title']`, and `session_usage` / `session_usage_key` (the latest
+`meta['session_usage']` dict and its record key). A `turn_end` folded
+while its turn is open and without its own `cost` gets the sum of the
+numeric `meta['cost']` of the turn's records since the turn root (or the
+turn's previous `turn_end`), with `cost_summed=True`; no record cost, no
+key. Accepted limitation: the sum is computed once, when the `turn_end` is
+folded; a message cost that settles in a later poll than the `idle` row is
+not re-summed. A `snapshot` `session_usage` with a numeric `cost`
+(`_stamp_session_cost`) is also put, as `meta['session_cost']`, on the
+last `end_turn` record since the previous `session_usage` record (none →
+nothing): the session total known at that point, never a per-turn figure.
+The chrome shows it as a `session cost` row before `usage`.
+
+The scope card (`_fmt_scope_card`) shows `td.session_usage` as `cost`
+(`_fmt_cost`, plus a per-model breakdown when `by_model` has 2+ models)
+and `tokens` (`_fmt_usage`) rows; they replace the store's `cost` /
+`tokens` rows from `store_session_info`. A `snapshot` usage followed by
+non-meta records gets a muted `as of exit <when> · +N records after`
+note (`when` from the nearest earlier record with a `ts`, omitted if
+none). With no usage at all the card has no `cost` row. Accepted
+limitation: the OpenCode scope card's session cost / tokens come from the
+store index and refresh on the next root listing. The cheap card
+(`_preview_session_card`) shows only `store_session_info`.
+
 Tool canon names and the per-agent name map:
 
 | canon | Claude | Codex | OpenCode |
@@ -273,11 +299,17 @@ one-liners; `system` / `meta` / `unknown` → the label, text or summary,
 and the raw object as JSON (always for `unknown`, at detail 6+ for the
 others — the one place common reads `raw`). The generic chrome shows
 `id`, `timestamp` (from `ts`), `offset` (from the turn root's `ts`) and
-the meta keys `model`, `agent`, `tokens`, `cost`, `duration_ms`. Generic
-tool formatters exist for canon bash, read, edit, write, grep, glob,
-skill, message, webfetch, websearch, mcp (umbrellas), spawn / question /
-message (call bodies), spawn / message / webfetch (markdown results); the
-default result body is the diff, else the output (JSON coloured).
+the meta keys `model`, `agent`, `cost`, `session_cost`, `usage`,
+`duration_ms`; `turn_end` row titles carry the usage brief (` · $0.12`, else
+` · 52K tok`); at detail >= 5 a composed (cascade) preview shows a
+one-line `💰` cost / usage under a record (also `turn_end`, and after a
+fused tool umbrella for its call and results; never on `meta`), only on
+the last record of a `msg_id` in the session (`_TreeData.msg_last_key`;
+blocks of one message may interleave with other records). Generic tool formatters exist for canon bash, read, edit, write,
+grep, glob, skill, message, webfetch, websearch, mcp (umbrellas), spawn /
+question / message (call bodies), spawn / message / webfetch (markdown
+results); the default result body is the diff, else the output (JSON
+coloured).
 
 Claude extras: `extras_render` renders every record from `raw`
 (`_classify` → `_render_user` / `_render_assistant` / `_render_attachment`
@@ -509,10 +541,12 @@ chrome, snapshots and the selection events are `meta` rows.
 The common tail worker (`common/040-tree` + `090-main`) is poll-based: a
 daemon thread resolves the cursor's session, makes sure `_scan_tree` has
 opened it (`store_tail_open`), then every `store_tail_interval()` seconds
-calls `store_tail_poll`, folds `new` records into the cached tree data,
-swaps `changed` ones in everywhere the fold placed them (`records`, the
-umbrella member lists, a turn root entry; `latest_voice_line` advances
-when the record became voice), and pushes patches: `upsert` for new rows,
+calls `store_tail_poll`, swaps `changed` records in everywhere the fold
+placed them (`records`, the umbrella member lists, a turn root entry;
+`latest_voice_line` advances when the record became voice), then folds
+`new` records into the cached tree data — in that order, so a `turn_end`
+in `new` sums the final costs of messages that settled in the same poll
+— and pushes patches: `upsert` for new rows,
 `mod` for cached rows whose title / tag / style / visibility moved (tree
 mode: the dirty umbrellas — a changed tool call also dirties its
 `<prompt>` umbrella, whose `<tool:>` row title derives from it; flat
