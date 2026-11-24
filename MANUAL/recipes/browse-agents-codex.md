@@ -61,6 +61,14 @@ duration, unified diff). The `exec` custom tool's JavaScript is unwrapped to
 `exec_command` (the `cmd`) or `apply_patch` (the patch and its file list).
 Raw twins stay visible as `raw` rows at level 6.
 
+**Cost and usage.** Codex records token counts only, no dollar cost, and
+nothing is computed from them. A session row (and a subthread row) tags the
+total from the thread index (`52.0K tok`) and the cheap session card shows it
+as `tokens`. The scope card (top row of an expanded session) shows a `tokens`
+row from the latest `token_count`, and each turn end row carries the turn's
+tokens (` · 29.9K tok`; its footer has the full breakdown). Each response's
+token usage is in the footer of its level-6 `usage` row.
+
 Keys: `Enter` follow a `[↗]` link to a spawned subthread, `1`-`7` set the
 detail level, `J` / `K` jump between voice rows, `t` toggle tree / flat,
 `e` / `E` open the preview / the rollout in `$EDITOR`, `y` show the row id.

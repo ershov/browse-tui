@@ -444,10 +444,11 @@ class _Thread:
 
     __slots__ = ('id', 'path', 'cwd', 'name', 'title', 'model', 'branch',
                  'source', 'version', 'parent', 'children', 'child_status',
-                 'mtime')
+                 'mtime', 'tokens')
 
     def __init__(self, id, path, cwd=None, title=None, model=None,
-                 branch=None, source=None, version=None, name=None):
+                 branch=None, source=None, version=None, name=None,
+                 tokens=None):
         self.id = id
         self.path = path
         self.cwd = cwd or None
@@ -457,6 +458,7 @@ class _Thread:
         self.branch = branch or None
         self.source = source or None
         self.version = version or None
+        self.tokens = tokens if isinstance(tokens, int) else None
         self.parent = None        # parent thread id (spawned threads)
         self.children = []        # child thread ids, in edge order
         self.child_status = None  # the spawn edge status for a child
@@ -481,9 +483,11 @@ def _db_rows():
     except (sqlite3.Error, ValueError):
         return [], []
     try:
+        cols = {r[1] for r in con.execute('PRAGMA table_info(threads)')}
+        used = 'tokens_used' if 'tokens_used' in cols else 'NULL'
         threads = con.execute(
             'SELECT id, rollout_path, cwd, title, model, git_branch, source, '
-            'cli_version, name FROM threads').fetchall()
+            f'cli_version, name, {used} FROM threads').fetchall()
         edges = con.execute(
             'SELECT parent_thread_id, child_thread_id, status '
             'FROM thread_spawn_edges').fetchall()
@@ -559,11 +563,13 @@ def _scan_rollouts():
 def _build_index():
     threads, by_path = {}, {}
     rows, edges = _db_rows()
-    for tid, path, cwd, title, model, branch, source, version, name in rows:
+    for (tid, path, cwd, title, model, branch, source, version, name,
+         tokens) in rows:
         if not os.path.isfile(path):
             continue
         th = _Thread(tid, path, cwd=cwd, title=title, model=model,
-                     branch=branch, source=source, version=version, name=name)
+                     branch=branch, source=source, version=version, name=name,
+                     tokens=tokens)
         threads[tid] = th
         by_path[path] = th
     for path in _scan_rollouts():
@@ -643,6 +649,10 @@ def store_list_projects():
     return out
 
 
+def _tokens_bit(th):
+    return f'{_human_count(th.tokens)} tok · ' if th.tokens else ''
+
+
 def _session_item(th):
     count = _line_count(th.path)
     n_subs = len(th.children)
@@ -650,6 +660,8 @@ def _session_item(th):
     bits.append(f'{count} rec')
     if n_subs:
         bits.append(f'{n_subs} sub')
+    if th.tokens:
+        bits.append(f'{_human_count(th.tokens)} tok')
     bits.append(_human_time(th.mtime))
     item = Item(
         id=('session', th.path),
@@ -683,11 +695,12 @@ def store_session_item(session_key):
 def _child_item(parent_path, th):
     count = _line_count(th.path)
     status = th.child_status or 'thread'
+    tok = _tokens_bit(th)
     item = Item(
         id=('agent', parent_path, th.id),
         title=_link_marker(('agent', parent_path, th.id))
               + (_trim(_oneline(_thread_title(th)), 80) or th.id),
-        tag=f'{status} · {count} rec · {_human_time(th.mtime)}',
+        tag=f'{status} · {count} rec · {tok}{_human_time(th.mtime)}',
         tag_style='magenta',
         has_children=count > 0,
         boundary=True,
@@ -697,6 +710,7 @@ def _child_item(parent_path, th):
     item.agent_type = status
     item.session_path = parent_path
     item.subagent_path = th.path
+    item.tokens_bit = tok
     item.line_count = count
     item.mtime = th.mtime
     item.row_bg = _ROW_BG_SPAWN
@@ -715,8 +729,8 @@ def store_child_sessions(session_key):
 
 
 def store_mark_orphan(item):
-    item.tag = (f'{item.agent_type} · {item.line_count} rec · orphan · '
-                f'{_human_time(item.mtime)}')
+    item.tag = (f'{item.agent_type} · {item.line_count} rec · '
+                f'{item.tokens_bit}orphan · {_human_time(item.mtime)}')
 
 
 def store_child_session(session_key, child_key):
@@ -901,6 +915,8 @@ def store_session_info(session_key):
             if v:
                 meta.append((key, _trim(_oneline(_clean_title(v)), 120)
                              if key in ('name', 'title') else v))
+        if th.tokens:
+            meta.append(('tokens', f'{th.tokens:,}'))
     try:
         mtime = os.stat(session_key).st_mtime
     except OSError:
@@ -1239,7 +1255,7 @@ def _tool_result_one_line(tool):
 class _ParseCtx:
     """Cross-line parse state for one rollout."""
 
-    __slots__ = ('item_ids', 'pending', 'answered', 'model', 'tokens',
+    __slots__ = ('item_ids', 'pending', 'answered', 'model', 'turn_usage',
                  'turn_id')
 
     def __init__(self):
@@ -1247,8 +1263,24 @@ class _ParseCtx:
         self.pending = []       # (call_id, canon) awaiting a result, oldest first
         self.answered = set()   # call_ids an item already answered
         self.model = None
-        self.tokens = None
+        self.turn_usage = None
         self.turn_id = None
+
+
+_USAGE_KEYS = (('input_tokens', 'input'), ('cached_input_tokens', 'cache_read'),
+               ('cache_write_input_tokens', 'cache_write'),
+               ('output_tokens', 'output'),
+               ('reasoning_output_tokens', 'reasoning'),
+               ('total_tokens', 'total'))
+
+
+def _norm_usage(d):
+    """Codex token-usage dict → ``{input, cache_read, …, total}`` (ints only);
+    ``{}`` for a non-dict."""
+    if not isinstance(d, dict):
+        return {}
+    return {new: d[old] for old, new in _USAGE_KEYS
+            if isinstance(d.get(old), int) and not isinstance(d[old], bool)}
 
 
 _CANON_BY_TOOL = {
@@ -1616,6 +1648,7 @@ def _parse_event(rec, p, ctx):
     if pt == 'task_started':
         ctx.turn_id = rec.turn_id = p.get('turn_id')
         ctx.pending = []    # an interrupted call never answers across turns
+        ctx.turn_usage = None
         rec.kind, rec.tag = 'turn_start', 'turn'
         rec.summary = 'turn started'
         return rec
@@ -1625,8 +1658,8 @@ def _parse_event(rec, p, ctx):
         ms = p.get('duration_ms')
         if ms is not None:
             rec.meta['duration_ms'] = ms
-        if ctx.tokens is not None:
-            rec.meta['tokens'] = ctx.tokens
+        if ctx.turn_usage:
+            rec.meta['usage'] = ctx.turn_usage
         if pt == 'turn_aborted':
             what = f'turn aborted ({p.get("reason") or "?"})'
         elif isinstance(p.get('error'), dict):
@@ -1636,12 +1669,15 @@ def _parse_event(rec, p, ctx):
         rec.summary = what + (f' · {ms / 1000:.1f}s' if ms is not None else '')
         ctx.turn_id = None
         ctx.pending = []
+        ctx.turn_usage = None
         return rec
     if pt == 'token_count':
         info = p.get('info') if isinstance(p.get('info'), dict) else {}
         total = (info.get('total_token_usage') or {}).get('total_tokens')
-        if total is not None:
-            ctx.tokens = total
+        if isinstance(info.get('total_token_usage'), dict):
+            rec.meta['session_usage'] = {
+                'cost': None, 'usage': _norm_usage(info['total_token_usage']),
+                'by_model': None, 'snapshot': False}
         bits = ['tokens']
         if total is not None:
             bits.append(f'total {total:,}')
@@ -1711,6 +1747,9 @@ def _parse_record(raw, key, ctx):
         rec.kind, rec.min_level, rec.tag = 'meta', _META_LEVEL[t], 'token_usage'
         usage = p.get('usage') if isinstance(p.get('usage'), dict) else {}
         rec.turn_id = p.get('turn_id') or rec.turn_id
+        rec.meta['usage'] = _norm_usage(usage)
+        if isinstance(p.get('turn_token_usage'), dict):
+            ctx.turn_usage = _norm_usage(p['turn_token_usage'])
         rec.summary = (f'usage · in {usage.get("input_tokens", 0):,} · '
                        f'out {usage.get("output_tokens", 0):,} · '
                        f'total {usage.get("total_tokens", 0):,}')

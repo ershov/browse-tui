@@ -18,7 +18,7 @@
 class _ParseCtx:
     """Cross-line parse state for one rollout."""
 
-    __slots__ = ('item_ids', 'pending', 'answered', 'model', 'tokens',
+    __slots__ = ('item_ids', 'pending', 'answered', 'model', 'turn_usage',
                  'turn_id')
 
     def __init__(self):
@@ -26,8 +26,24 @@ class _ParseCtx:
         self.pending = []       # (call_id, canon) awaiting a result, oldest first
         self.answered = set()   # call_ids an item already answered
         self.model = None
-        self.tokens = None
+        self.turn_usage = None
         self.turn_id = None
+
+
+_USAGE_KEYS = (('input_tokens', 'input'), ('cached_input_tokens', 'cache_read'),
+               ('cache_write_input_tokens', 'cache_write'),
+               ('output_tokens', 'output'),
+               ('reasoning_output_tokens', 'reasoning'),
+               ('total_tokens', 'total'))
+
+
+def _norm_usage(d):
+    """Codex token-usage dict → ``{input, cache_read, …, total}`` (ints only);
+    ``{}`` for a non-dict."""
+    if not isinstance(d, dict):
+        return {}
+    return {new: d[old] for old, new in _USAGE_KEYS
+            if isinstance(d.get(old), int) and not isinstance(d[old], bool)}
 
 
 _CANON_BY_TOOL = {
@@ -395,6 +411,7 @@ def _parse_event(rec, p, ctx):
     if pt == 'task_started':
         ctx.turn_id = rec.turn_id = p.get('turn_id')
         ctx.pending = []    # an interrupted call never answers across turns
+        ctx.turn_usage = None
         rec.kind, rec.tag = 'turn_start', 'turn'
         rec.summary = 'turn started'
         return rec
@@ -404,8 +421,8 @@ def _parse_event(rec, p, ctx):
         ms = p.get('duration_ms')
         if ms is not None:
             rec.meta['duration_ms'] = ms
-        if ctx.tokens is not None:
-            rec.meta['tokens'] = ctx.tokens
+        if ctx.turn_usage:
+            rec.meta['usage'] = ctx.turn_usage
         if pt == 'turn_aborted':
             what = f'turn aborted ({p.get("reason") or "?"})'
         elif isinstance(p.get('error'), dict):
@@ -415,12 +432,15 @@ def _parse_event(rec, p, ctx):
         rec.summary = what + (f' · {ms / 1000:.1f}s' if ms is not None else '')
         ctx.turn_id = None
         ctx.pending = []
+        ctx.turn_usage = None
         return rec
     if pt == 'token_count':
         info = p.get('info') if isinstance(p.get('info'), dict) else {}
         total = (info.get('total_token_usage') or {}).get('total_tokens')
-        if total is not None:
-            ctx.tokens = total
+        if isinstance(info.get('total_token_usage'), dict):
+            rec.meta['session_usage'] = {
+                'cost': None, 'usage': _norm_usage(info['total_token_usage']),
+                'by_model': None, 'snapshot': False}
         bits = ['tokens']
         if total is not None:
             bits.append(f'total {total:,}')
@@ -490,6 +510,9 @@ def _parse_record(raw, key, ctx):
         rec.kind, rec.min_level, rec.tag = 'meta', _META_LEVEL[t], 'token_usage'
         usage = p.get('usage') if isinstance(p.get('usage'), dict) else {}
         rec.turn_id = p.get('turn_id') or rec.turn_id
+        rec.meta['usage'] = _norm_usage(usage)
+        if isinstance(p.get('turn_token_usage'), dict):
+            ctx.turn_usage = _norm_usage(p['turn_token_usage'])
         rec.summary = (f'usage · in {usage.get("input_tokens", 0):,} · '
                        f'out {usage.get("output_tokens", 0):,} · '
                        f'total {usage.get("total_tokens", 0):,}')

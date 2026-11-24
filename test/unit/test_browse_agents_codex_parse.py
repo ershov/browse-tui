@@ -133,12 +133,17 @@ class CodexParseTests(unittest.TestCase):
             'last_token_usage': {'total_tokens': 100},
             'model_context_window': 400000},
             rate_limits={'primary': {'used_percent': 12.5}}))
+        self.parse(_line('token_usage_record', {
+            'turn_id': 'turn-1', 'usage': {'total_tokens': 100},
+            'turn_token_usage': {'input_tokens': 900, 'output_tokens': 50,
+                                 'total_tokens': 950}}))
         end = self.parse(_ev(type='task_complete', turn_id='turn-1',
                              last_agent_message='done', duration_ms=15700))
         self.assertEqual(end.kind, 'turn_end')
         self.assertEqual(self.level(end), 4)
         self.assertEqual(end.meta['duration_ms'], 15700)
-        self.assertEqual(end.meta['tokens'], 12345)
+        self.assertEqual(end.meta['usage'],
+                         {'input': 900, 'output': 50, 'total': 950})
         self.assertEqual(end.summary, 'turn complete · 15.7s')
         self.assertTrue(self.r._is_turn_close(end))
 
@@ -163,6 +168,48 @@ class CodexParseTests(unittest.TestCase):
                          ('meta', 'token_count', 6))
         self.assertEqual(rec.summary,
                          'tokens · total 2,500 · last 50 · window 1,000 · rate 3%')
+        self.assertEqual(rec.meta['session_usage'], {
+            'cost': None, 'usage': {'total': 2500}, 'by_model': None,
+            'snapshot': False})
+        bare = self.parse(_ev(type='token_count', info=None))
+        self.assertNotIn('session_usage', bare.meta)
+
+    def test_norm_usage(self):
+        n = self.r._norm_usage
+        self.assertEqual(n({
+            'input_tokens': 14502, 'cached_input_tokens': 11008,
+            'cache_write_input_tokens': 0, 'output_tokens': 181,
+            'reasoning_output_tokens': 30, 'total_tokens': 14683,
+            'extra': 5}), {
+            'input': 14502, 'cache_read': 11008, 'cache_write': 0,
+            'output': 181, 'reasoning': 30, 'total': 14683})
+        self.assertEqual(n({'input_tokens': '5', 'output_tokens': None,
+                            'total_tokens': True}), {})
+        self.assertEqual(n(None), {})
+        self.assertEqual(n([1]), {})
+
+    def test_turn_usage_is_the_last_response_turn_total_and_resets(self):
+        self.parse(_ev(type='task_started', turn_id='turn-1'))
+        r1 = self.parse(_line('token_usage_record', {
+            'turn_id': 'turn-1', 'usage': {'total_tokens': 10},
+            'turn_token_usage': {'total_tokens': 10}}))
+        self.assertEqual(r1.meta['usage'], {'total': 10})
+        self.parse(_line('token_usage_record', {
+            'turn_id': 'turn-1', 'usage': {'total_tokens': 25},
+            'turn_token_usage': {'total_tokens': 35}}))
+        self.parse(_ev(type='token_count', info={
+            'total_token_usage': {'total_tokens': 9999}}))
+        end = self.parse(_ev(type='task_complete', turn_id='turn-1'))
+        self.assertEqual(end.meta['usage'], {'total': 35})
+        self.assertIsNone(self.ctx.turn_usage)
+        end2 = self.parse(_ev(type='task_complete', turn_id='turn-1'))
+        self.assertNotIn('usage', end2.meta)
+        self.parse(_line('token_usage_record', {
+            'usage': {'total_tokens': 1}, 'turn_token_usage': {'total_tokens': 1}}))
+        self.parse(_ev(type='task_started', turn_id='turn-2'))
+        self.assertIsNone(self.ctx.turn_usage)
+        aborted = self.parse(_ev(type='turn_aborted', turn_id='turn-2', reason='interrupted'))
+        self.assertNotIn('usage', aborted.meta)
 
     def test_token_usage_record_world_state_settings(self):
         usage = self.parse(_line('token_usage_record', {
@@ -170,6 +217,7 @@ class CodexParseTests(unittest.TestCase):
                                       'total_tokens': 15}}))
         self.assertEqual((usage.kind, self.level(usage)), ('meta', 6))
         self.assertEqual(usage.summary, 'usage · in 10 · out 5 · total 15')
+        self.assertEqual(usage.meta['usage'], {'input': 10, 'output': 5, 'total': 15})
         ws = self.parse(_line('world_state', {'full': True, 'state': {}}))
         self.assertEqual((ws.kind, self.level(ws), ws.summary),
                          ('meta', 6, 'world_state (full)'))
@@ -449,7 +497,8 @@ class CodexParseTests(unittest.TestCase):
             _item({'type': 'Reasoning', 'id': 'rs_1', 'summary_text': []}),
             _ri(type='reasoning', id='rs_1', summary=[], encrypted_content='x'),
             _ri(type='custom_tool_call', id='ctc_1', call_id='call_1', name='exec', input=_EXEC_JS),
-            _line('token_usage_record', {'usage': {'total_tokens': 1}}),
+            _line('token_usage_record', {'usage': {'total_tokens': 1},
+                                         'turn_token_usage': {'total_tokens': 900}}),
             _item({'type': 'CommandExecution', 'id': 'exec-1', 'command': ['x'],
                    'status': 'completed', 'stdout': 'listing', 'exit_code': 0}),
             _ri(type='custom_tool_call_output', call_id='call_1',
@@ -473,7 +522,7 @@ class CodexParseTests(unittest.TestCase):
         roots = [(e['kind'], e.get('line', e.get('start'))) for e in td.roots_in_order]
         self.assertEqual(roots, [('span', 0), ('turn', 5)])
         self.assertEqual([rec.key for rec in td.tool_children[8]], [10, 11])
-        self.assertEqual(td.records[15].meta['tokens'], 900)
+        self.assertEqual(td.records[15].meta['usage'], {'total': 900})
         self.assertEqual(td.records[13].meta['model'], 'gpt-5.6')
         self.assertEqual(td.latest_voice_line, 13)
         r._TREE_CACHE['/x.jsonl'] = td

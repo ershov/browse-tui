@@ -475,11 +475,24 @@ chrome, snapshots and the selection events are `meta` rows.
   records.
 * Turns: `task_started` → `turn_start` (level 5, before the prompt, so it
   lands in the preceding `<system>` span); `task_complete` / `turn_aborted`
-  → `turn_end` (level 4) with `meta.duration_ms`, `meta.tokens` (the latest
-  `token_count` total) and a summary `turn complete · 9.0s` / `turn aborted
-  (interrupted) · …` / `turn failed: <error>`. `session_meta`,
-  `turn_context`, `thread_settings_applied` → `meta` level 5; `token_count`,
-  `token_usage_record`, `world_state` → `meta` level 6.
+  → `turn_end` (level 4) with `meta.duration_ms`, `meta.usage` (the turn's
+  tokens: the last `token_usage_record.turn_token_usage` of the turn, kept in
+  `ctx.turn_usage` and reset at `task_started` and after each turn end) and a
+  summary `turn complete · 9.0s` / `turn aborted (interrupted) · …` / `turn
+  failed: <error>`. `session_meta`, `turn_context`, `thread_settings_applied`
+  → `meta` level 5; `token_count`, `token_usage_record`, `world_state` →
+  `meta` level 6.
+* Usage (tokens only; Codex records no USD): `_norm_usage` maps
+  `input_tokens` / `cached_input_tokens` / `cache_write_input_tokens` /
+  `output_tokens` / `reasoning_output_tokens` / `total_tokens` to
+  `input` / `cache_read` / `cache_write` / `output` / `reasoning` / `total`.
+  `token_count` → `meta.session_usage` from `info.total_token_usage`
+  (`cost` None, not a snapshot; the last one wins). `token_usage_record` →
+  `meta.usage` from `usage` (that response, shown in its level-6 row's
+  chrome) and `ctx.turn_usage` from `turn_token_usage`.
+  `threads.tokens_used` (when the column exists) → `_Thread.tokens` → the
+  `tokens` row of `store_session_info` and a `52.0K tok` tag part on session
+  and child rows (also kept in the orphan re-tag).
 * Tail: file append through the common `040-tail-file` helper, with the
   `_ParseCtx` on the state.
 

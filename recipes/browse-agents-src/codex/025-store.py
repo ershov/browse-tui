@@ -40,10 +40,11 @@ class _Thread:
 
     __slots__ = ('id', 'path', 'cwd', 'name', 'title', 'model', 'branch',
                  'source', 'version', 'parent', 'children', 'child_status',
-                 'mtime')
+                 'mtime', 'tokens')
 
     def __init__(self, id, path, cwd=None, title=None, model=None,
-                 branch=None, source=None, version=None, name=None):
+                 branch=None, source=None, version=None, name=None,
+                 tokens=None):
         self.id = id
         self.path = path
         self.cwd = cwd or None
@@ -53,6 +54,7 @@ class _Thread:
         self.branch = branch or None
         self.source = source or None
         self.version = version or None
+        self.tokens = tokens if isinstance(tokens, int) else None
         self.parent = None        # parent thread id (spawned threads)
         self.children = []        # child thread ids, in edge order
         self.child_status = None  # the spawn edge status for a child
@@ -77,9 +79,11 @@ def _db_rows():
     except (sqlite3.Error, ValueError):
         return [], []
     try:
+        cols = {r[1] for r in con.execute('PRAGMA table_info(threads)')}
+        used = 'tokens_used' if 'tokens_used' in cols else 'NULL'
         threads = con.execute(
             'SELECT id, rollout_path, cwd, title, model, git_branch, source, '
-            'cli_version, name FROM threads').fetchall()
+            f'cli_version, name, {used} FROM threads').fetchall()
         edges = con.execute(
             'SELECT parent_thread_id, child_thread_id, status '
             'FROM thread_spawn_edges').fetchall()
@@ -155,11 +159,13 @@ def _scan_rollouts():
 def _build_index():
     threads, by_path = {}, {}
     rows, edges = _db_rows()
-    for tid, path, cwd, title, model, branch, source, version, name in rows:
+    for (tid, path, cwd, title, model, branch, source, version, name,
+         tokens) in rows:
         if not os.path.isfile(path):
             continue
         th = _Thread(tid, path, cwd=cwd, title=title, model=model,
-                     branch=branch, source=source, version=version, name=name)
+                     branch=branch, source=source, version=version, name=name,
+                     tokens=tokens)
         threads[tid] = th
         by_path[path] = th
     for path in _scan_rollouts():
@@ -239,6 +245,10 @@ def store_list_projects():
     return out
 
 
+def _tokens_bit(th):
+    return f'{_human_count(th.tokens)} tok · ' if th.tokens else ''
+
+
 def _session_item(th):
     count = _line_count(th.path)
     n_subs = len(th.children)
@@ -246,6 +256,8 @@ def _session_item(th):
     bits.append(f'{count} rec')
     if n_subs:
         bits.append(f'{n_subs} sub')
+    if th.tokens:
+        bits.append(f'{_human_count(th.tokens)} tok')
     bits.append(_human_time(th.mtime))
     item = Item(
         id=('session', th.path),
@@ -279,11 +291,12 @@ def store_session_item(session_key):
 def _child_item(parent_path, th):
     count = _line_count(th.path)
     status = th.child_status or 'thread'
+    tok = _tokens_bit(th)
     item = Item(
         id=('agent', parent_path, th.id),
         title=_link_marker(('agent', parent_path, th.id))
               + (_trim(_oneline(_thread_title(th)), 80) or th.id),
-        tag=f'{status} · {count} rec · {_human_time(th.mtime)}',
+        tag=f'{status} · {count} rec · {tok}{_human_time(th.mtime)}',
         tag_style='magenta',
         has_children=count > 0,
         boundary=True,
@@ -293,6 +306,7 @@ def _child_item(parent_path, th):
     item.agent_type = status
     item.session_path = parent_path
     item.subagent_path = th.path
+    item.tokens_bit = tok
     item.line_count = count
     item.mtime = th.mtime
     item.row_bg = _ROW_BG_SPAWN
@@ -311,8 +325,8 @@ def store_child_sessions(session_key):
 
 
 def store_mark_orphan(item):
-    item.tag = (f'{item.agent_type} · {item.line_count} rec · orphan · '
-                f'{_human_time(item.mtime)}')
+    item.tag = (f'{item.agent_type} · {item.line_count} rec · '
+                f'{item.tokens_bit}orphan · {_human_time(item.mtime)}')
 
 
 def store_child_session(session_key, child_key):
@@ -497,6 +511,8 @@ def store_session_info(session_key):
             if v:
                 meta.append((key, _trim(_oneline(_clean_title(v)), 120)
                              if key in ('name', 'title') else v))
+        if th.tokens:
+            meta.append(('tokens', f'{th.tokens:,}'))
     try:
         mtime = os.stat(session_key).st_mtime
     except OSError:

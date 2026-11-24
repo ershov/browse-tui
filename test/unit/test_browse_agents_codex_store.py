@@ -102,6 +102,9 @@ _THREADS = {
 }
 
 
+_TOKENS_USED = {T1: 52_000, T3: 7_500}
+
+
 def make_fake_codex(tmpdir, with_db=True):
     """Build ``<tmpdir>/.codex`` and return ``(codex_home, {tid: rollout_path})``."""
     home = os.path.join(tmpdir, '.codex')
@@ -125,7 +128,8 @@ def make_fake_codex(tmpdir, with_db=True):
                 source TEXT NOT NULL, model_provider TEXT NOT NULL,
                 cwd TEXT NOT NULL, title TEXT NOT NULL, archived INTEGER NOT NULL DEFAULT 0,
                 git_branch TEXT, cli_version TEXT NOT NULL DEFAULT '',
-                first_user_message TEXT NOT NULL DEFAULT '', model TEXT, name TEXT);
+                first_user_message TEXT NOT NULL DEFAULT '', model TEXT, name TEXT,
+                tokens_used INTEGER NOT NULL DEFAULT 0);
             CREATE TABLE thread_spawn_edges (
                 parent_thread_id TEXT NOT NULL,
                 child_thread_id TEXT NOT NULL PRIMARY KEY, status TEXT NOT NULL);
@@ -134,9 +138,9 @@ def make_fake_codex(tmpdir, with_db=True):
             con.execute(
                 'INSERT INTO threads (id, rollout_path, created_at, updated_at, source, '
                 'model_provider, cwd, title, git_branch, cli_version, first_user_message, '
-                'model, name) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?)',
+                'model, name, tokens_used) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?)',
                 (tid, paths[tid], base, base + off, 'cli', 'openai', cwd, title,
-                 'main', version, prompt, 'gpt-5.6', NAME_TWO if tid == T2 else None))
+                 'main', version, prompt, 'gpt-5.6', NAME_TWO if tid == T2 else None, _TOKENS_USED.get(tid, 0)))
         con.execute('INSERT INTO thread_spawn_edges VALUES (?,?,?)', (T1, T3, 'completed'))
         con.commit()
         con.close()
@@ -212,6 +216,7 @@ class CodexStoreTests(unittest.TestCase):
         self.assertEqual(s.title, 'PROBE_TITLE_ONE fix the build')
         self.assertEqual(s.scope_title, self.paths[T1])
         self.assertTrue(s.tag.startswith('gpt-5.6 · 15 rec · 1 sub · '), s.tag)
+        self.assertIn(' · 52.0K tok · ', s.tag)
         self.assertTrue(s.boundary)
         self.assertEqual((s.kind, s.thread_id, s.line_count), ('session', T1, 15))
         self.assertEqual(self.r.store_list_sessions('/nowhere'), [])
@@ -227,12 +232,13 @@ class CodexStoreTests(unittest.TestCase):
         self.assertEqual([k.id for k in kids], [('agent', self.paths[T1], T3)])
         kid = kids[0]
         self.assertEqual(kid.title, 'PROBE_CHILD_TITLE run the suite')
-        self.assertTrue(kid.tag.startswith('completed · 15 rec · '))
+        self.assertTrue(kid.tag.startswith('completed · 15 rec · 7.5K tok · '))
         self.assertEqual((kid.kind, kid.agent_id, kid.agent_type),
                          ('subagent', T3, 'completed'))
         self.assertEqual(kid.row_bg, r._ROW_BG_SPAWN)
         r.store_mark_orphan(kid)
-        self.assertIn('orphan', kid.tag)
+        self.assertTrue(kid.tag.startswith('completed · 15 rec · 7.5K tok · orphan · '),
+                        kid.tag)
         self.assertEqual(r.store_child_session(self.paths[T1], T3), self.paths[T3])
         self.assertIsNone(r.store_child_session(self.paths[T2], T3))
         self.assertIsNone(r.store_child_session(self.paths[T1], 'nope'))
@@ -270,6 +276,28 @@ class CodexStoreTests(unittest.TestCase):
         info = self.r.store_session_info(self.paths[T1])
         self.assertIn(('version', '0.161.0'), info['meta'])
         self.assertIn(('branch', 'main'), info['meta'])
+        self.assertNotIn('tokens', [k for k, _ in info['meta']])
+        self.assertNotIn('tok', sessions[0].tag)
+
+    def test_tokens_used_in_info_and_tags(self):
+        r = self.r
+        info = r.store_session_info(self.paths[T1])
+        self.assertIn(('tokens', '52,000'), info['meta'])
+        self.assertNotIn('tokens', [k for k, _ in r.store_session_info(self.paths[T2])['meta']])
+        self.assertNotIn('tok', r.store_session_item(self.paths[T2]).tag)
+
+    def test_db_without_tokens_used_column(self):
+        db = os.path.join(self.home, 'state_5.sqlite')
+        con = sqlite3.connect(db)
+        con.execute('ALTER TABLE threads DROP COLUMN tokens_used')
+        con.commit()
+        con.close()
+        r = self.r
+        r.store_reset()
+        s = r.store_list_sessions(CWD_A)[0]
+        self.assertEqual(s.title, 'PROBE_TITLE_ONE fix the build')
+        self.assertNotIn('tok', s.tag)
+        self.assertNotIn('tokens', [k for k, _ in r.store_session_info(self.paths[T1])['meta']])
 
     def test_without_the_sqlite_module_rollouts_are_scanned(self):
         saved = self.r.sqlite3
@@ -350,7 +378,9 @@ class CodexStoreTests(unittest.TestCase):
             'assistant_text', 'meta', 'turn_end'])
         self.assertEqual(state.ctx.pending, [])
         self.assertEqual(records[9][1].tool['glance'], 'PROBE_STDOUT ok')
-        self.assertEqual(records[14][1].meta, {'duration_ms': 9000, 'tokens': 1234})
+        self.assertEqual(records[14][1].meta, {'duration_ms': 9000})
+        count = next(rec for _, rec in records if rec.tag == 'token_count')
+        self.assertEqual(count.meta['session_usage']['usage'], {'total': 1234})
         self.assertEqual(r.store_tail_poll(path, state), ([], []))
         with open(path, 'a') as f:
             f.write(json.dumps({'timestamp': _ts(20), 'type': 'event_msg', 'payload': {
